@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="control-token" content="{{ control_token }}" />
+    <title>Phone · Local control</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+    <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">USB PHONE / EXTERNAL CAMERA</p>
+          <h1>Local control</h1>
+        </div>
+        <span class="local-tag">● On this Mac only</span>
+      </header>
+      <section class="metrics" aria-label="Connection details">
+        <div>
+          <span>Android device</span
+          ><strong id="serial">Checking connection…</strong>
+        </div>
+        <div><span>Phone display</span><strong id="resolution">—</strong></div>
+        <div>
+          <span>External camera</span
+          ><strong id="camera-state">Starting…</strong>
+        </div>
+      </section>
+      <div class="workspace">
+        <section class="viewer">
+          <div class="section-heading">
+            <h2>Camera view</h2>
+            <span id="frame-state">Waiting for live video</span>
+          </div>
+          <div class="video-wrap">
+            <canvas
+              id="video"
+              width="1280"
+              height="720"
+              aria-label="Live external camera. Click the calibrated phone display to tap."
+            ></canvas>
+            <div id="video-placeholder">Waiting for camera access…</div>
+          </div>
+          <div class="viewer-footer">
+            <span id="instruction"
+              >Input is disabled. Calibrate the display to begin.</span
+            ><output id="coordinates">—</output>
+          </div>
+        </section>
+        <aside>
+          <section class="card">
+            <div class="section-heading">
+              <h2>Input</h2>
+              <span id="mode" class="badge">Disabled</span>
+            </div>
+            <p>
+              Enable control when you are ready. Each click sends one tap to the
+              phone.
+            </p>
+            <button id="enable" class="primary" disabled>
+              Enable Manual Control
+            </button>
+            <button id="disable" class="stop">Disable input</button>
+            <div class="controls">
+              <button data-action="back" disabled>← Back</button>
+              <button data-action="home" disabled>⌂ Home</button>
+              <button data-action="recents" disabled>▣ Recent apps</button>
+              <button data-action="swipe_up" disabled>↑ Swipe up</button>
+              <button data-action="swipe_down" disabled>↓ Swipe down</button>
+              <button data-action="swipe_left" disabled>← Swipe left</button>
+              <button data-action="swipe_right" disabled>→ Swipe right</button>
+              <button data-action="screen_on" disabled>☀ Wake screen</button>
+              <button data-action="screen_off" disabled>⏻ Screen off</button>
+            </div>
+          </section>
+          <section class="card">
+            <div class="section-heading">
+              <h2>Calibration</h2>
+              <span id="cal-state">Required</span>
+            </div>
+            <p>
+              Click the four corners of the <strong>lit phone display</strong>,
+              in this order. Leave the bezel out.
+            </p>
+            <ol id="corner-list">
+              <li>Top-left</li>
+              <li>Top-right</li>
+              <li>Bottom-right</li>
+              <li>Bottom-left</li>
+            </ol>
+            <button id="calibrate" disabled>Calibrate display</button>
+            <div class="cal-actions">
+              <button id="undo" disabled>Undo corner</button
+              ><button id="save" class="primary" disabled>
+                Save calibration
+              </button>
+            </div>
+            <p class="small">
+              Keep the camera and phone fixed. Recalibrate after moving either
+              one or rotating the phone.
+            </p>
+          </section>
+        </aside>
+      </div>
+      <p id="notice" role="status" aria-live="polite">
+        Checking the camera and USB phone…
+      </p>
+      <footer>
+        Manual navigation only. No macros, credentials, transactions, or
+        automatic warning acknowledgement. Use Android Settings for the first
+        test.
+      </footer>
+    </main>
+  </body>
+</html>
