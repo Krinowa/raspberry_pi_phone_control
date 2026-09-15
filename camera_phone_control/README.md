@@ -4,6 +4,8 @@ A small macOS dashboard for manually controlling **one physical USB Android phon
 while viewing it through an **external webcam or camera**. Python captures that
 camera; the browser displays its live feed. A calibrated click sends one ADB tap.
 Back, Home, Swipe up, and Swipe down are explicit buttons.
+Manual Control also forwards supported keyboard input from the browser document
+to the phone, without a text box or Send button.
 
 This is separate from `appium_phone_poc`. It does not import or execute that script,
 launch banking apps, acknowledge warnings, enter credentials, or run a workflow.
@@ -23,7 +25,9 @@ camera_phone_control/
 ├── templates/index.html
 ├── static/app.js
 ├── static/style.css
-└── tests/test_control.py
+└── tests/
+    ├── test_control.py    # Backend, ADB, calibration, and camera tests
+    └── test_keyboard.js   # Dashboard keyboard behavior tests
 ```
 
 ## Setup on this Mac
@@ -132,6 +136,66 @@ One perspective transform assumes a flat screen; extreme lens distortion, glare,
 occlusion, or a curved display can reduce accuracy. No automatic image analysis
 or lens correction is performed.
 
+## Keyboard passthrough
+
+After calibration, enable **Manual Control**, then click a harmless text field
+on the phone through the camera view (for example, Android Settings search).
+When **Keyboard control active** appears, type on the computer keyboard. The
+phone's currently focused field receives the input; there is no dashboard text
+box, Send button, clipboard access, or keyboard history.
+
+- Supported text: `a-z`, `A-Z`, `0-9`, space, and printable ASCII punctuation
+  (including quotes, percent, slash, backslash, and shell metacharacters).
+  Unicode, emoji, dead keys, and IME composition are not forwarded. Rendering
+  depends on Android's key mapping and the receiving app.
+- Unmodified **Enter**, **Backspace**, and **Tab** send `KEYCODE_ENTER`,
+  `KEYCODE_DEL`, and `KEYCODE_TAB`. **Shift+Tab** stays in the browser for dashboard
+  navigation. Enter/Space on a focused dashboard button or link retain their
+  normal activation behavior; click the camera view to return keyboard focus.
+- All Cmd/Ctrl/Alt combinations stay local, including reload, address bar, new
+  tab, close tab, and copy/paste/cut/select-all. Function/system keys and typing
+  into local editable elements are not captured.
+- Keyboard input requires this tab's control lease, valid calibration, a healthy
+  phone/camera, a recent displayed frame, and a visible, focused dashboard.
+  Switching tabs disables Manual Control through the existing visibility and
+  heartbeat handling. Returning requires explicitly enabling control again.
+- The existing single-command gate also covers typing. While a command runs,
+  the indicator says **Keyboard control paused · command in progress**; additional
+  keys are not forwarded or buffered. Type slowly and check the phone: fast typing
+  can lose characters. Only forwarded keys have their browser default prevented.
+  Input errors disable control; uncertain input is never automatically retried.
+- Typed values are used only transiently to issue the command. The controller
+  does not log, echo in responses, persist, or keep a history of keyboard values.
+  The receiving Android app handles text normally, and text visible on the phone
+  can appear in the existing live camera feed.
+
+### Keyboard API
+
+`POST /api/key` uses the same local-request protection, `X-Control-Token`, and
+`X-Control-Client` headers as the existing controls. The body must contain exactly
+`type`, `value`, and `frame_id`; the frame must be recently displayed in this tab:
+
+```json
+{"type":"text","value":"a","frame_id":123}
+```
+
+```json
+{"type":"key","value":"enter","frame_id":123}
+```
+
+Text must be exactly one printable ASCII character. Named keys are limited to
+`enter`, `backspace`, and `tab`. Success returns `{"sent":true}` without echoing
+input. Keyboard requests do not renew the lease; the existing heartbeat does.
+The server chooses the validated USB serial, never a serial supplied in the body.
+
+Printable characters use `adb -s SERIAL shell input text VALUE`, with quoting
+for the [device's shell](https://developer.android.com/tools/adb#shellcommands)
+and `%s` for space. See Android's
+[input text implementation](https://android.googlesource.com/platform/frameworks/base/+/8417c7bb1cbb/services/core/java/com/android/server/input/InputShellCommand.java).
+Enter/Backspace/Tab use `adb -s SERIAL shell input keyevent KEYCODE` with the fixed
+codes above. No PIN, OTP, password, banking credential, transaction confirmation,
+biometric, or security-warning handling is implemented.
+
 ## How clicks are mapped
 
 The canvas displays the complete camera frame without cropping or letterboxing.
@@ -210,7 +274,8 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
 | Port already in use | Stop the other local server or choose `--port 8766` |
 
 The UI shows errors and connection details. Console logs record camera errors,
-control-state changes, device serials, action names, and tap coordinates. Camera
+control-state changes, device serials, button action names, and tap coordinates.
+Keyboard text and key values are excluded from logging and responses. Camera
 images stay in memory and are not saved. General input errors disable the browser's
 Manual Control; enable it again only after checking the reported condition.
 
@@ -221,12 +286,24 @@ From `camera_phone_control` with the virtual environment active:
 ```zsh
 python -m unittest discover -s tests -v
 node --check static/app.js
+node --test tests/test_keyboard.js
 ```
 
 The Python suite uses simulated ADB/camera responses. It checks perspective mapping,
 corner validation, coordinates, size/rotation parsing, single-device selection,
 control gating, stale frames, lease expiry, local-request protection, fixed ADB
-commands, and failure behavior. It never taps a real phone or opens a camera.
+commands, and failure behavior. Keyboard tests also check strict payloads, every
+printable ASCII character's shell quoting, shared command locking, and privacy
+on success/failure. It never taps a real phone or opens a camera. The Node tests
+run the dashboard script with simulated DOM/network objects to check direct
+keydown forwarding, shortcut exclusions, focus/health gates, no buffering, and
+no retries (Node 18+; no npm dependencies).
+
+For a physical-device smoke test, use Settings search: type `Ab9 .`, use Backspace,
+then try Enter/Tab and verify the result on the phone. Confirm Cmd/Ctrl+L and
+Cmd/Ctrl+C remain browser shortcuts. Disable control and verify typing sends
+nothing; repeat from a second tab that does not own the lease. Automated tests
+do not verify the phone's actual keyboard mapping or browser-native behavior.
 
 The implementation follows the [Flask security guidance](https://flask.palletsprojects.com/en/stable/web-security/)
 for local request handling and uses OpenCV's

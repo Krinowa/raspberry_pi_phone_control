@@ -559,11 +559,16 @@ def acknowledge_mae_warning(
             raise PocError("Multiple matching Proceed Anyway buttons; stopping.")
         if matches:
             button = matches[0]
-            if (button.is_displayed() and button.is_enabled()
-                    and button.get_attribute("clickable") == "true"):
+            if (
+                button.is_displayed()
+                and button.is_enabled()
+                and button.get_attribute("clickable") == "true"
+            ):
                 break
         if time.monotonic() >= deadline:
-            raise PocError("Warning present, but the identified Proceed Anyway button is unavailable.")
+            raise PocError(
+                "Warning present, but the identified Proceed Anyway button is unavailable."
+            )
         time.sleep(0.5)
 
     # Recheck immediately before the only click attempt; never use element index 40.
@@ -575,9 +580,16 @@ def acknowledge_mae_warning(
         "class": PROCEED_BUTTON_CLASS,
         "clickable": "true",
     }
-    if (any(button.get_attribute(key) != value for key, value in expected_attributes.items())
-            or " ".join((button.get_attribute("content-desc") or "").split()) != PROCEED_BUTTON_TEXT
-            or not button.is_displayed() or not button.is_enabled()):
+    if (
+        any(
+            button.get_attribute(key) != value
+            for key, value in expected_attributes.items()
+        )
+        or " ".join((button.get_attribute("content-desc") or "").split())
+        != PROCEED_BUTTON_TEXT
+        or not button.is_displayed()
+        or not button.is_enabled()
+    ):
         raise PocError("Proceed Anyway element changed before click; stopping.")
 
     log("UI", "Identified Proceed Anyway button found; acknowledging MAE warning")

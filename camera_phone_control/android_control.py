@@ -2,11 +2,28 @@
 
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
 
 LOG = logging.getLogger("android")
+KEY_EVENTS = {
+    "enter": "KEYCODE_ENTER",
+    "backspace": "KEYCODE_DEL",
+    "tab": "KEYCODE_TAB",
+}
+
+
+def validate_key(kind, value):
+    # A single printable ASCII character, never a string of commands or Unicode.
+    if not isinstance(kind, str) or not isinstance(value, str):
+        raise ValueError("Invalid keyboard input.")
+    if kind == "text" and len(value) == 1 and " " <= value <= "~":
+        return
+    if kind == "key" and value in KEY_EVENTS:
+        return
+    raise ValueError("Unsupported keyboard input.")
 
 
 class DeviceError(RuntimeError):
@@ -35,6 +52,26 @@ def parse_size(output):
 
 
 class AndroidControl:
+    def send_key(self, device, kind, value):
+        validate_key(kind, value)
+        if kind == "text":
+            # adb joins shell arguments on the device. Quote for that remote shell;
+            # subprocess's argument list already avoids a local shell. Android's
+            # input text interprets %s as space; single-character requests cannot
+            # accidentally combine a literal percent with a following s.
+            args = ["text", shlex.quote("%s" if value == " " else value)]
+        else:
+            args = ["keyevent", KEY_EVENTS[value]]
+        try:
+            self._adb("-s", device.serial, "shell", "input", *args)
+        except DeviceError:
+            # Do not expose command arguments or device output in logs/errors.
+            raise DeviceError(
+                "Keyboard input failed. Check the phone and USB connection. "
+                "An input may have occurred; it will not be retried."
+            ) from None
+        # Keyboard values must never enter the normal action log.
+
     def _adb(self, *args):
 
         if not shutil.which("adb"):

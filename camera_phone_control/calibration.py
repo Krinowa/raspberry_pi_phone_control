@@ -8,6 +8,7 @@ import numpy as np
 def unit_point(value):
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError("A point must contain x and y.")
+
     if any(
         isinstance(v, bool)
         or not isinstance(v, (int, float))

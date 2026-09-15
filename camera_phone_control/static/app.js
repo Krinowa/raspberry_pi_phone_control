@@ -47,6 +47,28 @@ function active() {
   return manual && state?.owned && fresh() && !calibrating;
 }
 
+function keyboardActive() {
+  return (
+    active() &&
+    state?.enabled &&
+    state?.calibrated &&
+    !!state?.device &&
+    state?.camera?.ready &&
+    !document.hidden &&
+    document.hasFocus()
+  );
+}
+
+function renderKeyboard() {
+  const enabled = keyboardActive();
+  $("keyboard-state").textContent = enabled
+    ? busy
+      ? "Keyboard control paused · command in progress"
+      : "Keyboard control active"
+    : "Keyboard control inactive";
+  $("keyboard-state").classList.toggle("active", enabled && !busy);
+}
+
 function render() {
   $("serial").textContent = state?.device?.serial || "No authorized USB phone";
 
@@ -71,6 +93,7 @@ function render() {
       : "Disabled";
 
   $("mode").classList.toggle("active", active());
+  renderKeyboard();
 
   $("enable").disabled =
     busy ||
@@ -340,8 +363,63 @@ async function sendAction(action, point) {
   });
 }
 
+document.addEventListener("keydown", (event) => {
+  if (
+    !keyboardActive() ||
+    busy ||
+    event.defaultPrevented ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    event.isComposing ||
+    event.keyCode === 229 ||
+    event.getModifierState("AltGraph") ||
+    event.getModifierState("Fn")
+  )
+    return;
+
+  // Leave local editing and keyboard activation of dashboard controls intact.
+  const target = event.target;
+  if (target?.isContentEditable || target?.closest?.("input, textarea, select"))
+    return;
+  if (
+    (event.key === "Enter" || event.key === " ") &&
+    target?.closest?.("button, a, [role='button']")
+  )
+    return;
+
+  let type, value;
+  if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
+    type = "text";
+    value = event.key;
+  } else if (
+    !event.shiftKey &&
+    ["Enter", "Backspace", "Tab"].includes(event.key)
+  ) {
+    type = "key";
+    value = event.key.toLowerCase();
+  } else return;
+
+  event.preventDefault();
+  // Send immediately using the existing busy gate. No buffer or keyboard history.
+  report(async () => {
+    try {
+      await api("/api/key", { type, value, frame_id: frameId });
+    } catch (error) {
+      // An uncertain input is never retried, even after a network timeout.
+      manual = false;
+      api("/api/control", { enabled: false }).catch(() => {});
+      throw error;
+    }
+  });
+});
+
+window.addEventListener("focus", renderKeyboard);
+window.addEventListener("blur", renderKeyboard);
+
 canvas.addEventListener("click", (event) => {
   if (!fresh() || busy) return;
+  canvas.focus({ preventScroll: true });
   const box = canvas.getBoundingClientRect();
   const point = [
     (event.clientX - box.left) / box.width,

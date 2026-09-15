@@ -10,7 +10,7 @@ from dataclasses import asdict
 from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
-from android_control import AndroidControl, DeviceError
+from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration
 from camera import Camera
 
@@ -70,6 +70,16 @@ class ControlState:
         if not self.device or not camera["ready"]:
             raise DeviceError(self.message)
         return camera
+
+    def require_input(self, client, frame_id):
+        self.require_ready()
+        self.require_frame(frame_id)
+        if (
+            self.owner != client
+            or time.monotonic() >= self.expires
+            or self.calibration is None
+        ):
+            raise ValueError("Input disabled. Enable Manual Control in this tab first.")
 
     def snapshot(self, client):
         camera = self.refresh()
@@ -226,6 +236,28 @@ def create_app(camera, android=None):
             LOG.info("Four-corner calibration saved for %s", state.device.serial)
             return jsonify(calibrated=True, corners=calibration.corners.tolist())
 
+    @app.post("/api/key")
+    def key():
+        data, client = payload(), client_id()
+        if set(data) != {"type", "value", "frame_id"}:
+            raise ValueError("Expected type, value, and frame_id only.")
+        validate_key(data["type"], data["value"])
+        if type(data["frame_id"]) is not int:
+            raise ValueError("A fresh camera frame is required.")
+        if not state.action_lock.acquire(blocking=False):
+            return jsonify(error="Controller busy. No action sent."), 409
+        try:
+            with state.lock:
+                state.require_input(client, data["frame_id"])
+                try:
+                    state.android.send_key(state.device, data["type"], data["value"])
+                except DeviceError as exc:
+                    state.disable(str(exc))
+                    raise
+                return jsonify(sent=True)
+        finally:
+            state.action_lock.release()
+
     @app.post("/api/action")
     def action():
         data, client = payload(), client_id()
@@ -235,17 +267,7 @@ def create_app(camera, android=None):
         state.lock.acquire()
 
         try:
-            state.require_ready()
-            state.require_frame(data.get("frame_id"))
-
-            if (
-                state.owner != client
-                or time.monotonic() >= state.expires
-                or state.calibration is None
-            ):
-                raise ValueError(
-                    "Input disabled. Enable Manual Control in this tab first."
-                )
+            state.require_input(client, data.get("frame_id"))
 
             name = data.get("action")
 
