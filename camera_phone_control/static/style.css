@@ -206,6 +206,7 @@ button.primary:hover:not(:disabled) {
   background: #234a37;
 }
 #enable,
+#takeover,
 #disable,
 #calibrate {
   width: 100%;

@@ -8,10 +8,11 @@ Manual Control also forwards supported keyboard input from the browser document
 to the phone, without a text box or Send button.
 
 This is separate from `appium_phone_poc`. It does not import or execute that script,
-launch banking apps, acknowledge warnings, enter credentials, or run a workflow.
+launch banking apps, acknowledge warnings, or enter credentials. A separate terminal
+runner can execute predefined, harmless navigation scripts such as `settings_demo`.
 The existing Appium server at `http://127.0.0.1:4723` is not required by this
-dashboard: these controls use ADB directly. Stop other phone automation scripts
-while using manual control so two controllers do not operate the device at once.
+dashboard: these controls use ADB directly. The dashboard and this project's runner
+share a device lock. Stop external automation scripts that bypass that lock.
 
 ## Source layout
 
@@ -19,6 +20,14 @@ while using manual control so two controllers do not operate the device at once.
 camera_phone_control/
 ├── app.py                 # Flask routes, control state, ownership, frame checks
 ├── android_control.py     # USB device discovery, resolution/rotation, ADB inputs
+├── device_lock.py         # Per-device locks shared across local processes
+├── automation/
+│   ├── __init__.py
+│   ├── runner.py          # Callable runner, run state, and CLI entry point
+│   ├── context.py         # Controller helpers, cancellation, explicit waits
+│   └── scripts/
+│       ├── __init__.py    # Explicit registry of predefined scripts
+│       └── settings_demo.py
 ├── camera.py              # External camera capture and in-memory JPEG frames
 ├── calibration.py         # Four-point perspective mapping using NumPy
 ├── requirements.txt
@@ -26,7 +35,9 @@ camera_phone_control/
 ├── static/app.js
 ├── static/style.css
 └── tests/
-    ├── test_control.py    # Backend, ADB, calibration, and camera tests
+    ├── test_control.py    # Backend, ADB, calibration, and camera regression tests
+    ├── test_automation.py # Runner, discovery, cancellation, cross-process locking
+    ├── test_takeover.py   # Manual preemption, safe handoff, lease expiry
     └── test_keyboard.js   # Dashboard keyboard behavior tests
 ```
 
@@ -176,11 +187,11 @@ box, Send button, clipboard access, or keyboard history.
 `type`, `value`, and `frame_id`; the frame must be recently displayed in this tab:
 
 ```json
-{"type":"text","value":"a","frame_id":123}
+{ "type": "text", "value": "a", "frame_id": 123 }
 ```
 
 ```json
-{"type":"key","value":"enter","frame_id":123}
+{ "type": "key", "value": "enter", "frame_id": 123 }
 ```
 
 Text must be exactly one printable ASCII character. Named keys are limited to
@@ -195,6 +206,144 @@ and `%s` for space. See Android's
 Enter/Backspace/Tab use `adb -s SERIAL shell input keyevent KEYCODE` with the fixed
 codes above. No PIN, OTP, password, banking credential, transaction confirmation,
 biometric, or security-warning handling is implemented.
+
+## Backend automation (terminal only)
+
+The browser remains a manual dashboard with one explicit Take Over operation and
+no script execution controls or script-launch API.
+The runner uses the same `AndroidControl` implementation as manual input and needs
+neither Flask, calibration, a browser lease, nor a running camera. The existing
+dashboard can remain open to observe the camera feed.
+
+With the existing virtual environment active, run from `camera_phone_control`:
+
+```zsh
+python -m automation.runner --list
+python -m automation.runner settings_demo
+python -m automation.runner settings_demo --serial N0AA003744K62800112
+```
+
+`settings_demo` wakes the phone, presses Home, launches Android Settings, and waits
+one second. Manually unlock the phone before running it. It does not enter text,
+tap screen coordinates, change settings, unlock the device, or handle security
+prompts. The controller resolves the requested package's launcher activity, validates the
+package/component arguments, and starts that activity through ADB.
+
+Without `--serial`, automation selects a phone only when exactly one authorized
+physical USB phone is available. Zero/multiple candidates fail clearly. With
+`--serial`, it validates that exact phone; unauthorized/offline phones, emulators,
+and wireless ADB remain unsupported. The manual dashboard retains its stricter
+single-attached-phone selection. **One tested Android phone remains the current
+hardware scope**; serial selection and lock isolation prepare for future devices,
+not a multi-device dashboard.
+
+### Exclusive device ownership
+
+Each serial has an OS ownership lock shared by dashboard and runner processes
+under `/tmp/camera-phone-control-<user-id>/`. Both must run as the same OS user.
+The directory is private to that user. Filenames are hashes of serials. The
+`.lock` file contains only a coarse owner label (`manual` or `automation`), and
+`.takeover` contains a random request token. A `.guard` lock serializes short
+metadata operations; it is never held during device commands or waits. No typed
+input or script details are written to these files.
+
+- **Automation has priority while it owns the device.** Normal manual controls,
+  keyboard passthrough, and click-to-tap are disabled. The camera stays visible.
+  The dashboard shows **Automation running** and **Manual control disabled**.
+  Normal manual input and Enable Manual Control return HTTP 409 with
+  `{"ok":false,"error":"device_busy","owner":"automation"}`; they never request
+  cancellation or queue input.
+- To interrupt a run, explicitly press **Take Over**. This is the dashboard's only
+  automation-related operation; it has no script selector or launcher. Take Over
+  can request cancellation without calibration or a live camera, since it sends
+  no Android input. Actual manual input retains all existing health/calibration
+  checks.
+- `POST /api/takeover` takes an empty JSON object and the existing local control
+  token/client headers. It selects the configured USB phone and verifies that
+  automation currently owns it. It then writes the per-device takeover signal
+  and immediately returns HTTP 202:
+  `{"enabled":false,"pending":true,"control_status":"takeover_requested"}`.
+  A free device is rejected with HTTP 409 and `error:"no_automation"`.
+  Another tab cannot steal an already-pending takeover request.
+- During **Takeover requested**, automation retains the OS lock until its current
+  ADB invocation finishes or times out. Cancellation is checked between steps,
+  before new Android actions, and at most every 50 ms during `context.wait`.
+  The runner records `takeover_requested` when detected, then `cancelled` after
+  releasing ownership. It logs that cancellation was due to takeover. No ADB
+  command is forcibly interrupted and no queued actions are replayed.
+- The requesting browser continues heartbeats. After automation releases the
+  lock, a fresh heartbeat completes the handoff, normally within 1.5 seconds.
+  Manual input becomes active if camera health, calibration, and frame freshness
+  still pass. Otherwise input remains disabled until those conditions are restored
+  and Manual Control is enabled. The dashboard reports the coarse states `free`,
+  `manual`, `automation`, and `takeover_requested`, without script details.
+- The browser's six-second manual lease selects the controlling tab; manual
+  commands take the OS lock individually. An externally triggered automation run
+  can therefore start between manual actions, even when Manual Control was enabled.
+  If a manual command is already in flight, a new run fails busy instead of
+  issuing concurrent input. Explicit takeover reserves the handoff until it is
+  completed or withdrawn; unrelated automation cannot steal it midway.
+- Disable input, hide/close the tab, or lose its heartbeat lease to release a
+  pending takeover reservation. A backend timer expires abandoned reservations
+  even without more HTTP requests. A retained random request token ensures the
+  old run still detects cancellation if a request is withdrawn before its next
+  check. **Cancelled automation never resumes automatically**, including when
+  manual control ends. A new run needs an explicit external trigger.
+- Camera viewing and status remain available throughout takeover. Success,
+  failure, and cancellation release automation's lock in cleanup; process exit
+  also releases OS locks. A leftover file is not an active lock. Do not delete
+  lock/signal files while either process is running. Different serials have
+  independent ownership, takeover signals, and metadata locks. The code uses
+  [Python's nonblocking `flock`](https://docs.python.org/3/library/fcntl.html#fcntl.flock)
+  on macOS/Linux; Windows is not supported.
+- These locks coordinate this project's entry points. Raw ADB, Appium, and other
+  software do not automatically participate. Both dashboard and runner must use
+  this version's takeover protocol.
+
+### Cancellation, results, and future triggers
+
+Press **Ctrl+C** to request cancellation. Explicit waits use a cancellation event
+and finish promptly. An in-flight ADB invocation finishes or reaches its existing
+timeout before cancellation stops subsequent steps; the runner does not send a
+terminal interrupt to the ADB child. Uncertain inputs are never retried. A command
+already delivered to Android cannot be retracted.
+
+The CLI returns `0` on completion, `1` on failure, and `130` on cancellation
+(`2` for invalid CLI syntax). Lifecycle logs include script/lock start and end,
+fixed step labels, and failure categories. They exclude keyboard values and
+runtime exception details that could contain input. Run state stays in memory:
+script name, selected serial, running/takeover_requested/cancelled/completed/failed
+status, a takeover flag, UTC start
+and end timestamps, current step, and a short message. There is no run-history
+database or keyboard history.
+
+Future components can call the runner without invoking CLI code:
+
+```python
+from automation import runner
+
+result = runner.run("settings_demo", serial="N0AA003744K62800112")
+print(result.status, result.message)
+```
+
+For cancellation or inspection while running, create a `runner.Runner`, pass a
+`threading.Event` as `cancel_event` to its `run` method, and inspect that instance's `state`.
+Use separate Runner instances for concurrent devices. Scripts are trusted local
+Python functions registered explicitly in `automation/scripts/__init__.py`, not
+file paths or modules supplied by the CLI. A script receives `context.device`,
+`context.controller`, `context.cancel_event`, `context.logger`, and `context.state`.
+Use `context.send(action, pixel=None)`, `context.send_key(kind, value)`,
+`context.launch_app(package)`, and `context.wait(seconds)` to get step logging,
+device health/geometry checks, and cancellation between steps. During any custom
+long-running work, call `context.check_cancelled()` regularly and use
+`context.wait` for delays so manual takeover can be handled promptly. Those helpers
+delegate to the existing Android controller; `send_key` retains its single ASCII
+character/fixed keyevent limits. Use fixed diagnostic labels and never log typed
+values or credentials in custom scripts.
+
+Triggers, runner, and controller are separate. Cron, webhooks, database/event
+triggers, banking/payment/transfer workflows, credentials, transaction confirmation,
+biometrics, and security-warning acknowledgement are not implemented.
 
 ## How clicks are mapped
 
@@ -239,7 +388,7 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
 
 - Input starts disabled and is disabled during calibration. Both backend and
   frontend enforce this; hidden or disabled buttons are not the only check.
-- All actions require a valid calibration, the same phone geometry, and a camera
+- All manual actions require a valid calibration, the same phone geometry, and a camera
   frame displayed less than two seconds ago. Commands with stale frames are rejected.
 - The controlling browser sends heartbeats. Control expires after six seconds
   without one. Hiding/closing the tab disables input immediately when possible;
@@ -259,19 +408,19 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
 
 ## Errors and diagnostics
 
-| Message / symptom | What to check |
-| --- | --- |
-| No physical phone / unauthorized / offline | USB data cable, one attached phone, debugging prompt |
-| USB transport missing | Disconnect wireless ADB and reconnect by USB |
-| Camera unavailable / permission denied | Correct `--camera` index, macOS Camera permission, other camera apps |
-| Camera froze or disconnected | Control is disabled; reconnect and restart capture, then recalibrate |
-| Cannot determine rotation | Inspect the two `dumpsys` commands above; add support for the device's rotation field |
-| Click outside display | No tap sent; click within the saved outline or recalibrate |
-| Invalid/crossed/tiny corners | Select the four display corners in the labelled order with a clearer view |
-| Phone geometry changed | Recalibrate after rotation or a resolution/device change |
-| Input disabled / heartbeat expired | Wait for live video, then explicitly enable control |
-| ADB timeout / connection lost | Inspect the phone before another action; an uncertain input is not repeated |
-| Port already in use | Stop the other local server or choose `--port 8766` |
+| Message / symptom                          | What to check                                                                         |
+| ------------------------------------------ | ------------------------------------------------------------------------------------- |
+| No physical phone / unauthorized / offline | USB data cable, one attached phone, debugging prompt                                  |
+| USB transport missing                      | Disconnect wireless ADB and reconnect by USB                                          |
+| Camera unavailable / permission denied     | Correct `--camera` index, macOS Camera permission, other camera apps                  |
+| Camera froze or disconnected               | Control is disabled; reconnect and restart capture, then recalibrate                  |
+| Cannot determine rotation                  | Inspect the two `dumpsys` commands above; add support for the device's rotation field |
+| Click outside display                      | No tap sent; click within the saved outline or recalibrate                            |
+| Invalid/crossed/tiny corners               | Select the four display corners in the labelled order with a clearer view             |
+| Phone geometry changed                     | Recalibrate after rotation or a resolution/device change                              |
+| Input disabled / heartbeat expired         | Wait for live video, then explicitly enable control                                   |
+| ADB timeout / connection lost              | Inspect the phone before another action; an uncertain input is not repeated           |
+| Port already in use                        | Stop the other local server or choose `--port 8766`                                   |
 
 The UI shows errors and connection details. Console logs record camera errors,
 control-state changes, device serials, button action names, and tap coordinates.
@@ -289,15 +438,20 @@ node --check static/app.js
 node --test tests/test_keyboard.js
 ```
 
-The Python suite uses simulated ADB/camera responses. It checks perspective mapping,
+The restored Python regression suite uses simulated ADB/camera responses. It checks perspective mapping,
 corner validation, coordinates, size/rotation parsing, single-device selection,
 control gating, stale frames, lease expiry, local-request protection, fixed ADB
-commands, and failure behavior. Keyboard tests also check strict payloads, every
-printable ASCII character's shell quoting, shared command locking, and privacy
-on success/failure. It never taps a real phone or opens a camera. The Node tests
+commands, and failure behavior. Automation tests check script discovery, device
+selection, state transitions, cancellation, privacy, and real cross-process lock
+contention/release (including process death). Takeover tests cover an in-flight
+command, a separate runner process waiting for 30 seconds, prompt cancellation,
+manual ownership, no concurrent input/replay/resumption, independent devices,
+and automatic expiry of abandoned leases. It never taps a real phone or opens
+a camera. The Node tests
 run the dashboard script with simulated DOM/network objects to check direct
-keydown forwarding, shortcut exclusions, focus/health gates, no buffering, and
-no retries (Node 18+; no npm dependencies).
+keydown forwarding, shortcut exclusions, ownership/health gates, no buffering, and
+takeover indicators/heartbeats, and rejection of late responses after disabling
+input (Node 18+; no npm dependencies).
 
 For a physical-device smoke test, use Settings search: type `Ab9 .`, use Backspace,
 then try Enter/Tab and verify the result on the phone. Confirm Cmd/Ctrl+L and

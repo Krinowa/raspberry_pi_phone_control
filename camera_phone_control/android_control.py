@@ -81,7 +81,13 @@ class AndroidControl:
 
         try:
             result = subprocess.run(
-                ["adb", *args], capture_output=True, text=True, timeout=8, check=False
+                ["adb", *args],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+                # A runner's Ctrl+C cancels between commands, not inside ADB.
+                start_new_session=True,
             )
         except subprocess.TimeoutExpired as exc:
             raise DeviceError(
@@ -96,7 +102,7 @@ class AndroidControl:
             )
         return result.stdout.strip()
 
-    def device(self):
+    def device(self, serial=None, *, authorized_only=False):
         rows = []
 
         for line in self._adb("devices", "-l").splitlines():
@@ -110,9 +116,26 @@ class AndroidControl:
         if not rows:
             raise DeviceError("No physical phone connected. Connect one phone by USB.")
 
+        if serial is not None:
+            rows = [row for row in rows if row[0] == serial]
+            if not rows:
+                raise DeviceError("Requested physical phone is not connected.")
+        elif authorized_only and len(rows) > 1:
+            rows = [
+                row
+                for row in rows
+                if row[1] == "device"
+                and any(item.startswith("usb:") for item in row[2:])
+            ]
+            if not rows:
+                raise DeviceError(
+                    "No authorized USB phone connected. Check adb devices -l."
+                )
+
         if len(rows) != 1:
             raise DeviceError(
-                "More than one device connected. Leave only one USB phone attached."
+                "More than one device connected. Select --serial for automation, "
+                "or leave only one USB phone attached for the dashboard."
             )
         serial, state, *details = rows[0]
 
@@ -153,6 +176,64 @@ class AndroidControl:
             width, height = height, width
 
         return Device(serial, width, height, rotation)
+
+    def launch_app(self, device, package):
+        if not isinstance(package, str) or not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+", package
+        ):
+            raise ValueError("A valid Android package name is required.")
+
+        # Resolve the application's launcher activity.
+        output = self._adb(
+            "-s",
+            device.serial,
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            package,
+        )
+
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+
+        component = next(
+            (line for line in reversed(lines) if "/" in line),
+            None,
+        )
+
+        if not component:
+            raise DeviceError("Unable to resolve application launcher activity.")
+        if not re.fullmatch(re.escape(package) + r"/[A-Za-z0-9_.$]+", component):
+            raise DeviceError("Android returned an invalid launcher component.")
+
+        # Launch the resolved Android component.
+        output = self._adb(
+            "-s",
+            device.serial,
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-n",
+            shlex.quote(component),
+        )
+
+        status = re.search(
+            r"(?im)^\s*Status:\s*(\S+)",
+            output,
+        )
+
+        if re.search(
+            r"(?im)^\s*(error|exception)\b",
+            output,
+        ) or (status and status.group(1).lower() != "ok"):
+            raise DeviceError("Application could not be launched. No retry attempted.")
+
+        LOG.info(
+            "Application opened on %s",
+            device.serial,
+        )
 
     def send(self, device, action, pixel=None):
         if action == "tap" and pixel is not None:
@@ -214,5 +295,25 @@ class AndroidControl:
             raise ValueError("Unsupported control action.")
         self._adb("-s", device.serial, "shell", "input", *args)
         LOG.info(
-            "Manual %s on %s%s", action, device.serial, f" at {pixel}" if pixel else ""
+            "Input %s on %s%s", action, device.serial, f" at {pixel}" if pixel else ""
         )
+
+    def dump_ui(self, device):
+        self._adb(
+            "-s",
+            device.serial,
+            "shell",
+            "uiautomator",
+            "dump",
+            "/sdcard/window.xml",
+        )
+
+        output = self._adb(
+            "-s",
+            device.serial,
+            "shell",
+            "cat",
+            "/sdcard/window.xml",
+        )
+
+        return output
