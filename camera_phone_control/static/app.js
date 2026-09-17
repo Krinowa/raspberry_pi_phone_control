@@ -14,6 +14,7 @@ let calibrating = false,
   corners = [],
   manual = false,
   busy = false;
+let controlVersion = 0;
 
 function notice(text, error = false) {
   $("notice").textContent = text;
@@ -44,7 +45,36 @@ function fresh() {
   return frameId !== null && performance.now() - frameAt < 1800;
 }
 function active() {
-  return manual && state?.owned && fresh() && !calibrating;
+  return (
+    manual &&
+    state?.owned &&
+    fresh() &&
+    !calibrating &&
+    state?.control_status !== "automation" &&
+    !state?.pending
+  );
+}
+
+function keyboardActive() {
+  return (
+    active() &&
+    state?.enabled &&
+    state?.calibrated &&
+    !!state?.device &&
+    state?.camera?.ready &&
+    !document.hidden &&
+    document.hasFocus()
+  );
+}
+
+function renderKeyboard() {
+  const enabled = keyboardActive();
+  $("keyboard-state").textContent = enabled
+    ? busy
+      ? "Keyboard control paused · command in progress"
+      : "Keyboard control active"
+    : "Keyboard control inactive";
+  $("keyboard-state").classList.toggle("active", enabled && !busy);
 }
 
 function render() {
@@ -64,13 +94,28 @@ function render() {
     ? "● Live camera"
     : "Camera feed unavailable";
 
-  $("mode").textContent = active()
-    ? "Manual Control"
-    : state?.enabled && !state?.owned
-      ? "Other tab"
-      : "Disabled";
+  $("mode").textContent =
+    state?.control_status === "automation"
+      ? "Automation running"
+      : state?.pending
+        ? "Takeover requested"
+        : active()
+          ? "Manual control active"
+          : state?.enabled && !state?.owned
+            ? "Other tab"
+            : "Disabled";
 
   $("mode").classList.toggle("active", active());
+  renderKeyboard();
+
+  const automation = state?.control_status === "automation";
+  $("takeover").hidden = !automation && !state?.pending;
+  $("takeover").disabled = busy || !!state?.pending || !state?.device;
+  $("control-help").textContent = automation
+    ? "Manual control disabled. Camera monitoring remains available. Use Take Over to interrupt automation."
+    : state?.pending
+      ? "Takeover requested. Manual input stays disabled until automation yields."
+      : "Enable control when you are ready. Each click sends one tap to the phone.";
 
   $("enable").disabled =
     busy ||
@@ -78,6 +123,7 @@ function render() {
     !fresh() ||
     !state?.device ||
     !state?.calibrated ||
+    automation ||
     state?.enabled;
 
   $("calibrate").disabled = busy || !fresh() || !state?.device;
@@ -151,13 +197,19 @@ function draw() {
 }
 
 async function disable() {
+  controlVersion++;
   manual = false;
+  if (state) {
+    state.pending = false;
+    state.pending_owned = false;
+  }
   render();
   await api("/api/control", { enabled: false });
 
   if (state) {
     state.enabled = false;
     state.owned = false;
+    state.control_status = "free";
   }
 
   render();
@@ -179,8 +231,10 @@ async function report(task) {
 }
 
 async function refreshStatus() {
+  const version = controlVersion;
   try {
     const next = await api("/api/status", undefined, "GET");
+    if (version !== controlVersion) return;
 
     if (
       calibrating &&
@@ -197,17 +251,19 @@ async function refreshStatus() {
 
     const previousMessage = state?.message;
     state = next;
-    if (!state.owned) manual = false;
+    if (!state.owned && !state.pending_owned) manual = false;
     if (!state.camera.ready || !state.device) notice(state.message, true);
     else if (state.message !== previousMessage) notice(state.message);
     render();
     draw();
   } catch (error) {
+    if (version !== controlVersion) return;
     manual = false;
     notice(`Backend unavailable: ${error.message}`, true);
     render();
+  } finally {
+    setTimeout(refreshStatus, 1800);
   }
-  setTimeout(refreshStatus, 1800);
 }
 
 async function videoLoop() {
@@ -261,13 +317,45 @@ async function videoLoop() {
   setTimeout(videoLoop, fresh() ? 65 : 600);
 }
 
+function applyControlResult(result) {
+  const wasPending = state?.pending;
+  manual = !!(result.enabled || result.pending);
+  if (state) {
+    state.enabled = manual;
+    state.owned = !!result.enabled;
+    state.pending = !!result.pending;
+    state.pending_owned = !!result.pending;
+    state.control_status = result.pending
+      ? "takeover_requested"
+      : result.enabled
+        ? "manual"
+        : "free";
+  }
+  if (result.pending)
+    notice("Takeover requested. Waiting for automation to yield.");
+  else if (wasPending && result.enabled) notice("Manual control active.");
+  render();
+}
+
 $("enable").addEventListener("click", () =>
   report(async () => {
-    await api("/api/control", { enabled: true, frame_id: frameId });
-    manual = true;
-    state.enabled = true;
-    state.owned = true;
-    notice("Manual Control enabled. Each click sends one tap.");
+    const version = ++controlVersion;
+    const result = await api("/api/control", {
+      enabled: true,
+      frame_id: frameId,
+    });
+    if (version !== controlVersion) return;
+    applyControlResult(result);
+    if (result.enabled) notice("Manual control active.");
+  }),
+);
+
+$("takeover").addEventListener("click", () =>
+  report(async () => {
+    const version = ++controlVersion;
+    const result = await api("/api/takeover", {});
+    if (version !== controlVersion) return;
+    applyControlResult(result);
   }),
 );
 
@@ -340,8 +428,63 @@ async function sendAction(action, point) {
   });
 }
 
+document.addEventListener("keydown", (event) => {
+  if (
+    !keyboardActive() ||
+    busy ||
+    event.defaultPrevented ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    event.isComposing ||
+    event.keyCode === 229 ||
+    event.getModifierState("AltGraph") ||
+    event.getModifierState("Fn")
+  )
+    return;
+
+  // Leave local editing and keyboard activation of dashboard controls intact.
+  const target = event.target;
+  if (target?.isContentEditable || target?.closest?.("input, textarea, select"))
+    return;
+  if (
+    (event.key === "Enter" || event.key === " ") &&
+    target?.closest?.("button, a, [role='button']")
+  )
+    return;
+
+  let type, value;
+  if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
+    type = "text";
+    value = event.key;
+  } else if (
+    !event.shiftKey &&
+    ["Enter", "Backspace", "Tab"].includes(event.key)
+  ) {
+    type = "key";
+    value = event.key.toLowerCase();
+  } else return;
+
+  event.preventDefault();
+  // Send immediately using the existing busy gate. No buffer or keyboard history.
+  report(async () => {
+    try {
+      await api("/api/key", { type, value, frame_id: frameId });
+    } catch (error) {
+      // An uncertain input is never retried, even after a network timeout.
+      manual = false;
+      api("/api/control", { enabled: false }).catch(() => {});
+      throw error;
+    }
+  });
+});
+
+window.addEventListener("focus", renderKeyboard);
+window.addEventListener("blur", renderKeyboard);
+
 canvas.addEventListener("click", (event) => {
   if (!fresh() || busy) return;
+  canvas.focus({ preventScroll: true });
   const box = canvas.getBoundingClientRect();
   const point = [
     (event.clientX - box.left) / box.width,
@@ -368,13 +511,13 @@ setInterval(async () => {
     return;
   }
 
+  const version = controlVersion;
   try {
     const result = await api("/api/heartbeat", { frame_id: frameId });
-    if (!result.enabled) {
-      manual = false;
-      render();
-    }
+    if (version !== controlVersion || !manual) return;
+    applyControlResult(result);
   } catch (error) {
+    if (version !== controlVersion) return;
     manual = false;
     notice(error.message, true);
     render();

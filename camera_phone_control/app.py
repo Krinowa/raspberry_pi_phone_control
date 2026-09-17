@@ -5,28 +5,33 @@ import logging
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 
 from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
-from android_control import AndroidControl, DeviceError
+from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration
 from camera import Camera
+from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
 
 
 class ControlState:
-    def __init__(self, android, camera):
+    def __init__(self, android, camera, device_locks=None):
         self.android, self.camera = android, camera
         self.lock = threading.RLock()
         self.action_lock = threading.Lock()
+        self.device_locks = device_locks or DeviceLocks()
         self.device = None
         self.calibration = None
         self.signature = None
         self.owner = None
+        self.manual_claim = None
+        self.lease_timer = None
         self.expires = 0
         self.message = "Input disabled. Calibrate the phone display first."
 
@@ -34,6 +39,55 @@ class ControlState:
         if self.owner:
             LOG.info("Control disabled: %s", reason)
         self.owner, self.expires, self.message = None, 0, reason
+        if self.lease_timer:
+            self.lease_timer.cancel()
+            self.lease_timer = None
+        if self.manual_claim:
+            claim = self.manual_claim
+            self.manual_claim = None
+            claim.close()
+
+    def renew_lease(self):
+        self.expires = time.monotonic() + LEASE_SECONDS
+        if self.lease_timer:
+            self.lease_timer.cancel()
+        self.lease_timer = threading.Timer(LEASE_SECONDS, self.expire_lease)
+        self.lease_timer.daemon = True
+        self.lease_timer.start()
+
+    def expire_lease(self):
+        # Release persistent ownership even if no browser/status requests arrive.
+        # state.lock lets any in-flight manual command finish before releasing it.
+        with self.lock:
+            if self.owner and time.monotonic() >= self.expires:
+                self.disable("Control heartbeat expired. Enable Manual Control again.")
+
+    @property
+    def pending(self):
+        return self.manual_claim is not None
+
+    def claim_manual(self):
+        try:
+            acquired = self.manual_claim.try_acquire()
+        except Exception:
+            self.disable("Manual ownership acquisition failed. Input disabled.")
+            raise DeviceError(
+                "Cannot acquire manual ownership. Check local device locks."
+            ) from None
+        if acquired:
+            # The handoff is complete. Retain the browser lease, but use the
+            # ordinary per-command OS lock so a new explicit run can start later.
+            claim, self.manual_claim = self.manual_claim, None
+            try:
+                self.message = "Manual control available again."
+                LOG.info("Manual control available again on %s", claim.serial)
+            finally:
+                claim.close()
+            return True
+        self.message = (
+            "Takeover requested. Waiting for automation to finish its current command."
+        )
+        return False
 
     def refresh(self):
         errors = []
@@ -71,24 +125,63 @@ class ControlState:
             raise DeviceError(self.message)
         return camera
 
+    @contextmanager
+    def input_control(self, client, frame_id):
+        if self.device is None:
+            self.require_ready()
+        if self.pending:
+            raise DeviceBusy("automation")  # Drop the input; never replay it later.
+        serial = self.device.serial
+        with self.device_locks.hold(serial, "manual"):
+            self.require_ready()
+            self.require_frame(frame_id)
+            if self.device.serial != serial:
+                raise DeviceError(
+                    "Phone changed while acquiring control. Enable input again."
+                )
+            if self.owner != client or self.calibration is None:
+                raise ValueError(
+                    "Input disabled. Enable Manual Control in this tab first."
+                )
+            yield
+
     def snapshot(self, client):
         camera = self.refresh()
+        owner = self.device_locks.owner(self.device.serial) if self.device else None
+        control_status = (
+            "takeover_requested"
+            if self.pending
+            else (
+                "automation"
+                if owner == "automation"
+                else "manual" if self.owner else "free"
+            )
+        )
+        if owner == "automation" and not self.pending and self.owner:
+            self.disable(
+                "Automation running. Manual control disabled. Use Take Over to interrupt."
+            )
         return {
             "device": asdict(self.device) if self.device else None,
             "camera": camera,
             "calibrated": self.calibration is not None,
             "corners": self.calibration.corners.tolist() if self.calibration else [],
             "enabled": self.owner is not None,
-            "owned": self.owner == client and self.owner is not None,
+            "owned": self.owner == client
+            and self.owner is not None
+            and not self.pending,
+            "pending": self.pending,
+            "pending_owned": self.pending and self.owner == client,
+            "control_status": control_status,
             "message": self.message,
         }
 
 
-def create_app(camera, android=None):
+def create_app(camera, android=None, device_locks=None):
     app = Flask(__name__)
     app.config.update(MAX_CONTENT_LENGTH=8192, TRUSTED_HOSTS=["localhost", "127.0.0.1"])
     token = secrets.token_urlsafe(32)
-    state = ControlState(android or AndroidControl(), camera)
+    state = ControlState(android or AndroidControl(), camera, device_locks)
     app.extensions["control_state"] = state
     app.config["CONTROL_TOKEN"] = token
 
@@ -127,6 +220,28 @@ def create_app(camera, android=None):
             state.disable(str(exc))
         LOG.warning("%s", exc)
         return jsonify(error=str(exc)), 409
+
+    @app.errorhandler(DeviceBusy)
+    def device_busy(exc):
+        with state.lock:
+            if state.pending:
+                return (
+                    jsonify(
+                        ok=False,
+                        error="takeover_requested",
+                        owner=exc.owner,
+                        pending=True,
+                    ),
+                    409,
+                )
+            state.disable(
+                "Device busy. Enable Manual Control again after it is released."
+            )
+        return jsonify(ok=False, error="device_busy", owner=exc.owner), 409
+
+    @app.errorhandler(NoAutomation)
+    def no_automation(exc):
+        return jsonify(ok=False, error="no_automation", owner="free"), 409
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
@@ -186,22 +301,81 @@ def create_app(camera, android=None):
                     raise ValueError(
                         "Another browser tab owns Manual Control. Disable it first."
                     )
-                state.owner, state.expires = client, time.monotonic() + LEASE_SECONDS
-                state.message = "Manual Control enabled. Each click sends one tap."
-                LOG.info("Manual Control enabled")
-            return jsonify(enabled=state.owner is not None)
+                if state.pending:
+                    raise DeviceBusy("automation")
+                with state.device_locks.hold(state.device.serial, "manual"):
+                    state.owner = client
+                    state.renew_lease()
+                    state.message = "Manual control active."
+                    LOG.info("Manual Control enabled")
+            return jsonify(
+                enabled=state.owner is not None and not state.pending,
+                pending=state.pending,
+            ), (202 if state.pending else 200)
+
+    @app.post("/api/takeover")
+    def takeover():
+        data, client = payload(), client_id()
+        if data:
+            raise ValueError("Take Over expects an empty JSON object.")
+        with state.lock:
+            state.refresh()
+            if state.device is None:
+                raise DeviceError(state.message)
+            # Cancelling automation is safe without calibration or a live camera.
+            # Only resuming actual manual input needs those existing safeguards.
+            if (
+                not state.pending
+                and state.device_locks.owner(state.device.serial) == "automation"
+            ):
+                state.disable("Automation running. Manual control disabled.")
+            if state.owner and state.owner != client:
+                raise ValueError(
+                    "Another browser tab owns Manual Control. Disable it first."
+                )
+            if not state.pending:
+                state.manual_claim = state.device_locks.request_takeover(
+                    state.device.serial
+                )
+                state.owner = client
+                LOG.info("Takeover requested on %s", state.device.serial)
+            state.renew_lease()
+            state.message = "Takeover requested. Waiting for automation to yield."
+            # Never wait for ADB or claim manual ownership inside this request.
+            return (
+                jsonify(
+                    enabled=False, pending=True, control_status="takeover_requested"
+                ),
+                202,
+            )
 
     @app.post("/api/heartbeat")
     def heartbeat():
         data, client = payload(), client_id()
         with state.lock:
             if state.owner == client and time.monotonic() < state.expires:
+                state.require_ready()
                 state.require_frame(data.get("frame_id"))
-                state.expires = time.monotonic() + LEASE_SECONDS
+                if state.owner == client:
+                    if state.pending:
+                        state.renew_lease()
+                        if state.claim_manual() and state.calibration is None:
+                            state.disable(
+                                "Automation stopped. Calibrate before enabling manual input."
+                            )
+                    elif state.device_locks.owner(state.device.serial) == "automation":
+                        state.disable(
+                            "Automation running. Manual control disabled. Use Take Over to interrupt."
+                        )
+                    else:
+                        state.renew_lease()
 
             elif state.owner == client:
                 state.disable("Control heartbeat expired. Enable Manual Control again.")
-            return jsonify(enabled=state.owner == client)
+            return jsonify(
+                enabled=state.owner == client and not state.pending,
+                pending=state.owner == client and state.pending,
+            )
 
     @app.route("/api/calibration", methods=["POST", "DELETE"])
     def calibrate():
@@ -226,61 +400,68 @@ def create_app(camera, android=None):
             LOG.info("Four-corner calibration saved for %s", state.device.serial)
             return jsonify(calibrated=True, corners=calibration.corners.tolist())
 
+    @app.post("/api/key")
+    def key():
+        data, client = payload(), client_id()
+        if set(data) != {"type", "value", "frame_id"}:
+            raise ValueError("Expected type, value, and frame_id only.")
+        validate_key(data["type"], data["value"])
+        if type(data["frame_id"]) is not int:
+            raise ValueError("A fresh camera frame is required.")
+        if not state.action_lock.acquire(blocking=False):
+            return jsonify(error="Controller busy. No action sent."), 409
+        try:
+            with state.lock, state.input_control(client, data["frame_id"]):
+                try:
+                    state.android.send_key(state.device, data["type"], data["value"])
+                except DeviceError as exc:
+                    state.disable(str(exc))
+                    raise
+                return jsonify(sent=True)
+        finally:
+            state.action_lock.release()
+
     @app.post("/api/action")
     def action():
         data, client = payload(), client_id()
         # Drop overlapping inputs instead of building a queue of phone commands.
         if not state.action_lock.acquire(blocking=False):
             return jsonify(error="Controller busy. No action sent."), 409
-        state.lock.acquire()
-
         try:
-            state.require_ready()
-            state.require_frame(data.get("frame_id"))
+            with state.lock, state.input_control(client, data.get("frame_id")):
+                name = data.get("action")
 
-            if (
-                state.owner != client
-                or time.monotonic() >= state.expires
-                or state.calibration is None
-            ):
-                raise ValueError(
-                    "Input disabled. Enable Manual Control in this tab first."
-                )
+                if name not in (
+                    "tap",
+                    "back",
+                    "home",
+                    "recents",
+                    "swipe_up",
+                    "swipe_down",
+                    "swipe_left",
+                    "swipe_right",
+                    "screen_on",
+                    "screen_off",
+                ):
+                    raise ValueError("Unsupported control action.")
 
-            name = data.get("action")
+                pixel, normalized = None, None
 
-            if name not in (
-                "tap",
-                "back",
-                "home",
-                "recents",
-                "swipe_up",
-                "swipe_down",
-                "swipe_left",
-                "swipe_right",
-                "screen_on",
-                "screen_off",
-            ):
-                raise ValueError("Unsupported control action.")
+                if name == "tap":
+                    pixel, normalized = state.calibration.pixel(
+                        [data.get("x"), data.get("y")],
+                        state.device.width,
+                        state.device.height,
+                    )
 
-            pixel, normalized = None, None
+                try:
+                    state.android.send(state.device, name, pixel)
+                except DeviceError as exc:
+                    state.disable(str(exc))
+                    raise
 
-            if name == "tap":
-                pixel, normalized = state.calibration.pixel(
-                    [data.get("x"), data.get("y")],
-                    state.device.width,
-                    state.device.height,
-                )
-
-            try:
-                state.android.send(state.device, name, pixel)
-            except DeviceError as exc:
-                state.disable(str(exc))
-                raise
-
-            return jsonify(action=name, pixel=pixel, normalized=normalized)
+                return jsonify(action=name, pixel=pixel, normalized=normalized)
         finally:
-            state.lock.release()
             state.action_lock.release()
 
     return app
@@ -375,6 +556,8 @@ def main():
         )
 
     finally:
+        with app.extensions["control_state"].lock:
+            app.extensions["control_state"].disable()
         camera.close()
 
 

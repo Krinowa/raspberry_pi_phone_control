@@ -42,6 +42,7 @@
               id="video"
               width="1280"
               height="720"
+              tabindex="-1"
               aria-label="Live external camera. Click the calibrated phone display to tap."
             ></canvas>
             <div id="video-placeholder">Waiting for camera access…</div>
@@ -58,14 +59,30 @@
               <h2>Input</h2>
               <span id="mode" class="badge">Disabled</span>
             </div>
-            <p>
+            <p id="control-help">
               Enable control when you are ready. Each click sends one tap to the
               phone.
             </p>
             <button id="enable" class="primary" disabled>
               Enable Manual Control
             </button>
+            <button id="takeover" class="stop" hidden disabled>
+              Take Over
+            </button>
             <button id="disable" class="stop">Disable input</button>
+            <p
+              id="keyboard-state"
+              class="badge"
+              role="status"
+              aria-live="polite"
+            >
+              Keyboard control inactive
+            </p>
+            <p class="small">
+              Click a text field on the phone, then type here. Letters, numbers,
+              punctuation, Space, Enter, Backspace, and Tab are supported.
+              Browser shortcuts stay local. Shift+Tab navigates this dashboard.
+            </p>
             <div class="controls">
               <button data-action="back" disabled>← Back</button>
               <button data-action="home" disabled>⌂ Home</button>
