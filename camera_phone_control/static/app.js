@@ -14,7 +14,11 @@ let calibrating = false,
   corners = [],
   manual = false,
   busy = false;
+const PI_STATUS_POLL_INTERVAL_MS = 5000;
+let statusPollInFlight = false;
+let statusPollTimer = null;
 let controlVersion = 0;
+let keyboardArmed = false;
 
 function notice(text, error = false) {
   $("notice").textContent = text;
@@ -28,6 +32,7 @@ async function api(path, data, method = "POST") {
       "Content-Type": "application/json",
       "X-Control-Token": token,
       "X-Control-Client": clientId,
+      "X-Recorder-Client": window.phoneRecorder?.ownerId || clientId,
     },
     body: method === "GET" ? undefined : JSON.stringify(data ?? {}),
     cache: "no-store",
@@ -55,9 +60,10 @@ function active() {
   );
 }
 
-function keyboardActive() {
+function keyboardEligible() {
   return (
     active() &&
+    !window.phoneRecorder?.capturesPreview() &&
     state?.enabled &&
     state?.calibrated &&
     !!state?.device &&
@@ -67,7 +73,19 @@ function keyboardActive() {
   );
 }
 
+function keyboardActive() {
+  return (
+    keyboardArmed && document.activeElement === canvas && keyboardEligible()
+  );
+}
+
+function releaseKeyboard() {
+  keyboardArmed = false;
+  renderKeyboard();
+}
+
 function renderKeyboard() {
+  if (!keyboardEligible()) keyboardArmed = false;
   const enabled = keyboardActive();
   $("keyboard-state").textContent = enabled
     ? busy
@@ -75,15 +93,34 @@ function renderKeyboard() {
       : "Keyboard control active"
     : "Keyboard control inactive";
   $("keyboard-state").classList.toggle("active", enabled && !busy);
+  canvas.classList.toggle("keyboard-active", enabled);
+  $("keyboard-help").textContent = enabled
+    ? "Type on your laptop to control the phone. Press Esc to release keyboard control."
+    : "Click or focus the phone view to enable keyboard control.";
 }
 
 function render() {
-  $("serial").textContent = state?.device?.serial || "No authorized USB phone";
+  const piMode = state?.manual_backend === "raspberry_pi";
+  $("serial").textContent =
+    state?.device?.label ||
+    state?.device?.serial ||
+    (piMode ? "Bluetooth phone unavailable" : "No authorized USB phone");
+  $("pi-connection").hidden = !piMode;
+  $("pi-api-state").textContent =
+    state?.pi?.api === "online" ? "Online" : "Pi Offline";
+  $("pi-phone-state").textContent =
+    state?.pi?.phone === "connected"
+      ? "Connected"
+      : state?.pi?.api === "online"
+        ? "Phone Waiting"
+        : "Unknown";
 
   const d = state?.device;
 
   $("resolution").textContent = d
-    ? `${d.width} × ${d.height} · rotation ${d.rotation * 90}°`
+    ? d.normalized
+      ? "Camera-calibrated coordinates"
+      : `${d.width} × ${d.height} · rotation ${d.rotation * 90}°`
     : "—";
 
   $("camera-state").textContent = state?.camera?.ready
@@ -138,7 +175,13 @@ function render() {
 
   $("save").disabled = !calibrating || corners.length !== 4 || busy || !fresh();
   document.querySelectorAll("[data-action]").forEach((button) => {
-    button.disabled = !active() || busy;
+    const supported =
+      !state?.supported_actions ||
+      state.supported_actions.includes(button.dataset.action);
+    button.disabled = !active() || busy || !supported;
+    button.title = supported
+      ? ""
+      : "This action is not provided by the Pi API.";
   });
 
   document.querySelectorAll("#corner-list li").forEach((item, i) => {
@@ -231,6 +274,8 @@ async function report(task) {
 }
 
 async function refreshStatus() {
+  if (statusPollInFlight) return;
+  statusPollInFlight = true;
   const version = controlVersion;
   try {
     const next = await api("/api/status", undefined, "GET");
@@ -262,7 +307,7 @@ async function refreshStatus() {
     notice(`Backend unavailable: ${error.message}`, true);
     render();
   } finally {
-    setTimeout(refreshStatus, 1800);
+    statusPollInFlight = false;
   }
 }
 
@@ -405,6 +450,9 @@ $("save").addEventListener("click", () =>
 );
 
 async function sendAction(action, point) {
+  if (window.phoneRecorder?.capturesPreview()) {
+    return window.phoneRecorder.action(action, point);
+  }
   if (!active() || busy) return;
 
   await report(async () => {
@@ -413,9 +461,11 @@ async function sendAction(action, point) {
 
     try {
       const result = await api("/api/action", data);
-      if (result.pixel) {
-        $("coordinates").textContent =
-          `${result.normalized.map((v) => v.toFixed(3)).join(", ")} → ${result.pixel.join(", ")} px`;
+      if (result.normalized) {
+        const position = result.normalized.map((v) => v.toFixed(3)).join(", ");
+        $("coordinates").textContent = result.pixel
+          ? `${position} → ${result.pixel.join(", ")} px`
+          : position;
       }
 
       notice(`Sent ${action.replaceAll("_", " ")}.`);
@@ -428,11 +478,33 @@ async function sendAction(action, point) {
   });
 }
 
+const phoneKeys = {
+  Enter: "enter",
+  Backspace: "backspace",
+  Tab: "tab",
+  ArrowLeft: "left",
+  ArrowRight: "right",
+  ArrowUp: "up",
+  ArrowDown: "down",
+  Delete: "delete",
+  Home: "home",
+  End: "end",
+  PageUp: "pageup",
+  PageDown: "pagedown",
+};
+
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && keyboardArmed) {
+    event.preventDefault();
+    releaseKeyboard();
+    canvas.blur();
+    return;
+  }
   if (
     !keyboardActive() ||
     busy ||
     event.defaultPrevented ||
+    event.repeat ||
     event.ctrlKey ||
     event.metaKey ||
     event.altKey ||
@@ -457,12 +529,9 @@ document.addEventListener("keydown", (event) => {
   if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
     type = "text";
     value = event.key;
-  } else if (
-    !event.shiftKey &&
-    ["Enter", "Backspace", "Tab"].includes(event.key)
-  ) {
+  } else if (!event.shiftKey && Object.hasOwn(phoneKeys, event.key)) {
     type = "key";
-    value = event.key.toLowerCase();
+    value = phoneKeys[event.key];
   } else return;
 
   event.preventDefault();
@@ -480,11 +549,31 @@ document.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("focus", renderKeyboard);
-window.addEventListener("blur", renderKeyboard);
+window.addEventListener("blur", releaseKeyboard);
+
+canvas.addEventListener("focus", () => {
+  keyboardArmed = keyboardEligible();
+  renderKeyboard();
+});
+
+canvas.addEventListener("blur", releaseKeyboard);
+
+document.addEventListener("focusin", (event) => {
+  if (event.target !== canvas) releaseKeyboard();
+});
+
+document.addEventListener("pointerdown", (event) => {
+  if (event.target !== canvas) releaseKeyboard();
+});
 
 canvas.addEventListener("click", (event) => {
+  if (!calibrating && window.phoneRecorder?.capturesPreview()) return;
   if (!fresh() || busy) return;
+
   canvas.focus({ preventScroll: true });
+  keyboardArmed = keyboardEligible();
+  renderKeyboard();
+
   const box = canvas.getBoundingClientRect();
   const point = [
     (event.clientX - box.left) / box.width,
@@ -529,6 +618,8 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("pagehide", () => {
+  clearInterval(statusPollTimer);
+  statusPollTimer = null;
   // Best effort on close; the server's six-second lease is the fallback.
   if (manual)
     fetch("/api/control", {
@@ -538,11 +629,18 @@ window.addEventListener("pagehide", () => {
         "Content-Type": "application/json",
         "X-Control-Token": token,
         "X-Control-Client": clientId,
+        "X-Recorder-Client": window.phoneRecorder?.ownerId || clientId,
       },
       body: JSON.stringify({ enabled: false }),
     }).catch(() => {});
 });
 
+function startStatusPolling() {
+  if (statusPollTimer !== null) return;
+  statusPollTimer = setInterval(refreshStatus, PI_STATUS_POLL_INTERVAL_MS);
+  refreshStatus();
+}
+window.addEventListener("pageshow", startStatusPolling);
 render();
-refreshStatus();
+startStatusPolling();
 videoLoop();

@@ -4,12 +4,15 @@ import argparse
 import logging
 import signal
 import threading
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from android_control import AndroidControl, DeviceError
 from device_lock import DeviceBusy, DeviceLocks
 from .context import AutomationContext, Cancelled
+from .backends import select_device, backend_names
+from .input.base import UnsupportedOperation
 from .scripts import SCRIPTS, available_scripts
 
 LOG = logging.getLogger("automation")
@@ -29,6 +32,9 @@ class RunState:
     current_step: str | None = None
     message: str = "Starting script."
     takeover_requested: bool = False
+    step_index: int = 0
+    step_count: int = 0
+    checkpoint_message: str | None = None
 
     @property
     def exit_code(self):
@@ -42,9 +48,10 @@ class RunState:
 class Runner:
     """One run at a time per instance; separate instances may target other devices."""
 
-    def __init__(self, controller=None, device_locks=None):
+    def __init__(self, controller=None, device_locks=None, logger=None):
         self.controller = controller or AndroidControl()
         self.device_locks = device_locks or DeviceLocks()
+        self.logger = logger or LOG
         self.state = None
         self._run_lock = threading.Lock()
 
@@ -56,8 +63,22 @@ class Runner:
         finally:
             self._run_lock.release()
 
-    def _run(self, script_name, serial, cancel_event):
-        script = SCRIPTS.get(script_name)
+    def run_task(
+        self, name, task, serial=None, *, cancel_event=None, resume_event=None
+    ):
+        """Use the same device ownership lifecycle for data-driven workflows."""
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("This runner is already running.")
+        try:
+            return self._run(
+                name, serial, cancel_event or threading.Event(), task, resume_event
+            )
+        finally:
+            self._run_lock.release()
+
+    def _run(self, script_name, serial, cancel_event, task=None, resume_event=None):
+        backend_names()  # Fail with an actionable configuration error before discovery.
+        script = task or SCRIPTS.get(script_name)
         self.state = state = RunState(
             script_name if script else "unknown", start_time=now()
         )
@@ -72,30 +93,61 @@ class Runner:
             if cancel_event.is_set():
                 raise Cancelled()
 
-            device = self.controller.device(serial=serial, authorized_only=True)
+            device = select_device(self.controller, serial)
             state.device_serial = device.serial
 
             if cancel_event.is_set():
                 raise Cancelled()
 
             stage = "locking"
-            with self.device_locks.hold(device.serial, "automation") as ownership:
+            with ExitStack() as stack:
+                ownership = stack.enter_context(
+                    self.device_locks.hold(device.serial, "automation")
+                )
                 acquired = True
-                LOG.info(
+                self.logger.info(
                     "Automation ownership acquired. Lock acquired on %s", device.serial
                 )
-                LOG.info("Script started: %s on %s", script_name, device.serial)
+                self.logger.info("Script started: %s on %s", script_name, device.serial)
                 stage = "script"
 
                 context = AutomationContext(
                     device,
                     self.controller,
                     cancel_event,
-                    LOG,
+                    self.logger,
                     state,
-                    ownership.takeover_requested,
+                    lambda: ownership.takeover_requested(),
                 )
 
+                def manual_checkpoint(message):
+                    nonlocal ownership
+                    if resume_event is None:
+                        raise RuntimeError(
+                            "Manual checkpoints require a resumable runner."
+                        )
+                    context.check_cancelled()
+                    resume_event.clear()
+                    stack.close()
+                    state.checkpoint_message = message
+                    state.status = "waiting_manual"
+                    self.logger.info(
+                        "Manual checkpoint entered; device ownership released."
+                    )
+                    while not resume_event.wait(0.05):
+                        context.check_cancelled()
+                    context.check_cancelled()
+                    ownership = stack.enter_context(
+                        self.device_locks.hold(device.serial, "automation")
+                    )
+                    context._check_device()
+                    state.checkpoint_message = None
+                    state.status = "running"
+                    self.logger.info(
+                        "Manual checkpoint resumed; device ownership acquired."
+                    )
+
+                context.manual_handler = manual_checkpoint
                 context.check_cancelled()
                 script(context)
                 context.check_cancelled()
@@ -113,7 +165,7 @@ class Runner:
             state.message = "Script cancelled. No further steps will run."
         except DeviceBusy as exc:
             state.status = "failed"
-            state.message = f"Device busy ({exc.owner}). No script input sent."
+            state.message = f"Device busy ({exc.owner}). No further input sent."
         except DeviceError as exc:
             state.status = "failed"
             # Discovery happens before scripts receive any input. Runtime exceptions
@@ -126,6 +178,9 @@ class Runner:
                     "phone geometry. An input may have occurred; it will not be retried."
                 )
             )
+        except UnsupportedOperation as exc:
+            state.status = "failed"
+            state.message = str(exc)
         except (Exception, SystemExit):
             state.status = "failed"
             state.message = (
@@ -135,13 +190,13 @@ class Runner:
             )
         finally:
             if acquired:
-                LOG.info(
+                self.logger.info(
                     "Automation ownership released. Lock released on %s",
                     state.device_serial,
                 )
             state.end_time = now()
             # No exception strings, arguments, input values, or script locals here.
-            log = LOG.error if state.status == "failed" else LOG.info
+            log = self.logger.error if state.status == "failed" else self.logger.info
             log(
                 "Script %s: %s; step=%s. %s",
                 state.status,

@@ -2,11 +2,13 @@
 
 import argparse
 import logging
+import os
 import secrets
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from types import SimpleNamespace
 
 from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
@@ -15,14 +17,27 @@ from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration
 from camera import Camera
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
+from automation.backends import backend_names, select_device
+from automation.context import AutomationContext
+from automation.workflows.api import register_workflows
+from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
+from hardware.raspberry_pi_input import RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
+PI_STATUS_POLL_INTERVAL_SECONDS = 5
 
 
 class ControlState:
-    def __init__(self, android, camera, device_locks=None):
+    def __init__(self, android, camera, device_locks=None, *, pi_bridge=None):
         self.android, self.camera = android, camera
+        self.pi_bridge = pi_bridge
+        self.pi_connection = {
+            "api": "offline",
+            "phone": "unknown",
+            "message": "Waiting for Pi status.",
+        }
+        self.pi_polled_at = None
         self.lock = threading.RLock()
         self.action_lock = threading.Lock()
         self.device_locks = device_locks or DeviceLocks()
@@ -89,10 +104,28 @@ class ControlState:
         )
         return False
 
+    def poll_pi_status(self):
+        # Called only by status routes under state.lock. Share the cache across tabs.
+        now = time.monotonic()
+        if (
+            self.pi_polled_at is None
+            or now - self.pi_polled_at >= PI_STATUS_POLL_INTERVAL_SECONDS
+        ):
+            self.pi_polled_at = now
+            self.pi_connection = self.pi_bridge.connection_state()
+        return self.pi_connection
+
     def refresh(self):
         errors = []
         try:
-            self.device = self.android.device()
+            if self.pi_bridge is not None:
+                if self.pi_connection["phone"] == "connected":
+                    self.device = self.pi_bridge.target
+                else:
+                    self.device = None
+                    errors.append(self.pi_connection["message"])
+            else:
+                self.device = select_device(self.android, authorized_only=False)
         except DeviceError as exc:
             self.device = None
             errors.append(str(exc))
@@ -146,6 +179,8 @@ class ControlState:
             yield
 
     def snapshot(self, client):
+        if self.pi_bridge is not None:
+            self.poll_pi_status()
         camera = self.refresh()
         owner = self.device_locks.owner(self.device.serial) if self.device else None
         control_status = (
@@ -163,6 +198,13 @@ class ControlState:
             )
         return {
             "device": asdict(self.device) if self.device else None,
+            "manual_backend": (
+                "raspberry_pi" if self.pi_bridge is not None else "appium"
+            ),
+            "pi": self.pi_connection,
+            "supported_actions": (
+                sorted(self.pi_bridge.ACTIONS) if self.pi_bridge is not None else None
+            ),
             "camera": camera,
             "calibrated": self.calibration is not None,
             "corners": self.calibration.corners.tolist() if self.calibration else [],
@@ -177,11 +219,42 @@ class ControlState:
         }
 
 
-def create_app(camera, android=None, device_locks=None):
+def create_app(
+    camera,
+    android=None,
+    device_locks=None,
+    workflow_storage=None,
+    *,
+    manual_backend=None,
+    pi_client=None
+):
+    automation_input, _ = (
+        backend_names()
+    )  # Existing automation configuration is unchanged.
+    # An explicitly injected Android controller retains legacy test/embedding behavior.
+    # Normal dashboard startup selects Pi manual control; there is no failure fallback.
+    manual_backend = (
+        manual_backend
+        or os.environ.get("PHONE_MANUAL_INPUT_BACKEND")
+        or (
+            "appium"
+            if pi_client is None and (android is not None or automation_input == "mock")
+            else "raspberry_pi"
+        )
+    )
+    if manual_backend not in {"raspberry_pi", "appium"}:
+        raise ValueError("PHONE_MANUAL_INPUT_BACKEND must be raspberry_pi or appium.")
+    pi_bridge = (
+        RaspberryPiInputBridge(pi_client) if manual_backend == "raspberry_pi" else None
+    )
     app = Flask(__name__)
-    app.config.update(MAX_CONTENT_LENGTH=8192, TRUSTED_HOSTS=["localhost", "127.0.0.1"])
+    app.config.update(
+        MAX_CONTENT_LENGTH=1024 * 1024, TRUSTED_HOSTS=["localhost", "127.0.0.1"]
+    )
     token = secrets.token_urlsafe(32)
-    state = ControlState(android or AndroidControl(), camera, device_locks)
+    state = ControlState(
+        android or AndroidControl(), camera, device_locks, pi_bridge=pi_bridge
+    )
     app.extensions["control_state"] = state
     app.config["CONTROL_TOKEN"] = token
 
@@ -206,7 +279,7 @@ def create_app(camera, android=None, device_locks=None):
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+            "img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         )
         return response
 
@@ -214,6 +287,7 @@ def create_app(camera, android=None, device_locks=None):
     def invalid_input(exc):
         return jsonify(error=str(exc)), 400
 
+    @app.errorhandler(PiApiError)
     @app.errorhandler(DeviceError)
     def device_error(exc):
         with state.lock:
@@ -269,6 +343,17 @@ def create_app(camera, android=None, device_locks=None):
     def status():
         with state.lock:
             return jsonify(state.snapshot(client_id()))
+
+    @app.get("/api/pi/status")
+    def pi_status():
+        if state.pi_bridge is None:
+            return jsonify(
+                api="not_selected",
+                phone="unknown",
+                message="Pi manual control is not selected.",
+            )
+        with state.lock:
+            return jsonify(state.poll_pi_status())
 
     @app.get("/api/frame")
     def frame():
@@ -413,10 +498,48 @@ def create_app(camera, android=None, device_locks=None):
         try:
             with state.lock, state.input_control(client, data["frame_id"]):
                 try:
-                    state.android.send_key(state.device, data["type"], data["value"])
-                except DeviceError as exc:
+                    if state.pi_bridge is not None:
+                        if data["type"] == "text":
+                            state.pi_bridge.type_text(data["value"])
+                        else:
+                            state.pi_bridge.key(data["value"])
+                    else:
+                        context = AutomationContext(
+                            state.device,
+                            state.android,
+                            threading.Event(),
+                            LOG,
+                            SimpleNamespace(),
+                        )
+                        context.send_key(data["type"], data["value"])
+                except (DeviceError, PiApiError) as exc:
                     state.disable(str(exc))
                     raise
+                return jsonify(sent=True)
+        finally:
+            state.action_lock.release()
+
+    @app.post("/api/text")
+    def text_input():
+        data, client = payload(), client_id()
+        if set(data) != {"text", "frame_id"}:
+            raise ValueError("Expected text and frame_id only.")
+        validate_pi_text(data["text"])
+        if not state.action_lock.acquire(blocking=False):
+            return jsonify(error="Controller busy. No action sent."), 409
+        try:
+            with state.lock, state.input_control(client, data["frame_id"]):
+                if state.pi_bridge is not None:
+                    state.pi_bridge.type_text(data["text"])
+                else:
+                    context = AutomationContext(
+                        state.device,
+                        state.android,
+                        threading.Event(),
+                        LOG,
+                        SimpleNamespace(),
+                    )
+                    context.input.type_text(data["text"])
                 return jsonify(sent=True)
         finally:
             state.action_lock.release()
@@ -448,15 +571,30 @@ def create_app(camera, android=None, device_locks=None):
                 pixel, normalized = None, None
 
                 if name == "tap":
-                    pixel, normalized = state.calibration.pixel(
-                        [data.get("x"), data.get("y")],
-                        state.device.width,
-                        state.device.height,
-                    )
+                    if state.pi_bridge is not None:
+                        normalized = state.calibration.map(
+                            [data.get("x"), data.get("y")]
+                        )
+                    else:
+                        pixel, normalized = state.calibration.pixel(
+                            [data.get("x"), data.get("y")],
+                            state.device.width,
+                            state.device.height,
+                        )
 
                 try:
-                    state.android.send(state.device, name, pixel)
-                except DeviceError as exc:
+                    if state.pi_bridge is not None:
+                        state.pi_bridge.action(name, normalized)
+                    else:
+                        context = AutomationContext(
+                            state.device,
+                            state.android,
+                            threading.Event(),
+                            LOG,
+                            SimpleNamespace(),
+                        )
+                        context.send(name, pixel)
+                except (DeviceError, PiApiError) as exc:
                     state.disable(str(exc))
                     raise
 
@@ -464,6 +602,7 @@ def create_app(camera, android=None, device_locks=None):
         finally:
             state.action_lock.release()
 
+    register_workflows(app, state, payload, client_id, workflow_storage)
     return app
 
 

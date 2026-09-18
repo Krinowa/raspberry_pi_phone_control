@@ -1,22 +1,16 @@
 """Four camera corners -> normalized Android display, using a homography."""
 
-import math
-
 import numpy as np
+
+from automation.coordinates import normalized_to_device, unit
 
 
 def unit_point(value):
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError("A point must contain x and y.")
 
-    if any(
-        isinstance(v, bool)
-        or not isinstance(v, (int, float))
-        or not math.isfinite(v)
-        or not 0 <= v <= 1
-        for v in value
-    ):
-        raise ValueError("Coordinates must be finite numbers between 0 and 1.")
+    for coordinate in value:
+        unit(coordinate)
     return np.array(value, dtype=float)
 
 
@@ -105,8 +99,4 @@ class Calibration:
 
     def pixel(self, point, width, height):
         u, v = self.map(point)
-        # Nearest pixel; a tiny tolerance prevents solver noise changing half-pixels.
-        return (
-            math.floor(u * (width - 1) + 0.5 + 1e-9),
-            math.floor(v * (height - 1) + 0.5 + 1e-9),
-        ), (u, v)
+        return normalized_to_device(u, v, width, height), (u, v)

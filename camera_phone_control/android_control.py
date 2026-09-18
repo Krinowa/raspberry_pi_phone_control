@@ -12,6 +12,15 @@ KEY_EVENTS = {
     "enter": "KEYCODE_ENTER",
     "backspace": "KEYCODE_DEL",
     "tab": "KEYCODE_TAB",
+    "left": "KEYCODE_DPAD_LEFT",
+    "right": "KEYCODE_DPAD_RIGHT",
+    "up": "KEYCODE_DPAD_UP",
+    "down": "KEYCODE_DPAD_DOWN",
+    "delete": "KEYCODE_FORWARD_DEL",
+    "home": "KEYCODE_MOVE_HOME",
+    "end": "KEYCODE_MOVE_END",
+    "pageup": "KEYCODE_PAGE_UP",
+    "pagedown": "KEYCODE_PAGE_DOWN",
 }
 
 
@@ -19,8 +28,10 @@ def validate_key(kind, value):
     # A single printable ASCII character, never a string of commands or Unicode.
     if not isinstance(kind, str) or not isinstance(value, str):
         raise ValueError("Invalid keyboard input.")
+
     if kind == "text" and len(value) == 1 and " " <= value <= "~":
         return
+
     if kind == "key" and value in KEY_EVENTS:
         return
     raise ValueError("Unsupported keyboard input.")
@@ -72,7 +83,7 @@ class AndroidControl:
             ) from None
         # Keyboard values must never enter the normal action log.
 
-    def _adb(self, *args):
+    def _adb(self, *args, binary=False):
 
         if not shutil.which("adb"):
             raise DeviceError(
@@ -83,7 +94,7 @@ class AndroidControl:
             result = subprocess.run(
                 ["adb", *args],
                 capture_output=True,
-                text=True,
+                text=not binary,
                 timeout=8,
                 check=False,
                 # A runner's Ctrl+C cancels between commands, not inside ADB.
@@ -100,7 +111,7 @@ class AndroidControl:
             raise DeviceError(
                 "ADB failed; check the USB cable, phone authorization, and device state."
             )
-        return result.stdout.strip()
+        return result.stdout if binary else result.stdout.strip()
 
     def device(self, serial=None, *, authorized_only=False):
         rows = []
@@ -317,3 +328,24 @@ class AndroidControl:
         )
 
         return output
+
+    def swipe(self, device, start, end, duration_ms=300):
+        if type(duration_ms) is not int or not 1 <= duration_ms <= 60000:
+            raise ValueError("Swipe duration must be 1–60000 milliseconds.")
+        for x, y in (start, end):
+            if not (0 <= x < device.width and 0 <= y < device.height):
+                raise ValueError("Swipe is outside the Android display.")
+        self._adb(
+            "-s",
+            device.serial,
+            "shell",
+            "input",
+            "swipe",
+            *(str(v) for v in (*start, *end, duration_ms)),
+        )
+        LOG.info("Input swipe on %s", device.serial)
+
+    def screenshot(self, device):
+        return self._adb(
+            "-s", device.serial, "exec-out", "screencap", "-p", binary=True
+        )

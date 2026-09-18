@@ -10,25 +10,41 @@
       href="{{ url_for('static', filename='style.css') }}"
     />
     <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+    <script
+      defer
+      src="{{ url_for('static', filename='workflows.js') }}"
+    ></script>
   </head>
   <body>
     <main>
       <header>
         <div>
-          <p class="eyebrow">USB PHONE / EXTERNAL CAMERA</p>
+          <p class="eyebrow">PHONE CONTROL / EXTERNAL CAMERA</p>
           <h1>Local control</h1>
         </div>
         <span class="local-tag">● On this Mac only</span>
       </header>
       <section class="metrics" aria-label="Connection details">
         <div>
-          <span>Android device</span
+          <span>Phone control</span
           ><strong id="serial">Checking connection…</strong>
         </div>
         <div><span>Phone display</span><strong id="resolution">—</strong></div>
         <div>
           <span>External camera</span
           ><strong id="camera-state">Starting…</strong>
+        </div>
+      </section>
+      <section
+        id="pi-connection"
+        class="metrics pi-metrics"
+        aria-label="Pi connection status"
+      >
+        <div>
+          <span>Pi API</span><strong id="pi-api-state">Checking…</strong>
+        </div>
+        <div>
+          <span>Phone HID</span><strong id="pi-phone-state">Checking…</strong>
         </div>
       </section>
       <div class="workspace">
@@ -42,8 +58,9 @@
               id="video"
               width="1280"
               height="720"
-              tabindex="-1"
-              aria-label="Live external camera. Click the calibrated phone display to tap."
+              tabindex="0"
+              aria-label="Live external camera. Click to tap and control the keyboard. Press Escape to release."
+              aria-describedby="keyboard-help"
             ></canvas>
             <div id="video-placeholder">Waiting for camera access…</div>
           </div>
@@ -52,6 +69,7 @@
               >Input is disabled. Calibrate the display to begin.</span
             ><output id="coordinates">—</output>
           </div>
+          <div id="camera-record-controls"></div>
         </section>
         <aside>
           <section class="card">
@@ -78,10 +96,8 @@
             >
               Keyboard control inactive
             </p>
-            <p class="small">
-              Click a text field on the phone, then type here. Letters, numbers,
-              punctuation, Space, Enter, Backspace, and Tab are supported.
-              Browser shortcuts stay local. Shift+Tab navigates this dashboard.
+            <p id="keyboard-help" class="small">
+              Click or focus the phone view to enable keyboard control.
             </p>
             <div class="controls">
               <button data-action="back" disabled>← Back</button>
@@ -127,10 +143,159 @@
       <p id="notice" role="status" aria-live="polite">
         Checking the camera and USB phone…
       </p>
+      <section id="automations" class="card">
+        <div class="section-heading">
+          <h2>Automations</h2>
+          <button id="record-new" class="primary">Record New Flow</button>
+        </div>
+        <div id="record-ready" hidden>
+          <p>
+            Use the phone preview as usual. We’ll record your taps, swipes and
+            typing, then you can review and name the flow.
+          </p>
+          <p class="small">
+            Secure input belongs on the phone. Recognized secure screens and
+            unrecognized text fields become manual checkpoints.
+          </p>
+          <button id="record-start" class="primary">Start Recording</button>
+        </div>
+        <div id="record-controls-slot">
+          <div id="record-live" hidden>
+            <strong id="record-status" class="recording" role="status"
+              >● Recording</strong
+            >
+            <span id="record-count">Actions recorded: 0</span>
+            <button id="record-undo">Undo Last</button>
+            <button id="record-stop" class="primary">Stop Recording</button>
+          </div>
+        </div>
+        <div id="mock-recording-preview" hidden>
+          <p>
+            Interact with this phone preview to try recording without hardware.
+          </p>
+        </div>
+        <canvas
+          id="workflow-preview"
+          width="270"
+          height="480"
+          aria-label="Phone preview. Click, drag and type to record in mock mode."
+          tabindex="0"
+        ></canvas>
+        <div id="review-flow" hidden>
+          <h3>Review Flow</h3>
+          <label>Flow name <input id="flow-name" maxlength="160" /></label>
+          <button id="flow-rename">Rename Flow</button>
+          <ol id="record-steps" class="step-list review-timeline"></ol>
+          <form id="step-editor" hidden>
+            <h3 id="step-editor-title">Edit Step</h3>
+            <label>Step name <input id="step-name" maxlength="160" /></label>
+            <div id="step-input-options" hidden>
+              <label
+                >Use this input as
+                <select id="input-source">
+                  <option value="fixed">Keep Fixed</option>
+                  <option value="variable">Make Variable</option>
+                  <option value="manual">Manual</option>
+                </select></label
+              >
+              <div id="fixed-fields">
+                <label
+                  >Recorded value
+                  <input id="input-value" autocomplete="off" maxlength="4096"
+                /></label>
+              </div>
+              <div id="variable-fields" hidden>
+                <label
+                  >Variable name
+                  <input id="variable-name" placeholder="customer_name"
+                /></label>
+                <label
+                  >Label <input id="variable-label" placeholder="Customer Name"
+                /></label>
+                <label class="check"
+                  ><input id="variable-required" type="checkbox" checked />
+                  Required</label
+                >
+                <label
+                  >Default value (optional)
+                  <input id="variable-default" autocomplete="off"
+                /></label>
+                <label class="check"
+                  ><input id="variable-ask" type="checkbox" checked /> Ask When
+                  Running</label
+                >
+              </div>
+              <p id="manual-input-help" hidden>
+                The recorded value will be removed. Playback will pause for you
+                to complete this step on the phone.
+              </p>
+            </div>
+            <button id="step-apply" class="primary">Apply Changes</button
+            ><button id="step-close" type="button">Close</button>
+          </form>
+          <details id="review-insert">
+            <summary>Insert a wait or manual checkpoint</summary>
+            <label
+              >Insert after
+              <select id="insert-position"></select
+            ></label>
+            <div class="flow-buttons">
+              <input
+                id="record-wait-seconds"
+                type="number"
+                min="0"
+                max="3600"
+                step="0.1"
+                value="1"
+                aria-label="Wait seconds"
+              /><button id="record-wait">Insert Wait</button>
+            </div>
+            <label
+              >Checkpoint message
+              <input
+                id="checkpoint-message"
+                value="Complete this step manually, then Resume."
+                maxlength="500"
+            /></label>
+            <button id="record-checkpoint">Insert Manual Checkpoint</button>
+          </details>
+          <label class="check"
+            ><input id="flow-financial" type="checkbox" /> Financial preparation
+            flow — end with manual authorization</label
+          >
+          <div class="flow-buttons">
+            <button id="record-save" class="primary">Save Flow</button
+            ><button id="record-cancel">Discard Recording</button>
+          </div>
+        </div>
+        <div id="saved-flow-panel">
+          <h3>Saved Flows</h3>
+          <button id="flows-refresh">Refresh Flows</button>
+          <ul id="saved-flows" class="saved-flows"></ul>
+          <h3 id="run-title">Run Flow</h3>
+          <form id="flow-run-form">
+            <div id="run-variables"></div>
+            <button id="flow-run" class="primary" disabled>Start Run</button>
+          </form>
+          <div class="flow-buttons">
+            <button id="flow-resume" hidden>Resume after manual action</button
+            ><button id="flow-cancel" disabled>Stop Run</button>
+          </div>
+          <p id="flow-run-state" role="status" aria-live="polite">
+            No active run
+          </p>
+        </div>
+        <details id="workflow-debug">
+          <summary>Advanced / Debug</summary>
+          <p id="workflow-backend"></p>
+          <pre id="workflow-debug-data"></pre>
+          <pre id="workflow-logs" aria-label="Workflow execution logs"></pre>
+        </details>
+        <p id="workflow-notice" role="status" aria-live="polite"></p>
+      </section>
       <footer>
-        Manual navigation only. No macros, credentials, transactions, or
-        automatic warning acknowledgement. Use Android Settings for the first
-        test.
+        Local dashboard. Camera viewing, manual control, scripts and saved
+        workflows share device ownership.
       </footer>
     </main>
   </body>
