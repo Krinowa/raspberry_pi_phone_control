@@ -32,11 +32,14 @@ network and the phone must already be paired with the proven Pi HID setup.
 ## Check status
 
 The dashboard displays **Pi API: Online** and **Phone HID: Connected** using the
-Pi's `/status` alone, immediately on load and then every five seconds. Overlapping
-checks are skipped, and status routes share a five-second cache across tabs.
-Actions and lease heartbeats use cached status and never poll the Pi. `/health`
-remains available in the client for explicit diagnostics; it is not polled. It also distinguishes offline, waiting for the phone,
-and unknown phone status. Inspect the same summary without sending phone input:
+Pi's `/status` alone, once on dashboard load and once when you explicitly enable
+Manual Control. Enabling requires a fresh response reporting the phone HID as
+connected; a failed check or waiting phone leaves input disabled, without retrying.
+The badges retain the last-known status. There is no background Pi polling.
+Actions, lease heartbeats, and ordinary dashboard status requests never check the
+Pi. `/health` remains available in the client for explicit diagnostics.
+Reload the dashboard to refresh its badges, or request a fresh summary without
+sending phone input:
 
 ```zsh
 curl http://127.0.0.1:8765/api/pi/status
@@ -53,16 +56,16 @@ the four display corners: top-left, top-right, bottom-right, bottom-left. Save
 calibration and enable Manual Control. Existing fresh-frame, browser ownership,
 and input-lock checks still apply to every manual input, including Wake.
 
-| Dashboard action | Verification on phone |
-| --- | --- |
-| Wake screen | After the calibrated phone sleeps, click Wake; HID activity should wake it. It does not unlock the phone. |
-| Home | Home screen appears. |
-| Back | Open a harmless Settings subpage first; Back returns to the previous page. |
-| Camera preview click | Click a visible Settings item inside the calibration outline; that item opens. The backend sends normalized coordinates, never camera pixels. |
-| Swipe up/down/left/right | Open suitable scrollable content and check movement in each direction. |
-| Laptop typing | Click a harmless Android text field through the preview. With Keyboard control active, type `hello123`; verify the phone receives it. |
-| Laptop keys | Press Backspace and Enter; verify deletion and submission. Tab, arrows, Delete, Home, End, PageUp and PageDown are also supported. |
-| Escape | Keyboard control becomes inactive; subsequent typing sends nothing. Click a dashboard form and verify normal local typing. |
+| Dashboard action         | Verification on phone                                                                                                                         |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wake screen              | After the calibrated phone sleeps, click Wake; HID activity should wake it. It does not unlock the phone.                                     |
+| Home                     | Home screen appears.                                                                                                                          |
+| Back                     | Open a harmless Settings subpage first; Back returns to the previous page.                                                                    |
+| Camera preview click     | Click a visible Settings item inside the calibration outline; that item opens. The backend sends normalized coordinates, never camera pixels. |
+| Swipe up/down/left/right | Open suitable scrollable content and check movement in each direction.                                                                        |
+| Laptop typing            | Click a harmless Android text field through the preview. With Keyboard control active, type `hello123`; verify the phone receives it.         |
+| Laptop keys              | Press Backspace and Enter; verify deletion and submission. Tab, arrows, Delete, Home, End, PageUp and PageDown are also supported.            |
+| Escape                   | Keyboard control becomes inactive; subsequent typing sends nothing. Click a dashboard form and verify normal local typing.                    |
 
 Keyboard forwarding requires intentional focus on the camera surface and enabled
 manual ownership. Click the preview or focus it with keyboard navigation to arm;
@@ -85,15 +88,17 @@ not echoed in responses or errors.
 
 ## Incremental scope and tests
 
-Recorder, workflow storage/playback, scripts, and their backend selection are
-unchanged. Use `PHONE_MANUAL_INPUT_BACKEND=appium` for the existing USB workflow
-features. `PHONE_INPUT_BACKEND` and `PHONE_SCREEN_BACKEND` still configure those
-automation backends; do not set them to `raspberry_pi` in this integration.
+Manual input and workflow playback are independently configured. Use
+`PHONE_MANUAL_INPUT_BACKEND=appium` for legacy USB manual controls, or
+`PHONE_INPUT_BACKEND=raspberry_pi` for Pi workflow input playback. Screen selection
+remains `appium` or `mock`; it is not migrated to the camera. See
+[workflow playback configuration](WORKFLOWS.md#pi-workflow-playback).
 Existing global mock mode stays hardware-free unless Pi manual mode is explicitly
 selected.
 
-Pi input uses an endpoint-based lock identity. Legacy automation uses Android
-serial-based locks, so Take Over does not coordinate across these two transports.
+Pi manual input and Pi workflow playback share an endpoint-based lock identity,
+including Take Over. Legacy automation uses Android serial-based locks, so
+Take Over does not coordinate across these two transports.
 Do not run both against the same phone concurrently. Within each existing lock
 identity, ownership, cancellation, and takeover behavior are preserved.
 

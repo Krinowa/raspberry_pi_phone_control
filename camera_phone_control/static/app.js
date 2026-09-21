@@ -14,9 +14,8 @@ let calibrating = false,
   corners = [],
   manual = false,
   busy = false;
-const PI_STATUS_POLL_INTERVAL_MS = 5000;
-let statusPollInFlight = false;
-let statusPollTimer = null;
+let statusRefreshInFlight = false;
+let legacyStatusTimer = null;
 let controlVersion = 0;
 let keyboardArmed = false;
 
@@ -52,6 +51,7 @@ function fresh() {
 function active() {
   return (
     manual &&
+    !window.phoneRecorder?.blocksInput?.() &&
     state?.owned &&
     fresh() &&
     !calibrating &&
@@ -274,8 +274,8 @@ async function report(task) {
 }
 
 async function refreshStatus() {
-  if (statusPollInFlight) return;
-  statusPollInFlight = true;
+  if (statusRefreshInFlight) return;
+  statusRefreshInFlight = true;
   const version = controlVersion;
   try {
     const next = await api("/api/status", undefined, "GET");
@@ -307,7 +307,7 @@ async function refreshStatus() {
     notice(`Backend unavailable: ${error.message}`, true);
     render();
   } finally {
-    statusPollInFlight = false;
+    statusRefreshInFlight = false;
   }
 }
 
@@ -385,10 +385,16 @@ function applyControlResult(result) {
 $("enable").addEventListener("click", () =>
   report(async () => {
     const version = ++controlVersion;
-    const result = await api("/api/control", {
-      enabled: true,
-      frame_id: frameId,
-    });
+    let result;
+    try {
+      result = await api("/api/control", {
+        enabled: true,
+        frame_id: frameId,
+      });
+    } finally {
+      // Enabling checks the Pi on the server; fetch the resulting cached badges.
+      if (state?.manual_backend === "raspberry_pi") await refreshStatus();
+    }
     if (version !== controlVersion) return;
     applyControlResult(result);
     if (result.enabled) notice("Manual control active.");
@@ -449,6 +455,23 @@ $("save").addEventListener("click", () =>
   }),
 );
 
+function manualApi(path, data) {
+  const operation = api(path, data).then(
+    (result) => {
+      window.phoneRecorder?.acceptManual?.(result.recording);
+      return result;
+    },
+    async (error) => {
+      manual = false;
+      render();
+      await window.phoneRecorder?.manualFailed?.(error);
+      throw error;
+    },
+  );
+  window.phoneRecorder?.trackManual?.(operation);
+  return operation;
+}
+
 async function sendAction(action, point) {
   if (window.phoneRecorder?.capturesPreview()) {
     return window.phoneRecorder.action(action, point);
@@ -460,7 +483,7 @@ async function sendAction(action, point) {
     if (point) [data.x, data.y] = point;
 
     try {
-      const result = await api("/api/action", data);
+      const result = await manualApi("/api/action", data);
       if (result.normalized) {
         const position = result.normalized.map((v) => v.toFixed(3)).join(", ");
         $("coordinates").textContent = result.pixel
@@ -538,7 +561,7 @@ document.addEventListener("keydown", (event) => {
   // Send immediately using the existing busy gate. No buffer or keyboard history.
   report(async () => {
     try {
-      await api("/api/key", { type, value, frame_id: frameId });
+      await manualApi("/api/key", { type, value, frame_id: frameId });
     } catch (error) {
       // An uncertain input is never retried, even after a network timeout.
       manual = false;
@@ -618,8 +641,8 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("pagehide", () => {
-  clearInterval(statusPollTimer);
-  statusPollTimer = null;
+  clearInterval(legacyStatusTimer);
+  legacyStatusTimer = null;
   // Best effort on close; the server's six-second lease is the fallback.
   if (manual)
     fetch("/api/control", {
@@ -635,12 +658,28 @@ window.addEventListener("pagehide", () => {
     }).catch(() => {});
 });
 
-function startStatusPolling() {
-  if (statusPollTimer !== null) return;
-  statusPollTimer = setInterval(refreshStatus, PI_STATUS_POLL_INTERVAL_MS);
-  refreshStatus();
+function startLegacyStatusPolling() {
+  // Preserve the existing Appium dashboard/automation status updates.
+  if (state?.manual_backend !== "appium" || legacyStatusTimer !== null) return;
+  legacyStatusTimer = setInterval(refreshStatus, 5000);
 }
-window.addEventListener("pageshow", startStatusPolling);
+
+async function loadStatus() {
+  try {
+    // This endpoint checks the Pi once (and is a no-op in Appium mode).
+    await api("/api/pi/status", undefined, "GET");
+  } catch (error) {
+    notice(`Backend unavailable: ${error.message}`, true);
+  }
+  await refreshStatus();
+  startLegacyStatusPolling();
+}
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) {
+    refreshStatus();
+    startLegacyStatusPolling();
+  }
+});
 render();
-startStatusPolling();
+loadStatus();
 videoLoop();

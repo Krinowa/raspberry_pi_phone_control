@@ -474,3 +474,45 @@ summary {
   outline: 2px solid var(--accent, #38bdf8);
   outline-offset: -2px;
 }
+
+/* Keep recording controls and its live timeline beside the full camera view. */
+#record-card.is-recording {
+  border-color: #b7454b;
+  background: #fffafb;
+}
+#record-live {
+  position: static;
+  box-shadow: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  gap: 10px;
+}
+#record-status,
+#record-count,
+#live-timeline-slot {
+  flex-basis: 100%;
+}
+#record-count,
+#record-empty,
+.review-timeline p {
+  font-size: 12px;
+  color: #566b60;
+  line-height: 1.5;
+}
+#live-timeline-slot .review-timeline {
+  max-height: 280px;
+  overflow-y: auto;
+  margin-bottom: 0;
+}
+#live-timeline-slot .review-timeline li {
+  padding: 10px 4px;
+}
+#record-review-link {
+  display: inline-block;
+  margin: 12px 0;
+}
+#review-flow .review-timeline {
+  max-height: 420px;
+  overflow-y: auto;
+}

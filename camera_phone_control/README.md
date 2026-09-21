@@ -363,8 +363,10 @@ values or credentials in custom scripts.
 
 Triggers, runner, and controller remain separate. The local workflow execution API
 is documented in [WORKFLOWS.md](WORKFLOWS.md). Authentication and final financial
-authorization belong in manual checkpoints. External/public webhooks, scheduling,
-Pi/ESP32 transports and visual automation are not implemented.
+authorization belong in manual checkpoints. Pi workflow input is available with
+`PHONE_INPUT_BACKEND=raspberry_pi`; screen handling remains separately configured.
+See [Pi workflow playback](WORKFLOWS.md#pi-workflow-playback). External/public
+webhooks, scheduling, ESP32 input and visual automation are not implemented.
 
 ## How clicks are mapped
 

@@ -69,9 +69,43 @@
               >Input is disabled. Calibrate the display to begin.</span
             ><output id="coordinates">—</output>
           </div>
-          <div id="camera-record-controls"></div>
         </section>
         <aside>
+          <section id="record-card" class="card">
+            <div class="section-heading"><h2>Record</h2></div>
+            <button id="record-new" class="primary">● Start Recording</button>
+            <p id="record-guidance" class="small">
+              No steps recorded yet. Click Start Recording, then control the
+              phone through the preview. Your taps, swipes, typing and
+              navigation will appear here. Typed text is saved in the workflow.
+            </p>
+            <a id="record-review-link" href="#review-flow" hidden
+              >Review recording and save workflow</a
+            >
+            <div id="camera-record-controls"></div>
+            <div id="record-ready" hidden>
+              <p>
+                Use the phone preview as usual. We’ll record your taps, swipes
+                and typing, then you can review and name the flow.
+              </p>
+              <p class="small">
+                Secure input belongs on the phone. Avoid typing sensitive values
+                while recording. You can add a manual checkpoint during review.
+              </p>
+              <button id="record-start" class="primary">Start Recording</button>
+            </div>
+            <div id="record-controls-slot">
+              <div id="record-live" hidden>
+                <strong id="record-status" class="recording" role="status"
+                  >● Recording</strong
+                >
+                <span id="record-count">Actions recorded: 0</span>
+                <button id="record-undo">Undo Last</button>
+                <button id="record-stop" class="stop">■ Stop Recording</button>
+                <div id="live-timeline-slot"></div>
+              </div>
+            </div>
+          </section>
           <section class="card">
             <div class="section-heading">
               <h2>Input</h2>
@@ -141,33 +175,11 @@
         </aside>
       </div>
       <p id="notice" role="status" aria-live="polite">
-        Checking the camera and USB phone…
+        Checking the camera and phone…
       </p>
       <section id="automations" class="card">
         <div class="section-heading">
           <h2>Automations</h2>
-          <button id="record-new" class="primary">Record New Flow</button>
-        </div>
-        <div id="record-ready" hidden>
-          <p>
-            Use the phone preview as usual. We’ll record your taps, swipes and
-            typing, then you can review and name the flow.
-          </p>
-          <p class="small">
-            Secure input belongs on the phone. Recognized secure screens and
-            unrecognized text fields become manual checkpoints.
-          </p>
-          <button id="record-start" class="primary">Start Recording</button>
-        </div>
-        <div id="record-controls-slot">
-          <div id="record-live" hidden>
-            <strong id="record-status" class="recording" role="status"
-              >● Recording</strong
-            >
-            <span id="record-count">Actions recorded: 0</span>
-            <button id="record-undo">Undo Last</button>
-            <button id="record-stop" class="primary">Stop Recording</button>
-          </div>
         </div>
         <div id="mock-recording-preview" hidden>
           <p>
@@ -182,56 +194,224 @@
           tabindex="0"
         ></canvas>
         <div id="review-flow" hidden>
-          <h3>Review Flow</h3>
-          <label>Flow name <input id="flow-name" maxlength="160" /></label>
-          <button id="flow-rename">Rename Flow</button>
-          <ol id="record-steps" class="step-list review-timeline"></ol>
+          <h3>Review Recording</h3>
+          <label>Workflow name <input id="flow-name" maxlength="160" /></label>
+          <button id="flow-rename">Rename</button>
+          <div class="flow-buttons">
+            <button id="record-save" class="primary">Save Workflow</button
+            ><button id="record-cancel">Discard Recording</button>
+          </div>
+
+          <div id="review-timeline-slot">
+            <div id="record-timeline">
+              <h3>Recorded Steps</h3>
+              <p id="record-empty">
+                No steps recorded yet. Use the phone preview to record taps,
+                swipes, typing and navigation.
+              </p>
+              <ol
+                id="record-steps"
+                class="step-list review-timeline"
+                aria-label="Recorded steps"
+                aria-live="polite"
+              ></ol>
+            </div>
+          </div>
           <form id="step-editor" hidden>
             <h3 id="step-editor-title">Edit Step</h3>
-            <label>Step name <input id="step-name" maxlength="160" /></label>
+
+            <label>
+              Step name
+              <input id="step-name" maxlength="160" />
+            </label>
+
+            <div id="step-tap-options" hidden>
+              <div class="flow-buttons">
+                <label>
+                  X (%)
+                  <input
+                    id="step-tap-x"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                  />
+                </label>
+
+                <label>
+                  Y (%)
+                  <input
+                    id="step-tap-y"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div id="step-swipe-options" hidden>
+              <div class="flow-buttons">
+                <label>
+                  Start X (%)
+                  <input
+                    id="step-swipe-start-x"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                  />
+                </label>
+
+                <label>
+                  Start Y (%)
+                  <input
+                    id="step-swipe-start-y"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                  />
+                </label>
+              </div>
+
+              <div class="flow-buttons">
+                <label>
+                  End X (%)
+                  <input
+                    id="step-swipe-end-x"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                  />
+                </label>
+
+                <label>
+                  End Y (%)
+                  <input
+                    id="step-swipe-end-y"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                  />
+                </label>
+              </div>
+
+              <label>
+                Duration (ms)
+                <input
+                  id="step-swipe-duration"
+                  type="number"
+                  min="50"
+                  max="60000"
+                  step="10"
+                />
+              </label>
+            </div>
+
+            <label id="step-key-options" hidden>
+              Key
+              <select id="step-key">
+                <option value="ENTER">Enter</option>
+                <option value="BACKSPACE">Backspace</option>
+                <option value="TAB">Tab</option>
+
+                <option value="LEFT">Arrow Left</option>
+                <option value="RIGHT">Arrow Right</option>
+                <option value="UP">Arrow Up</option>
+                <option value="DOWN">Arrow Down</option>
+
+                <option value="DELETE">Delete</option>
+                <option value="HOME">Home</option>
+                <option value="END">End</option>
+                <option value="PAGEUP">Page Up</option>
+                <option value="PAGEDOWN">Page Down</option>
+
+                <option value="BACK">Back</option>
+                <option value="SCREEN_ON">Wake Screen</option>
+              </select>
+            </label>
+
+            <!-- ====================================================== -->
+            <!-- WAIT -->
+            <!-- ====================================================== -->
+
+            <label id="step-wait-options" hidden>
+              Wait duration (seconds)
+              <input
+                id="step-wait-seconds"
+                type="number"
+                min="0"
+                max="3600"
+                step="0.1"
+              />
+            </label>
+
             <div id="step-input-options" hidden>
-              <label
-                >Use this input as
+              <label>
+                Use this input as
+
                 <select id="input-source">
                   <option value="fixed">Keep Fixed</option>
                   <option value="variable">Make Variable</option>
                   <option value="manual">Manual</option>
-                </select></label
-              >
+                </select>
+              </label>
+
               <div id="fixed-fields">
-                <label
-                  >Recorded value
-                  <input id="input-value" autocomplete="off" maxlength="4096"
-                /></label>
+                <label>
+                  Recorded value
+
+                  <input id="input-value" autocomplete="off" maxlength="4096" />
+                </label>
               </div>
+
               <div id="variable-fields" hidden>
-                <label
-                  >Variable name
-                  <input id="variable-name" placeholder="customer_name"
-                /></label>
-                <label
-                  >Label <input id="variable-label" placeholder="Customer Name"
-                /></label>
-                <label class="check"
-                  ><input id="variable-required" type="checkbox" checked />
-                  Required</label
-                >
-                <label
-                  >Default value (optional)
-                  <input id="variable-default" autocomplete="off"
-                /></label>
-                <label class="check"
-                  ><input id="variable-ask" type="checkbox" checked /> Ask When
-                  Running</label
-                >
+                <label>
+                  Variable name
+
+                  <input id="variable-name" placeholder="customer_name" />
+                </label>
+
+                <label>
+                  Label
+
+                  <input id="variable-label" placeholder="Customer Name" />
+                </label>
+
+                <label class="check">
+                  <input id="variable-required" type="checkbox" checked />
+
+                  Required
+                </label>
+
+                <label>
+                  Default value (optional)
+
+                  <input id="variable-default" autocomplete="off" />
+                </label>
+
+                <label class="check">
+                  <input id="variable-ask" type="checkbox" checked />
+
+                  Ask When Running
+                </label>
               </div>
+
               <p id="manual-input-help" hidden>
                 The recorded value will be removed. Playback will pause for you
                 to complete this step on the phone.
               </p>
             </div>
-            <button id="step-apply" class="primary">Apply Changes</button
-            ><button id="step-close" type="button">Close</button>
+
+            <div class="flow-buttons">
+              <button id="step-apply" class="primary">Apply Changes</button>
+
+              <button id="step-close" type="button">Close</button>
+            </div>
           </form>
           <details id="review-insert">
             <summary>Insert a wait or manual checkpoint</summary>
@@ -263,10 +443,6 @@
             ><input id="flow-financial" type="checkbox" /> Financial preparation
             flow — end with manual authorization</label
           >
-          <div class="flow-buttons">
-            <button id="record-save" class="primary">Save Flow</button
-            ><button id="record-cancel">Discard Recording</button>
-          </div>
         </div>
         <div id="saved-flow-panel">
           <h3>Saved Flows</h3>

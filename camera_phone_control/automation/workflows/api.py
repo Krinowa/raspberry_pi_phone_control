@@ -18,7 +18,7 @@ from .storage import WorkflowStorage
 def register_workflows(app, state, payload, client_id, storage=None):
     storage = storage or WorkflowStorage()
     recorder = Recorder()
-    lock = threading.RLock()
+    lock = state.lock  # Recording commits and manual input share one lock order.
     service = WorkflowService(state.android, state.device_locks)
 
     app.extensions.update(
@@ -37,6 +37,26 @@ def register_workflows(app, state, payload, client_id, storage=None):
         if not 8 <= len(value) <= 80 or not all(c.isalnum() or c == "-" for c in value):
             raise ValueError("Invalid recording identifier.")
         return value
+
+    def record_manual(step, perform):
+        # The caller already holds the manual ownership/frame/action gates.
+        with lock:
+            if not recorder.active:
+                perform()
+                return None
+            owner = recorder_id()
+            candidate = recorder.prepare_manual(owner, step)
+            try:
+                perform()
+            except Exception:
+                recorder.active = False
+                recorder.input_target = None
+                raise
+            recorder.workflow = candidate
+            recorder.input_target = "manual-text" if step["type"] == "input" else None
+            return recorder.snapshot()
+
+    app.extensions["record_manual"] = record_manual
 
     @app.errorhandler(FileNotFoundError)
     def missing_file(exc):
@@ -151,6 +171,18 @@ def register_workflows(app, state, payload, client_id, storage=None):
                 )
             )
 
+    @app.post("/api/recorder/edit")
+    def edit_saved_workflow():
+        data = payload()
+        if set(data) != {"workflow_id"}:
+            raise ValueError("Choose a saved workflow to edit.")
+        with lock:
+            if any(item["thread"].is_alive() for item in service.runs.values()):
+                raise ValueError("Stop the running workflow before editing.")
+            return jsonify(
+                recorder.edit(recorder_id(), storage.read(data["workflow_id"]))
+            )
+
     @app.get("/api/recorder")
     def recording_status():
         with lock:
@@ -234,6 +266,10 @@ def register_workflows(app, state, payload, client_id, storage=None):
             execute = recorder.execute and (
                 capture or step.get("type") in {"tap", "swipe", "key"}
             )
+            if state.pi_bridge is not None and (capture or execute):
+                raise ValueError(
+                    "Use the phone preview and manual controls to record actions."
+                )
             if capture or execute:
                 if not state.action_lock.acquire(blocking=False):
                     raise ValueError("Controller busy. Step was not recorded or sent.")
@@ -245,6 +281,9 @@ def register_workflows(app, state, payload, client_id, storage=None):
                             threading.Event(),
                             logging.getLogger("recorder"),
                             SimpleNamespace(),
+                            input_backend=(
+                                "mock" if backend_names()[0] == "mock" else "appium"
+                            ),
                         )
                         if capture:
                             target = inspect_target(context, step)
@@ -322,7 +361,16 @@ def register_workflows(app, state, payload, client_id, storage=None):
                 recorder.require_owner(recorder_id())
                 if recorder.active:
                     raise ValueError("Stop recording before saving.")
-                result = storage.save(recorder.workflow, create=True)
+                editing = recorder.editing_existing
+                if editing:
+                    storage.read(
+                        recorder.workflow["id"]
+                    )  # Do not resurrect a deleted flow.
+                result = storage.save(recorder.workflow, create=not editing)
+                # Saved editor values remain server-side, including the save response.
+                if editing:
+                    recorder.workflow = result
+                    result = recorder.snapshot()["workflow"]
                 recorder.cancel(recorder_id())
-                return jsonify(result), 201
+                return jsonify(result), (200 if editing else 201)
             return jsonify(error="Unknown recorder operation."), 404

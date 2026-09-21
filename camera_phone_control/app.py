@@ -25,7 +25,6 @@ from hardware.raspberry_pi_input import RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
-PI_STATUS_POLL_INTERVAL_SECONDS = 5
 
 
 class ControlState:
@@ -37,7 +36,7 @@ class ControlState:
             "phone": "unknown",
             "message": "Waiting for Pi status.",
         }
-        self.pi_polled_at = None
+        self.pi_status_notice = None
         self.lock = threading.RLock()
         self.action_lock = threading.Lock()
         self.device_locks = device_locks or DeviceLocks()
@@ -104,15 +103,9 @@ class ControlState:
         )
         return False
 
-    def poll_pi_status(self):
-        # Called only by status routes under state.lock. Share the cache across tabs.
-        now = time.monotonic()
-        if (
-            self.pi_polled_at is None
-            or now - self.pi_polled_at >= PI_STATUS_POLL_INTERVAL_SECONDS
-        ):
-            self.pi_polled_at = now
-            self.pi_connection = self.pi_bridge.connection_state()
+    def refresh_pi_status(self):
+        # Explicit checks only; snapshots, inputs and heartbeats use last-known state.
+        self.pi_connection = self.pi_bridge.connection_state()
         return self.pi_connection
 
     def refresh(self):
@@ -125,7 +118,11 @@ class ControlState:
                     self.device = None
                     errors.append(self.pi_connection["message"])
             else:
-                self.device = select_device(self.android, authorized_only=False)
+                self.device = select_device(
+                    self.android,
+                    authorized_only=False,
+                    input_backend="appium",
+                )
         except DeviceError as exc:
             self.device = None
             errors.append(str(exc))
@@ -136,6 +133,12 @@ class ControlState:
         if errors:
             self.calibration = None
             self.disable(" ".join(errors))
+            if (
+                self.pi_bridge is not None
+                and self.pi_connection["phone"] != "connected"
+            ):
+                # Track the displayed failure, independently of later explicit checks.
+                self.pi_status_notice = self.message
         elif self.calibration and signature != self.signature:
             self.calibration = None
             self.disable(
@@ -143,6 +146,15 @@ class ControlState:
             )
         elif self.owner and time.monotonic() >= self.expires:
             self.disable("Control heartbeat expired. Enable Manual Control again.")
+        if not errors and self.pi_status_notice is not None:
+            if self.message == self.pi_status_notice:
+                self.message = (
+                    "Phone Connected. Enable Manual Control when ready."
+                    if self.calibration
+                    else "Phone Connected. Calibrate the phone display before enabling input."
+                )
+            # Never replace a newer safety or control message with Pi recovery text.
+            self.pi_status_notice = None
         return camera
 
     def require_frame(self, frame_id):
@@ -179,8 +191,6 @@ class ControlState:
             yield
 
     def snapshot(self, client):
-        if self.pi_bridge is not None:
-            self.poll_pi_status()
         camera = self.refresh()
         owner = self.device_locks.owner(self.device.serial) if self.device else None
         control_status = (
@@ -228,19 +238,9 @@ def create_app(
     manual_backend=None,
     pi_client=None
 ):
-    automation_input, _ = (
-        backend_names()
-    )  # Existing automation configuration is unchanged.
-    # An explicitly injected Android controller retains legacy test/embedding behavior.
-    # Normal dashboard startup selects Pi manual control; there is no failure fallback.
+    # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
-        manual_backend
-        or os.environ.get("PHONE_MANUAL_INPUT_BACKEND")
-        or (
-            "appium"
-            if pi_client is None and (android is not None or automation_input == "mock")
-            else "raspberry_pi"
-        )
+        manual_backend or os.environ.get("PHONE_MANUAL_INPUT_BACKEND") or "raspberry_pi"
     )
     if manual_backend not in {"raspberry_pi", "appium"}:
         raise ValueError("PHONE_MANUAL_INPUT_BACKEND must be raspberry_pi or appium.")
@@ -353,7 +353,7 @@ def create_app(
                 message="Pi manual control is not selected.",
             )
         with state.lock:
-            return jsonify(state.poll_pi_status())
+            return jsonify(state.refresh_pi_status())
 
     @app.get("/api/frame")
     def frame():
@@ -376,6 +376,8 @@ def create_app(
             if not data["enabled"]:
                 state.disable()
             else:
+                if state.pi_bridge is not None:
+                    state.refresh_pi_status()
                 state.require_ready()
                 state.require_frame(data.get("frame_id"))
                 if state.calibration is None:
@@ -497,12 +499,25 @@ def create_app(
             return jsonify(error="Controller busy. No action sent."), 409
         try:
             with state.lock, state.input_control(client, data["frame_id"]):
+                recorded = None
                 try:
                     if state.pi_bridge is not None:
                         if data["type"] == "text":
-                            state.pi_bridge.type_text(data["value"])
+                            step = {
+                                "type": "input",
+                                "source": "fixed",
+                                "value": data["value"],
+                            }
+                            perform = lambda: state.pi_bridge.type_text(data["value"])
                         else:
-                            state.pi_bridge.key(data["value"])
+                            key_name = (
+                                "MOVE_HOME"
+                                if data["value"] == "home"
+                                else data["value"].upper()
+                            )
+                            step = {"type": "key", "key": key_name}
+                            perform = lambda: state.pi_bridge.key(data["value"])
+                        recorded = app.extensions["record_manual"](step, perform)
                     else:
                         context = AutomationContext(
                             state.device,
@@ -510,12 +525,13 @@ def create_app(
                             threading.Event(),
                             LOG,
                             SimpleNamespace(),
+                            input_backend="appium",
                         )
                         context.send_key(data["type"], data["value"])
                 except (DeviceError, PiApiError) as exc:
                     state.disable(str(exc))
                     raise
-                return jsonify(sent=True)
+                return jsonify(sent=True, recording=recorded)
         finally:
             state.action_lock.release()
 
@@ -529,8 +545,12 @@ def create_app(
             return jsonify(error="Controller busy. No action sent."), 409
         try:
             with state.lock, state.input_control(client, data["frame_id"]):
+                recorded = None
                 if state.pi_bridge is not None:
-                    state.pi_bridge.type_text(data["text"])
+                    recorded = app.extensions["record_manual"](
+                        {"type": "input", "source": "fixed", "value": data["text"]},
+                        lambda: state.pi_bridge.type_text(data["text"]),
+                    )
                 else:
                     context = AutomationContext(
                         state.device,
@@ -538,9 +558,10 @@ def create_app(
                         threading.Event(),
                         LOG,
                         SimpleNamespace(),
+                        input_backend="appium",
                     )
                     context.input.type_text(data["text"])
-                return jsonify(sent=True)
+                return jsonify(sent=True, recording=recorded)
         finally:
             state.action_lock.release()
 
@@ -582,9 +603,31 @@ def create_app(
                             state.device.height,
                         )
 
+                recorded = None
                 try:
                     if state.pi_bridge is not None:
-                        state.pi_bridge.action(name, normalized)
+                        if name not in state.pi_bridge.ACTIONS:
+                            raise ValueError(
+                                "This action is not supported; no input sent."
+                            )
+                        if name == "tap":
+                            step = {
+                                "type": "tap",
+                                "x": normalized[0],
+                                "y": normalized[1],
+                            }
+                        elif name in state.pi_bridge.SWIPES:
+                            points = state.pi_bridge.SWIPES[name]
+                            step = {
+                                "type": "swipe",
+                                "start": list(points[:2]),
+                                "end": list(points[2:]),
+                            }
+                        else:
+                            step = {"type": "key", "key": name.upper()}
+                        recorded = app.extensions["record_manual"](
+                            step, lambda: state.pi_bridge.action(name, normalized)
+                        )
                     else:
                         context = AutomationContext(
                             state.device,
@@ -592,13 +635,16 @@ def create_app(
                             threading.Event(),
                             LOG,
                             SimpleNamespace(),
+                            input_backend="appium",
                         )
                         context.send(name, pixel)
                 except (DeviceError, PiApiError) as exc:
                     state.disable(str(exc))
                     raise
 
-                return jsonify(action=name, pixel=pixel, normalized=normalized)
+                return jsonify(
+                    action=name, pixel=pixel, normalized=normalized, recording=recorded
+                )
         finally:
             state.action_lock.release()
 

@@ -29,6 +29,13 @@ class RaspberryPiInputBridge:
         "screen_on",
     }
 
+    SWIPES = {
+        "swipe_up": (0.5, 0.75, 0.5, 0.25),
+        "swipe_down": (0.5, 0.25, 0.5, 0.75),
+        "swipe_left": (0.75, 0.5, 0.25, 0.5),
+        "swipe_right": (0.25, 0.5, 0.75, 0.5),
+    }
+
     def __init__(self, client=None):
         self.client = client if client is not None else PiApiClient()
         self.target = PiControlTarget("pi-api:" + self.client.base_url)
@@ -80,12 +87,6 @@ class RaspberryPiInputBridge:
             if point is None:
                 raise ValueError("A calibrated phone coordinate is required.")
             return self.tap(*point)
-        swipes = {
-            "swipe_up": (0.5, 0.75, 0.5, 0.25),
-            "swipe_down": (0.5, 0.25, 0.5, 0.75),
-            "swipe_left": (0.75, 0.5, 0.25, 0.5),
-            "swipe_right": (0.25, 0.5, 0.75, 0.5),
-        }
-        if action in swipes:
-            return self.swipe(*swipes[action])
+        if action in self.SWIPES:
+            return self.swipe(*self.SWIPES[action])
         return {"home": self.home, "back": self.back, "screen_on": self.wake}[action]()

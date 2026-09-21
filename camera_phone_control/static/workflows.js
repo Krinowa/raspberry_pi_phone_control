@@ -1,7 +1,11 @@
 "use strict";
 
 (() => {
-  let recording = { active: false, workflow: null },
+  let recording = {
+      active: false,
+      workflow: null,
+      editing_existing: false,
+    },
     selected = null;
   let backend = "appium",
     running = null,
@@ -9,6 +13,7 @@
     gesture = null;
   let editingId = null,
     timelineSignature = "",
+    timelineWasLive = false,
     stopping = false;
   let textBuffer = "",
     textTimer = null,
@@ -16,11 +21,14 @@
     queued = 0;
   const preview = $("workflow-preview"),
     paint = preview.getContext("2d");
+  const piManual = () => state?.manual_backend === "raspberry_pi";
+  let pendingManual = Promise.resolve();
   const terminal = new Set(["passed", "failed", "cancelled"]);
   const show = (message, error = false) => {
     $("workflow-notice").textContent = message;
     $("workflow-notice").classList.toggle("error", error);
   };
+
   async function task(fn) {
     if (working) return;
     working = true;
@@ -34,9 +42,10 @@
       renderRecording();
     }
   }
+
   function describe(step, index = 0) {
-    const suffix = step.label || `Step ${index + 1}`;
-    if (step.type === "tap") return `Tap — ${suffix}`;
+    const suffix = step.label;
+    if (step.type === "tap") return `Tap${suffix ? " — " + suffix : ""}`;
     if (step.type === "swipe") {
       const dx = step.end[0] - step.start[0],
         dy = step.end[1] - step.start[1];
@@ -46,16 +55,27 @@
       const variable = recording.workflow?.variables.find(
         (v) => v.name === step.variable,
       );
-      return `Text Input — ${variable?.label || suffix}`;
+      return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}`;
     }
     if (step.type === "wait") return `Wait ${step.seconds} seconds`;
     if (step.type === "key")
       return (
         step.label ||
+        {
+          HOME: "Home",
+          BACK: "Back",
+          SCREEN_ON: "Wake Screen",
+          SCREEN_OFF: "Screen Off",
+          RECENTS: "Recent Apps",
+          MOVE_HOME: "Press Home",
+          PAGEUP: "Press Page Up",
+          PAGEDOWN: "Press Page Down",
+        }[step.key.toUpperCase()] ||
         `Press ${step.key.charAt(0).toUpperCase()}${step.key.slice(1).toLowerCase().replaceAll("_", " ")}`
       );
     return `Manual checkpoint${step.label ? " — " + step.label : ""}`;
   }
+
   function button(label, fn) {
     const element = document.createElement("button");
     element.type = "button";
@@ -63,17 +83,26 @@
     element.addEventListener("click", () => task(fn));
     return element;
   }
+
   function renderTimeline() {
     const draft = recording.workflow;
-    const signature = JSON.stringify(draft);
+    const signature = JSON.stringify([draft, recording.active]);
+
     if (signature === timelineSignature) return;
     timelineSignature = signature;
+
+    const enteringReview = timelineWasLive && !recording.active;
+    timelineWasLive = recording.active;
+
     $("step-editor").hidden = true;
     editingId = null;
+    $("record-empty").hidden = !!draft?.steps.length;
+
     if (!draft) {
       $("record-steps").replaceChildren();
       return;
     }
+
     $("flow-name").value = draft.name;
     $("flow-financial").checked = !!draft.financial;
     const positions = [new Option("At the beginning", "0")];
@@ -82,6 +111,12 @@
         title = document.createElement("strong");
       title.textContent = describe(step, index);
       row.append(title);
+
+      if (step.type === "tap") {
+        const detail = document.createElement("p");
+        detail.textContent = `X ${Math.round(step.x * 100)}% • Y ${Math.round(step.y * 100)}%`;
+        row.append(detail);
+      }
       if (step.preview) {
         const image = document.createElement("img");
         image.src = "data:image/png;base64," + step.preview;
@@ -92,23 +127,16 @@
       }
       const actions = document.createElement("div");
       actions.className = "flow-buttons";
-      actions.append(button("Rename", () => openEditor(step)));
+      actions.append(button("Edit", () => openEditor(step)));
       if (step.type === "input") {
         const value = document.createElement("p");
         value.textContent =
           step.source === "fixed"
-            ? "Recorded value: " + step.value
+            ? "“" + step.value + "”"
             : "Ask for: " +
               (draft.variables.find((v) => v.name === step.variable)?.label ||
                 "Input");
         row.append(value);
-        actions.append(
-          button("Keep Fixed", () => openEditor(step, "fixed")),
-          button("Make Variable", () => openEditor(step, "variable")),
-          button("Manual", () =>
-            review({ operation: "input", step_id: step.id, source: "manual" }),
-          ),
-        );
       }
       actions.append(
         button("Delete", () =>
@@ -127,7 +155,7 @@
             review({ operation: "move", step_id: step.id, index: index + 1 }),
           ),
         );
-      row.append(actions);
+      if (!recording.active) row.append(actions);
       positions.push(
         new Option(
           `After ${index + 1}. ${describe(step, index)}`,
@@ -136,7 +164,10 @@
       );
       return row;
     });
+
     $("record-steps").replaceChildren(...rows);
+    if (enteringReview) $("record-steps").scrollTop = 0;
+    if (recording.active) rows.at(-1)?.scrollIntoView?.({ block: "nearest" });
     $("insert-position").replaceChildren(...positions);
     $("insert-position").value = String(draft.steps.length);
     $("workflow-debug-data").textContent = JSON.stringify(
@@ -146,75 +177,191 @@
       2,
     );
   }
+
   function renderRecording() {
     const draft = recording.workflow,
-      live = recording.active;
+      live = recording.active,
+      editingExisting = !!recording.editing_existing;
+
     $("record-new").hidden = !!draft;
+    $("record-guidance").hidden = !!draft;
+    $("record-review-link").hidden = !draft || live;
+
+    $("record-card").classList.toggle("is-recording", live);
+
     $("record-new").disabled =
       working || (running && !terminal.has(running.status));
-    if (draft) $("record-ready").hidden = true;
+
+    if (draft) {
+      $("record-ready").hidden = true;
+    }
+
     const controlSlot =
-      live && backend !== "mock"
+      live && (piManual() || backend !== "mock")
         ? $("camera-record-controls")
         : $("record-controls-slot");
-    if ($("record-live").parentElement !== controlSlot)
+
+    if ($("record-live").parentElement !== controlSlot) {
       controlSlot.append($("record-live"));
+    }
+
     $("record-live").hidden = !live;
+
     $("review-flow").hidden = !draft || live;
+
     $("saved-flow-panel").hidden = !!draft;
+
     $("workflow-debug").hidden = live;
+
+    const timelineSlot = live
+      ? $("live-timeline-slot")
+      : $("review-timeline-slot");
+
+    if ($("record-timeline").parentElement !== timelineSlot) {
+      timelineSlot.append($("record-timeline"));
+    }
+
     $("record-status").textContent = stopping
       ? "Finishing recording…"
-      : "● Recording";
-    $("record-count").textContent =
-      `Actions recorded: ${draft?.steps.length || 0}`;
+      : `● Recording • ${draft?.steps.length || 0} ${
+          draft?.steps.length === 1 ? "step" : "steps"
+        }`;
+
+    $("record-count").textContent = "Taps, swipes and typing appear below.";
+
     $("record-start").disabled = working || !!draft;
+
     $("record-stop").disabled = stopping;
+
     $("record-undo").disabled =
       stopping || !draft?.steps.length || queued > 0 || !!textBuffer;
+
     $("record-save").disabled = working || !draft?.steps.length || live;
+
+    $("record-save").textContent = editingExisting
+      ? "Save Changes"
+      : "Save Workflow";
+
+    $("record-cancel").textContent = editingExisting
+      ? "Cancel Editing"
+      : "Discard Recording";
+
     $("flow-run").disabled =
       working ||
       !selected ||
       !!draft ||
       (running && !terminal.has(running.status));
-    $("mock-recording-preview").hidden = backend !== "mock" || !live;
-    preview.hidden = backend !== "mock" && !running;
-    if (!live) renderTimeline();
+
+    $("mock-recording-preview").hidden =
+      piManual() || backend !== "mock" || !live;
+
+    preview.hidden = (piManual() || backend !== "mock") && !running;
+    const reviewTitle = $("review-flow")?.querySelector("h3");
+
+    if (reviewTitle) {
+      reviewTitle.textContent = editingExisting
+        ? "Edit Workflow"
+        : "Review Recording";
+    }
+
+    if (draft && !live && editingExisting) {
+      $("record-empty").textContent =
+        "This workflow has no steps. Add or edit steps, then save your changes.";
+    } else {
+      $("record-empty").textContent =
+        "No steps recorded yet. Use the phone preview to record taps, swipes, typing and navigation.";
+    }
+
+    renderTimeline();
   }
+
   async function review(data) {
     recording = await api("/api/recorder/review", data);
     show("Flow updated.");
     renderRecording();
   }
+
   function sourceFields() {
     const source = $("input-source").value;
     $("fixed-fields").hidden = source !== "fixed";
     $("variable-fields").hidden = source !== "variable";
     $("manual-input-help").hidden = source !== "manual";
   }
+
   function openEditor(step, source) {
     editingId = step.id;
+
     $("step-editor").hidden = false;
     $("step-editor-title").textContent = describe(
       step,
       recording.workflow.steps.indexOf(step),
     );
+
     $("step-name").value = step.label || "";
+
+    // Show/hide step-specific controls.
+    $("step-tap-options").hidden = step.type !== "tap";
+    $("step-swipe-options").hidden = step.type !== "swipe";
+    $("step-key-options").hidden = step.type !== "key";
     $("step-input-options").hidden = step.type !== "input";
+    $("step-wait-options").hidden = step.type !== "wait";
+
+    // Tap
+    if (step.type === "tap") {
+      $("step-tap-x").value = (step.x * 100).toFixed(1);
+      $("step-tap-y").value = (step.y * 100).toFixed(1);
+    }
+
+    // Swipe
+    if (step.type === "swipe") {
+      $("step-swipe-start-x").value = (step.start[0] * 100).toFixed(1);
+      $("step-swipe-start-y").value = (step.start[1] * 100).toFixed(1);
+      $("step-swipe-end-x").value = (step.end[0] * 100).toFixed(1);
+      $("step-swipe-end-y").value = (step.end[1] * 100).toFixed(1);
+      $("step-swipe-duration").value = step.duration_ms ?? 300;
+    }
+
+    // Key
+    if (step.type === "key") {
+      $("step-key").value = step.key.toUpperCase();
+    }
+
+    // Wait
+    $("step-wait-seconds").value = step.seconds ?? 1;
+
+    // Input
     const definition = recording.workflow.variables.find(
       (v) => v.name === step.variable,
     );
+
     $("input-source").value = source || step.source || "fixed";
-    $("input-value").value = step.value ?? definition?.default ?? "";
+
+    if (
+      recording.editing_existing &&
+      step.type === "input" &&
+      step.source === "fixed"
+    ) {
+      $("input-value").value = "";
+      $("input-value").placeholder = "Leave blank to keep existing value";
+    } else {
+      $("input-value").value = step.value ?? definition?.default ?? "";
+      $("input-value").placeholder = "";
+    }
+
     $("variable-name").value = definition?.name || "";
     $("variable-label").value = definition?.label || step.label || "";
     $("variable-required").checked = definition?.required ?? true;
     $("variable-default").value = definition?.default ?? "";
     $("variable-ask").checked = definition?.ask_when_running ?? true;
+
     sourceFields();
-    $("step-editor").scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+
+    $("step-editor").scrollIntoView?.({
+      block: "nearest",
+      behavior: "smooth",
+    });
   }
+
   $("input-source").addEventListener("change", sourceFields);
 
   $("step-close").addEventListener("click", () => {
@@ -224,14 +371,37 @@
 
   $("step-editor").addEventListener("submit", (event) => {
     event.preventDefault();
-    // Snapshot edits before the first response replaces the timeline/editor.
-    const step_id = editingId,
-      label = $("step-name").value;
-    const old = recording.workflow.steps.find((s) => s.id === step_id);
+
+    const step_id = editingId;
+    const label = $("step-name").value;
+
+    const old = recording.workflow.steps.find((step) => step.id === step_id);
+
+    if (!old) {
+      show("Step no longer exists.", true);
+      return;
+    }
+
+    const seconds = Number($("step-wait-seconds").value);
     const source = $("input-source").value;
-    const input = { operation: "input", step_id, source };
-    if (source === "fixed") input.value = $("input-value").value;
-    if (source === "variable")
+
+    const input = {
+      operation: "input",
+      step_id,
+      source,
+    };
+
+    if (source === "fixed") {
+      const value = $("input-value").value;
+
+      // When editing an existing saved workflow:
+      // blank = preserve the existing server-side value.
+      if (!recording.editing_existing || value !== "") {
+        input.value = value;
+      }
+    }
+
+    if (source === "variable") {
       input.variable = {
         name: $("variable-name").value,
         label: $("variable-label").value,
@@ -240,12 +410,113 @@
         default: $("variable-default").value || null,
         ask_when_running: $("variable-ask").checked,
       };
+    }
 
     task(async () => {
-      if (old.type === "input") await review(input);
-      await review({ operation: "rename_step", step_id, label });
+      if (old.type === "tap") {
+        const x = Number($("step-tap-x").value) / 100;
+        const y = Number($("step-tap-y").value) / 100;
+
+        if (
+          !Number.isFinite(x) ||
+          !Number.isFinite(y) ||
+          x < 0 ||
+          x > 1 ||
+          y < 0 ||
+          y > 1
+        ) {
+          throw new Error("Tap coordinates must be between 0% and 100%.");
+        }
+
+        await review({
+          operation: "fields",
+          step_id,
+          fields: {
+            x,
+            y,
+          },
+        });
+      }
+
+      if (old.type === "swipe") {
+        const start = [
+          Number($("step-swipe-start-x").value) / 100,
+          Number($("step-swipe-start-y").value) / 100,
+        ];
+
+        const end = [
+          Number($("step-swipe-end-x").value) / 100,
+          Number($("step-swipe-end-y").value) / 100,
+        ];
+
+        const duration_ms = Number($("step-swipe-duration").value);
+
+        if (
+          [...start, ...end].some(
+            (value) => !Number.isFinite(value) || value < 0 || value > 1,
+          )
+        ) {
+          throw new Error("Swipe coordinates must be between 0% and 100%.");
+        }
+
+        if (
+          !Number.isFinite(duration_ms) ||
+          duration_ms < 50 ||
+          duration_ms > 60000
+        ) {
+          throw new Error("Swipe duration must be between 50 and 60000 ms.");
+        }
+
+        await review({
+          operation: "fields",
+          step_id,
+          fields: {
+            start,
+            end,
+            duration_ms,
+          },
+        });
+      }
+
+      if (old.type === "key") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: {
+            key: $("step-key").value,
+          },
+        });
+      }
+
+      if (old.type === "input") {
+        await review(input);
+      }
+
+      if (old.type === "wait") {
+        if (!Number.isFinite(seconds) || seconds < 0 || seconds > 3600) {
+          throw new Error("Wait duration must be between 0 and 3600 seconds.");
+        }
+
+        await review({
+          operation: "wait",
+          step_id,
+          seconds,
+        });
+      }
+
+      await review({
+        operation: "rename_step",
+        step_id,
+        label,
+      });
+
       $("input-value").value = "";
       $("variable-default").value = "";
+
+      editingId = null;
+      $("step-editor").hidden = true;
+
+      show("Step updated.");
     });
   });
 
@@ -321,6 +592,7 @@
     }
     renderRecording();
   }
+
   function enqueue(step, extra = {}) {
     if (!recording.active) return captureQueue;
     if (queued >= 32) {
@@ -401,17 +673,20 @@
     return enqueue({ type: "key", key: action.toUpperCase() });
   }
 
-  $("record-new").addEventListener("click", () => {
-    $("record-ready").hidden = false;
-  });
+  $("record-new").addEventListener("click", () => $("record-start").click());
 
   $("record-start").addEventListener("click", () =>
     task(async () => {
-      if (backend !== "mock") {
-        const result = await api("/api/control", {
-          enabled: true,
-          frame_id: frameId,
-        });
+      if (piManual() || backend !== "mock") {
+        let result;
+        try {
+          result = await api("/api/control", {
+            enabled: true,
+            frame_id: frameId,
+          });
+        } finally {
+          if (piManual()) await refreshStatus();
+        }
         applyControlResult(result);
       }
 
@@ -421,7 +696,7 @@
           execute: true,
         });
       } catch (error) {
-        if (backend !== "mock") await disable();
+        if (piManual() || backend !== "mock") await disable();
         throw error;
       }
 
@@ -429,7 +704,7 @@
       textBuffer = "";
       stopping = false;
       show("Use the phone preview as usual. Stop when you’re ready to review.");
-      const livePreview = backend === "mock" ? preview : canvas;
+      const livePreview = !piManual() && backend === "mock" ? preview : canvas;
       livePreview.focus({ preventScroll: true });
       livePreview.scrollIntoView?.({ block: "center", behavior: "smooth" });
     }),
@@ -440,10 +715,13 @@
       stopping = true;
       renderRecording();
       try {
+        await pendingManual;
         await flushText();
         recording = await api("/api/recorder/stop", {});
-        if (backend !== "mock") await disable();
-        show("Review your recording, then save the flow.");
+        if (piManual() || backend !== "mock") await disable();
+        show(
+          "Recording stopped. Review your steps, name your workflow, then save.",
+        );
         renderRecording();
         $("review-flow").scrollIntoView?.({
           block: "start",
@@ -457,6 +735,7 @@
 
   $("record-undo").addEventListener("click", () =>
     task(async () => {
+      await pendingManual;
       await flushText();
       recording = await api("/api/recorder/undo", {});
       show("Last recorded step removed. The phone itself was not changed.");
@@ -465,21 +744,41 @@
 
   $("record-cancel").addEventListener("click", () =>
     task(async () => {
+      const editingExisting = !!recording.editing_existing;
+
       recording = await api("/api/recorder/cancel", {});
-      show("Recording discarded.");
+
+      show(editingExisting ? "Changes discarded." : "Recording discarded.");
+
+      await loadFlows();
     }),
   );
 
   $("record-save").addEventListener("click", () =>
     task(async () => {
+      if (!$("flow-name").value.trim()) {
+        $("flow-name").focus();
+        return show("Enter a workflow name", true);
+      }
+
+      const editingExisting = !!recording.editing_existing;
+
       await review({
         operation: "rename_flow",
-        name: $("flow-name").value,
+        name: $("flow-name").value.trim(),
         financial: $("flow-financial").checked,
       });
+
       const saved = await api("/api/recorder/save", {});
-      recording = { active: false, workflow: null };
-      show("Flow saved.");
+
+      recording = {
+        active: false,
+        workflow: null,
+        editing_existing: false,
+      };
+
+      show(editingExisting ? "Workflow updated" : "Workflow saved");
+
       await loadFlows();
       await selectFlow(saved.id);
     }),
@@ -495,6 +794,7 @@
   }
   document.addEventListener("keydown", (event) => {
     if (
+      piManual() ||
       !recording.active ||
       stopping ||
       event.defaultPrevented ||
@@ -531,6 +831,7 @@
   });
   document.addEventListener("paste", (event) => {
     if (
+      piManual() ||
       !recording.active ||
       stopping ||
       localTarget(event) ||
@@ -560,6 +861,7 @@
   function installGestures(element, camera) {
     element.addEventListener("pointerdown", (event) => {
       if (
+        piManual() ||
         !recording.active ||
         stopping ||
         event.button !== 0 ||
@@ -642,7 +944,40 @@
   }
 
   window.phoneRecorder = {
-    capturesPreview: () => recording.active,
+    capturesPreview: () => recording.active && !piManual(),
+    blocksInput: () => piManual() && stopping,
+    trackManual: (operation) => {
+      if (piManual() && recording.active)
+        pendingManual = operation.catch(() => {});
+    },
+    acceptManual: (snapshot) => {
+      if (!snapshot || !piManual()) return;
+      recording = snapshot;
+      renderRecording();
+    },
+    manualFailed: async (error) => {
+      if (!piManual() || !recording.active) return;
+      recording.active = false;
+      show(
+        error.message +
+          " Recording stopped. Input may already have occurred; inspect the phone before continuing. No retry attempted.",
+        true,
+      );
+      renderRecording();
+      try {
+        await api("/api/recorder/stop", {});
+        recording = await api("/api/recorder", undefined, "GET");
+      } catch {
+        /* Keep the local capture gate closed. */
+      }
+      recording.active = false;
+      show(
+        error.message +
+          " Recording stopped. Input may already have occurred; inspect the phone before continuing. No retry attempted.",
+        true,
+      );
+      renderRecording();
+    },
     ownerId: recorderOwner,
     action: naturalAction,
   };
@@ -664,6 +999,29 @@
       select.textContent = "Run…";
       select.addEventListener("click", () => task(() => selectFlow(flow.id)));
 
+      const edit = document.createElement("button");
+      edit.textContent = "Edit";
+      edit.addEventListener("click", () =>
+        task(async () => {
+          recording = await api("/api/recorder/edit", {
+            workflow_id: flow.id,
+          });
+
+          selected = null;
+          timelineSignature = "";
+          editingId = null;
+
+          show(`Editing “${recording.workflow.name}”`);
+
+          renderRecording();
+
+          $("review-flow").scrollIntoView?.({
+            block: "start",
+            behavior: "smooth",
+          });
+        }),
+      );
+
       const remove = document.createElement("button");
       remove.textContent = "Delete";
       remove.addEventListener("click", () =>
@@ -679,7 +1037,7 @@
         }),
       );
 
-      row.append(label, select, remove);
+      row.append(label, select, edit, remove);
       return row;
     });
     $("saved-flows").replaceChildren(...rows);

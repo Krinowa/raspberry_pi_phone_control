@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from android_control import AndroidControl, DeviceError
 from device_lock import DeviceBusy, DeviceLocks
+from hardware.pi_api_client import PiApiError
 from .context import AutomationContext, Cancelled
 from .backends import select_device, backend_names
 from .input.base import UnsupportedOperation
@@ -166,6 +167,10 @@ class Runner:
         except DeviceBusy as exc:
             state.status = "failed"
             state.message = f"Device busy ({exc.owner}). No further input sent."
+        except PiApiError as exc:
+            state.status = "failed"
+            # PiApiClient messages exclude payloads and describe uncertain input.
+            state.message = str(exc)
         except DeviceError as exc:
             state.status = "failed"
             # Discovery happens before scripts receive any input. Runtime exceptions

@@ -13,6 +13,7 @@ class Recorder:
         self.active = False
         self.execute = False
         self.input_target = None
+        self.editing_existing = False
 
     def require_owner(self, owner):
         if self.owner != owner or self.workflow is None:
@@ -28,13 +29,33 @@ class Recorder:
         workflow = new_workflow(name)
         workflow["financial"] = financial
         validate_workflow(workflow, allow_empty=True)
+
         self.owner, self.workflow, self.active, self.execute = (
             owner,
             workflow,
             True,
             execute,
         )
+
         self.input_target = None
+        self.editing_existing = False
+
+        return self.snapshot()
+
+    def edit(self, owner, workflow):
+        if self.workflow is not None:
+            raise ValueError("Save or cancel the current workflow first.")
+
+        candidate = deepcopy(workflow)
+        validate_workflow(candidate)
+
+        self.workflow = candidate
+        self.owner = owner
+        self.active = False
+        self.execute = False
+        self.input_target = None
+        self.editing_existing = True
+
         return self.snapshot()
 
     def prepare(self, owner, step, variable=None):
@@ -93,6 +114,8 @@ class Recorder:
     def cancel(self, owner):
         self.require_owner(owner)
         self.owner, self.workflow, self.active, self.execute = None, None, False, False
+        self.editing_existing = False
+        self.input_target = None
 
     def prepare_capture(self, owner, step, target=None):
         """Merge consecutive chunks from the same focused text field."""
@@ -122,6 +145,30 @@ class Recorder:
         validate_workflow(check)
         return candidate
 
+    def prepare_manual(self, owner, step):
+        """Group acknowledged printable input only; keys remain explicit steps."""
+        step = deepcopy(step)
+        step["recorded_at"] = now()
+        self.require_owner(owner)
+        previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
+        if (
+            self.active
+            and self.input_target == "manual-text"
+            and previous
+            and previous["type"] == "input"
+            and previous.get("source") == "fixed"
+            and step["type"] == "input"
+            and step.get("source") == "fixed"
+            and len(previous["value"]) + len(step["value"]) <= 4096
+        ):
+            candidate = deepcopy(self.workflow)
+            candidate["steps"][-1]["value"] += step["value"]
+            check = deepcopy(candidate)
+            check["financial"] = False
+            validate_workflow(check)
+            return candidate
+        return self.prepare(owner, step)
+
     def review(self, owner, operation, data):
         self.require_owner(owner)
         if self.active:
@@ -136,10 +183,14 @@ class Recorder:
         elif operation == "insert":
             step = deepcopy(data.get("step"))
             if not isinstance(step, dict) or step.get("type") not in {
+                "tap",
+                "swipe",
+                "input",
+                "key",
                 "wait",
                 "manual_checkpoint",
             }:
-                raise ValueError("Only waits and manual checkpoints can be inserted.")
+                raise ValueError("Choose a supported step type.")
             index = data.get("index", len(candidate["steps"]))
 
             if type(index) is not int or not 0 <= index <= len(candidate["steps"]):
@@ -161,6 +212,22 @@ class Recorder:
             old = candidate["steps"][index]
             if operation == "delete":
                 candidate["steps"].pop(index)
+            elif operation == "fields":
+                allowed = {
+                    "tap": {"x", "y"},
+                    "swipe": {"start", "end", "duration_ms"},
+                    "key": {"key"},
+                    "wait": {"seconds"},
+                    "manual_checkpoint": {"message"},
+                }.get(old["type"], set())
+                changes = data.get("fields")
+                if not isinstance(changes, dict) or set(changes) - allowed:
+                    raise ValueError("Unsupported fields for this step.")
+                old.update(deepcopy(changes))
+            elif operation == "wait":
+                if old["type"] != "wait":
+                    raise ValueError("Choose a wait step to edit its duration.")
+                old["seconds"] = data.get("seconds")
             elif operation == "rename_step":
                 label = data.get("label")
                 if (
@@ -197,22 +264,39 @@ class Recorder:
                         "Only recorded text inputs can become fixed or variable."
                     )
                 elif source == "fixed":
+                    new_value = data.get("value")
+
+                    if (
+                        self.editing_existing
+                        and old.get("source") == "fixed"
+                        and new_value in {None, "", "(hidden)"}
+                    ):
+                        new_value = old.get("value", "")
+
                     candidate["steps"][index] = {
+                        **{
+                            k: v
+                            for k, v in old.items()
+                            if k not in {"source", "variable", "message", "value"}
+                        },
                         "id": old["id"],
                         "type": "input",
                         "source": "fixed",
-                        "value": data.get("value", ""),
+                        "value": new_value,
                         "label": old.get("label", ""),
                     }
                 elif source == "variable":
                     variable = deepcopy(data.get("variable"))
+
                     if not isinstance(variable, dict):
                         raise ValueError("Variable definition is required.")
+
                     sensitive_label = (
                         str(variable.get("name", ""))
                         + " "
                         + str(variable.get("label", ""))
                     )
+
                     if variable.get(
                         "sensitive", False
                     ) is not False or SENSITIVE.search(sensitive_label):
@@ -249,20 +333,31 @@ class Recorder:
                 raise ValueError("Unknown review operation.")
 
         used = {s.get("variable") for s in candidate["steps"]}
+
         candidate["variables"] = [
             v for v in candidate["variables"] if v["name"] in used
         ]
         check = deepcopy(candidate)
         check["financial"] = False
         validate_workflow(check, allow_empty=True)
+
         if type(candidate.get("financial", False)) is not bool:
             raise ValueError("Financial flow must be a boolean.")
         self.workflow = candidate
         return self.snapshot()
 
     def snapshot(self):
+        workflow = deepcopy(self.workflow)
+        if self.editing_existing and workflow:
+            for step in workflow["steps"]:
+                if step["type"] == "input" and step.get("source") == "fixed":
+                    step["value"] = "(hidden)"
+                step.pop("preview", None)
+            for variable in workflow["variables"]:
+                variable["default"] = None
         return {
-            "workflow": deepcopy(self.workflow),
+            "workflow": workflow,
+            "editing_existing": self.editing_existing,
             "active": self.active,
             "execute": self.execute,
         }

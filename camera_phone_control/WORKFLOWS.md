@@ -58,7 +58,7 @@ ESP32, ADB, Appium server or camera is required for mock workflows.
    input label. Fast steps may pass between status polls; all commands remain in
    the run log. This preview is a diagram, not a phone screenshot.
 5. Resume the final checkpoint to finish. **Stop Run** cancels a run or a checkpoint.
-6. To record without hardware, choose **Record New Flow → Start Recording**,
+6. To record without hardware, choose **Start Recording**,
    then click, drag and type using the small mock phone preview. Stop to review.
 
 Mock text logs include only character counts. Typed values are not retained in
@@ -67,24 +67,24 @@ and 500 log entries per run; restarting Flask clears it. Saved flows persist.
 
 ## Record first, configure after
 
-1. Start the current backend, connect and authorize the USB phone, and unlock it
+1. Connect the phone using your configured manual controls and unlock it
    manually. Open an ordinary screen such as Settings search. Calibrate the lit
    display using the existing four-corner controls.
-2. Open **Automations → Record New Flow → Start Recording**. Recording enables the
-   current backend's manual control through its existing ownership/frame checks.
+2. Open **Start Recording**. Recording enables the
+   phone's manual control through its existing ownership/frame checks.
    You do not have to choose action types or variables first.
-3. Click or drag inside the live phone preview; type and use Enter, Backspace or
-   Tab after focusing it. Normal navigation buttons such as Home and Back also
+3. Click inside the live phone preview; type and use phone keys after focusing
+   it. Use the swipe buttons for Pi recording; legacy and mock recording also support dragging. Normal navigation buttons such as Home and Back also
    become recorded actions. In mock mode, use the small phone preview without a
    camera or phone. These actions execute once as they are recorded.
-4. Active recording shows **● Recording**, **Actions recorded**, **Undo Last** and
+4. Active recording shows **● Recording • N steps**, a live **Recorded Steps** timeline, **Undo Last** and
    **Stop Recording**. Configuration and technical details stay hidden. Undo
    removes the recorded step; it does not reverse the physical phone's action.
 5. Press **Stop Recording**. Pending typed text is flushed before stopping. The
-   **Review Flow** timeline opens and manual keyboard forwarding is disabled.
+   **Review Recording** timeline opens and manual keyboard forwarding is disabled.
 6. Rename the flow and individual steps. Tap labels use accessibility text when
-   available; otherwise they display “Tap — Step 1”. Swipes show their direction.
-   Coordinates, durations and IDs are only in **Advanced / Debug**.
+   available; otherwise they display “Tap”. Swipes show their direction.
+   Tap coordinates are rounded percentages; full precision remains in the workflow.
 7. Recorded text appears as a single input step. Choose **Keep Fixed**, **Make
    Variable**, or **Manual**. The variable editor supplies Name, Label, Required,
    optional Default Value and **Ask When Running**. Conversion to a variable
@@ -94,7 +94,7 @@ and 500 log entries per run; restarting Flask clears it. Saved flows persist.
 8. Use Delete, Move Up/Down, or insert a wait/manual checkpoint at the chosen
    timeline position. These editing actions are only available after Stop. A
    financial preparation flow must end in a manual authorization checkpoint.
-9. **Save Flow**, select **Run…**, fill the generated variable form, and **Start
+9. **Save Workflow**, select **Run…**, fill the generated variable form, and **Start
    Run**. “Ask When Running” defaults to on for old and new definitions. When off,
    the variable uses its default; a required hidden variable needs a default.
 10. At a manual checkpoint, automation releases ownership. Complete the action on
@@ -102,7 +102,7 @@ and 500 log entries per run; restarting Flask clears it. Saved flows persist.
     to the displayed checkpoint and reacquires the same device lock and health
     checks. Take Over permanently cancels a running workflow; it does not resume it.
 
-Typing is buffered briefly in the browser, then sent in order with gestures/keys.
+For legacy/mock recording, typing is buffered briefly in the browser, then sent in order with gestures/keys.
 Consecutive chunks from the same focused field are combined into one recorded
 text step, including a trailing Backspace. Local form editing and browser
 shortcuts are not recorded. Supported text remains printable ASCII with the
@@ -115,9 +115,49 @@ or typing performed directly on the physical phone. A draft survives refresh in
 the same tab but not a server restart. The browser's normal manual-control
 identifier and the draft recording identifier remain separate.
 
+### Recording through Pi manual controls
+
+Pi recording observes the existing `/api/action`, `/api/key`, and `/api/text`
+requests after ownership, camera freshness, calibration, and device-lock checks.
+It prepares a valid candidate before sending input, then commits only after the
+Pi acknowledges success. Failed or uncertain input stops recording without
+appending a successful step or retrying. The UI preserves the draft for review.
+No status checks, screen inspection, or automation transport are added to input.
+
+Printable keys go to the phone immediately, one existing request per key.
+Consecutive acknowledged text is grouped in the draft, up to 4096 characters per
+step. Every physical tap, swipe, navigation action, or special key breaks the
+group. Backspace is an explicit key step, not an edit to previously captured text.
+Stop closes the input gate immediately and waits for an already-sent input before
+opening review. It does not save or discard automatically.
+
+Version 1 is retained: tap `x/y` and swipe `start/end` contain full-precision
+normalized phone coordinates. Text uses `input` with `source: fixed` and `value`;
+keys use `key` with uppercase `key`. Navigation uses existing `HOME`, `BACK`, and
+`SCREEN_ON` keys. The additive key names `LEFT`, `RIGHT`, `UP`, `DOWN`, `DELETE`,
+`MOVE_HOME`, `END`, `PAGEUP`, and `PAGEDOWN` cover the manual keyboard. `MOVE_HOME`
+means the text cursor Home key; existing `HOME` still means phone navigation.
+Legacy playback accepts these keys through its existing keyboard transport.
+No transport names, URLs, request payloads, or camera coordinates enter steps.
+
+Pi recording has no UI hierarchy or secure-field detection. It records text sent
+through the manual controls as entered. For private input, use the phone directly
+and insert a manual checkpoint during review. Legacy input privacy checks remain
+unchanged. Playback uses its independently configured input backend, including
+Pi when `PHONE_INPUT_BACKEND=raspberry_pi`.
+
+Review supports step names, fixed/variable/manual text, wait duration, deletion,
+and reordering. **Save Workflow** uses the workflow name field; an empty name shows
+“Enter a workflow name”. Recorder tests run without hardware:
+
+```sh
+python -m unittest discover -s tests -p 'test_pi_recording.py' -v
+node --test tests/test_keyboard.js tests/test_workflow_ui.js
+```
+
 ### Input privacy and target previews
 
-Before capturing physical-backend input, the recorder inspects the current UI
+Before capturing legacy Appium input, the recorder inspects the current UI
 through `context.screen.inspect()`. Password flags and security-related UI labels
 cause a manual checkpoint instead of a replayable tap/key/text action. Text also
 requires one focused, non-password editable field with a recognized ordinary
@@ -179,13 +219,61 @@ supports explicit manual pause/resume. Local API background threads call that
 entry point rather than taking an independent lock.
 
 Backend selection, construction, device discovery and health checks live in
-`automation/backends.py`. To add Raspberry Pi or ESP32-S3 later, implement the
-`InputBridge` contract, then register its construction/discovery/health handling
-in that module and allow its configuration name. Provide a ScreenProvider for
-camera/vision independently. The recorder, JSON, variable forms, generic runner
-and workflow actions remain unchanged. No Pi/ESP32 protocol has been selected.
-`screen/camera.py` is only a reserved module; requesting `camera`, `raspberry_pi`
-or `esp32_s3` now produces an explicit configuration error.
+`automation/backends.py`. Input supports `appium`, `raspberry_pi`, and `mock`.
+Screen selection remains `appium` or `mock`; camera/vision and ESP32 input are not
+implemented. The workflow schema and recorder are independent of this selection.
+
+### Pi workflow playback
+
+Start the dashboard with the playback input explicitly selected:
+
+```sh
+export PHONE_INPUT_BACKEND=raspberry_pi
+export PI_API_BASE_URL=http://192.168.68.61:8766
+export PHONE_SCREEN_BACKEND=appium
+python app.py --camera 0
+```
+
+The advanced panel will show `Input: raspberry_pi · Screen: appium`. Restart the
+server after changing its environment. `PHONE_MANUAL_INPUT_BACKEND` independently
+selects manual controls; it does not choose workflow playback. Leave
+`PHONE_INPUT_BACKEND=appium` to retain legacy playback, or use `mock` for no input.
+
+Saved version-1 workflows go through `WorkflowRunner`, the guarded input contract,
+`RaspberryPiWorkflowInput`, the existing `RaspberryPiInputBridge`, and `PiApiClient`.
+Pi input discovers no USB device and performs no `/status` or `/health` checks.
+Each physical action is sent once; failures stop later steps, preserve useful Pi
+errors, and warn when input may have occurred. No retries or status polling occur.
+
+| Saved action                | Pi operation                                    |
+| --------------------------- | ----------------------------------------------- |
+| `tap` (`x`, `y`)            | `/tap`, unchanged normalized coordinates        |
+| `swipe` (`start`, `end`)    | `/swipe`, normalized endpoints                  |
+| Fixed or variable `input`   | `/text`, resolved value; empty input is a no-op |
+| Keyboard `key`              | `/key`; `MOVE_HOME` maps to keyboard `HOME`     |
+| `HOME`, `BACK`, `SCREEN_ON` | `/home`, `/back`, `/wake`                       |
+| `wait`, `manual_checkpoint` | Existing local wait and checkpoint behavior     |
+
+The Pi swipe API has no duration field. Saved durations remain intact for legacy
+playback, but Pi playback uses the HID server's swipe timing. Recent Apps, Screen
+Off, relative motion, pointer click, and application launch are unsupported and
+fail without inventing an endpoint or falling back to ADB.
+
+Pi runs use the same `pi-api:<base URL>` lock identity as Pi manual input.
+Cancellation, explicit takeover, and checkpoint release/resume retain their
+existing semantics. Different transport identities (Pi versus USB) still cannot
+coordinate ownership of the same physical phone.
+
+Screen acquisition has not migrated. Appium screenshot/UI inspection still uses
+the existing USB screen provider, resolving its USB device only when explicitly
+requested. Input-only workflows require no USB even with `PHONE_SCREEN_BACKEND=appium`.
+A screen operation still requires USB; no camera or vision fallback is introduced.
+Legacy scripts that require pixel geometry or direct Android controller operations
+are not automatically made Pi-compatible.
+
+```sh
+python -m unittest discover -s tests -p 'test_pi_playback.py' -v
+```
 
 ## Coordinates and JSON
 
@@ -211,14 +299,35 @@ Example version 1 document:
   "version": 1,
   "financial": false,
   "variables": [
-    {"name": "search_text", "label": "Search Text", "type": "text", "required": true, "default": null}
+    {
+      "name": "search_text",
+      "label": "Search Text",
+      "type": "text",
+      "required": true,
+      "default": null
+    }
   ],
   "steps": [
-    {"id": "step_001", "type": "tap", "x": 0.51, "y": 0.73},
-    {"id": "step_002", "type": "input", "source": "variable", "variable": "search_text"},
-    {"id": "step_003", "type": "swipe", "start": [0.5, 0.8], "end": [0.5, 0.2], "duration_ms": 350},
-    {"id": "step_004", "type": "wait", "seconds": 1.0},
-    {"id": "step_005", "type": "manual_checkpoint", "message": "Inspect the result, then Resume."}
+    { "id": "step_001", "type": "tap", "x": 0.51, "y": 0.73 },
+    {
+      "id": "step_002",
+      "type": "input",
+      "source": "variable",
+      "variable": "search_text"
+    },
+    {
+      "id": "step_003",
+      "type": "swipe",
+      "start": [0.5, 0.8],
+      "end": [0.5, 0.2],
+      "duration_ms": 350
+    },
+    { "id": "step_004", "type": "wait", "seconds": 1.0 },
+    {
+      "id": "step_005",
+      "type": "manual_checkpoint",
+      "message": "Inspect the result, then Resume."
+    }
   ]
 }
 ```
@@ -273,22 +382,22 @@ All mutations require existing `X-Control-Token` and a valid `X-Control-Client`
 header. The token is in the dashboard HTML meta tag; this is a trusted local
 application, not a public webhook authentication system.
 
-| Method and path | Purpose |
-| --- | --- |
-| GET /api/workflows | List summaries and backend configuration |
-| POST /api/workflows | Create a validated workflow JSON document |
-| GET /api/workflows/ID | Read full definition |
-| PUT /api/workflows/ID | Update definition with matching ID |
-| DELETE /api/workflows/ID | Delete saved definition |
-| POST /api/workflows/ID/run | Start with `{"variables":{"search_text":"hello"}}` |
-| GET /api/workflow-runs/RUN_ID | Status, step counters, safe preview and logs |
-| POST /api/workflow-runs/RUN_ID/cancel | Stop, with `{}` |
-| POST /api/workflow-runs/RUN_ID/resume | Resume the displayed checkpoint, with `{"step_index":1}` |
-| GET /api/recorder | Current browser-owned draft |
-| POST /api/recorder/start | Name, execute flag and financial flag |
-| POST /api/recorder/step | Capture performed actions using `capture:true`, with optional camera points; legacy definition-only requests remain supported |
-| POST /api/recorder/review | After Stop: rename_flow, rename_step, delete, move, input conversion, or insert |
-| POST /api/recorder/undo, /stop, /save, /cancel | Draft lifecycle, with `{}` |
+| Method and path                                | Purpose                                                                                                                       |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| GET /api/workflows                             | List summaries and backend configuration                                                                                      |
+| POST /api/workflows                            | Create a validated workflow JSON document                                                                                     |
+| GET /api/workflows/ID                          | Read full definition                                                                                                          |
+| PUT /api/workflows/ID                          | Update definition with matching ID                                                                                            |
+| DELETE /api/workflows/ID                       | Delete saved definition                                                                                                       |
+| POST /api/workflows/ID/run                     | Start with `{"variables":{"search_text":"hello"}}`                                                                            |
+| GET /api/workflow-runs/RUN_ID                  | Status, step counters, safe preview and logs                                                                                  |
+| POST /api/workflow-runs/RUN_ID/cancel          | Stop, with `{}`                                                                                                               |
+| POST /api/workflow-runs/RUN_ID/resume          | Resume the displayed checkpoint, with `{"step_index":1}`                                                                      |
+| GET /api/recorder                              | Current browser-owned draft                                                                                                   |
+| POST /api/recorder/start                       | Name, execute flag and financial flag                                                                                         |
+| POST /api/recorder/step                        | Capture performed actions using `capture:true`, with optional camera points; legacy definition-only requests remain supported |
+| POST /api/recorder/review                      | After Stop: rename_flow, rename_step, delete, move, input conversion, or insert                                               |
+| POST /api/recorder/undo, /stop, /save, /cancel | Draft lifecycle, with `{}`                                                                                                    |
 
 Recorder requests can carry `X-Recorder-Client`, a separate per-tab draft identity
 kept in session storage. Live gesture execution still checks the current manual

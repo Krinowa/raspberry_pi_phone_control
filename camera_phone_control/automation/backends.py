@@ -4,7 +4,9 @@ import os
 from android_control import Device, DeviceError
 from .input.appium import AppiumInputBridge
 from .input.mock import MockInputBridge
-from .screen.appium import AppiumScreenProvider
+from .input.raspberry_pi import RaspberryPiWorkflowInput
+from hardware.raspberry_pi_input import RaspberryPiInputBridge
+from .screen.appium import AppiumScreenProvider, DeferredAppiumScreenProvider
 from .screen.base import ScreenProvider
 
 
@@ -13,11 +15,11 @@ class BackendConfigurationError(ValueError):
 
 
 def backend_names():
-    input_name = os.environ.get("PHONE_INPUT_BACKEND", "appium")
+    input_name = os.environ.get("PHONE_INPUT_BACKEND", "raspberry_pi")
     screen_name = os.environ.get("PHONE_SCREEN_BACKEND", "appium")
-    if input_name not in {"appium", "mock"}:
+    if input_name not in {"appium", "mock", "raspberry_pi"}:
         raise BackendConfigurationError(
-            "Unsupported PHONE_INPUT_BACKEND; use appium or mock."
+            "Unsupported PHONE_INPUT_BACKEND; use appium, raspberry_pi or mock."
         )
     if screen_name not in {"appium", "mock"}:
         raise BackendConfigurationError(
@@ -26,8 +28,15 @@ def backend_names():
     return input_name, screen_name
 
 
-def select_device(controller, serial=None, *, authorized_only=True):
-    input_name, _ = backend_names()
+def select_device(controller, serial=None, *, authorized_only=True, input_backend=None):
+    input_name = input_backend or backend_names()[0]
+    if input_name == "raspberry_pi":
+        target = RaspberryPiInputBridge().target
+        if serial is not None and serial != target.serial:
+            raise BackendConfigurationError(
+                "Pi input uses PI_API_BASE_URL, not a USB serial."
+            )
+        return target
     if input_name == "mock":
         return Device("mock", 1080, 1920, 0)
     return controller.device(serial=serial, authorized_only=authorized_only)
@@ -93,11 +102,12 @@ class GuardedScreen:
         return self._call("inspect")
 
 
-def bind(context):
-    input_name, screen_name = backend_names()
+def bind(context, input_backend=None):
+    configured_input, screen_name = backend_names()
+    input_name = input_backend or configured_input
 
     def check_ready():
-        if input_name == "mock":
+        if input_name in {"mock", "raspberry_pi"}:
             return
         current = context.controller.device(
             serial=context.device.serial, authorized_only=True
@@ -106,17 +116,22 @@ def bind(context):
             raise DeviceError("Phone geometry changed. Script stopped.")
 
     context._health_check = check_ready
-    bridge = (
-        MockInputBridge(context.logger)
-        if input_name == "mock"
-        else AppiumInputBridge(
+
+    if input_name == "mock":
+        bridge = MockInputBridge(context.logger)
+    elif input_name == "raspberry_pi":
+        bridge = RaspberryPiWorkflowInput(context.device)
+    else:
+        bridge = AppiumInputBridge(
             context.controller, context.device, context._check_device
         )
-    )
+
     # Mock input never touches hardware, even if the default screen name is appium.
-    screen = (
-        ScreenProvider()
-        if input_name == "mock" or screen_name == "mock"
-        else AppiumScreenProvider(context.controller, context.device)
-    )
+    if input_name == "mock" or screen_name == "mock":
+        screen = ScreenProvider()
+    elif input_name == "raspberry_pi":
+        # Keep USB screen handling independent; input-only runs never discover USB.
+        screen = DeferredAppiumScreenProvider(context.controller)
+    else:
+        screen = AppiumScreenProvider(context.controller, context.device)
     return input_name, GuardedInput(context, bridge), GuardedScreen(context, screen)

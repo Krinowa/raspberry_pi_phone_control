@@ -16,7 +16,15 @@ class Cancelled(Exception):
 
 class AutomationContext:
     def __init__(
-        self, device, controller, cancel_event, logger, state, takeover_requested=None
+        self,
+        device,
+        controller,
+        cancel_event,
+        logger,
+        state,
+        takeover_requested=None,
+        *,
+        input_backend=None
     ):
         self.device = device
         self.controller = controller
@@ -25,7 +33,9 @@ class AutomationContext:
         self.state = state
         self.takeover_requested = takeover_requested or (lambda: False)
         self.cancelled_for_takeover = False
-        self.input_backend, self.input, self.screen = bind(self)
+        self.input_backend, self.input, self.screen = bind(
+            self, input_backend=input_backend
+        )
         self.manual_handler = None
 
     def check_cancelled(self):

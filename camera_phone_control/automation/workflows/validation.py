@@ -22,6 +22,15 @@ KEYS = {
     "RECENTS",
     "SCREEN_ON",
     "SCREEN_OFF",
+    "LEFT",
+    "RIGHT",
+    "UP",
+    "DOWN",
+    "DELETE",
+    "MOVE_HOME",
+    "END",
+    "PAGEUP",
+    "PAGEDOWN",
 }
 
 

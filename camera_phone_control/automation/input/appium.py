@@ -12,6 +12,15 @@ KEYS = {
     "RECENTS",
     "SCREEN_ON",
     "SCREEN_OFF",
+    "LEFT",
+    "RIGHT",
+    "UP",
+    "DOWN",
+    "DELETE",
+    "MOVE_HOME",
+    "END",
+    "PAGEUP",
+    "PAGEDOWN",
 }
 
 
@@ -46,7 +55,21 @@ class AppiumInputBridge(InputBridge):
         if not isinstance(key, str) or key.upper() not in KEYS:
             raise ValueError("Unsupported key.")
         key = key.lower()
-        if key in {"enter", "backspace", "tab"}:
+        if key == "move_home":
+            self.controller.send_key(self.device, "key", "home")
+        elif key in {
+            "enter",
+            "backspace",
+            "tab",
+            "left",
+            "right",
+            "up",
+            "down",
+            "delete",
+            "end",
+            "pageup",
+            "pagedown",
+        }:
             self.controller.send_key(self.device, "key", key)
         else:
             self.controller.send(self.device, key)
