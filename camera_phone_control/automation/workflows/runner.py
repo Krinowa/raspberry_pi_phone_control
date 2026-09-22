@@ -2,11 +2,19 @@
 
 from .validation import validate_workflow, resolve_variables
 from ..context import Cancelled
+from ..screen.state import UnavailableScreenStateProvider, wait_for_text
+from ..screen.stability import wait_until_stable
 
 
 class WorkflowRunner:
-    def __init__(self, context):
+    def __init__(self, context, external_screen=None, screen_state_provider=None):
         self.context = context
+        self.external_screen = external_screen
+        self.screen_state_provider = (
+            UnavailableScreenStateProvider()
+            if screen_state_provider is None
+            else screen_state_provider
+        )
 
     def run(self, workflow, variables=None):
         workflow = validate_workflow(workflow)
@@ -53,6 +61,24 @@ class WorkflowRunner:
             ctx.input.key(step["key"])
         elif kind == "wait":
             ctx.wait(step["seconds"])
+        elif kind == "wait_until_stable":
+            ctx.logger.info("Waiting for screen to settle…")
+            wait_until_stable(
+                self.external_screen,
+                ctx,
+                step["stable_ms"],
+                step["timeout_seconds"],
+            )
+            ctx.logger.info("Screen stable for %s ms.", step["stable_ms"])
+        elif kind == "wait_for_text":
+            ctx.logger.info("Waiting for text: %s", step["text"])
+            wait_for_text(
+                self.screen_state_provider,
+                ctx,
+                step["text"],
+                step["timeout_seconds"],
+            )
+            ctx.logger.info("Text detected: %s", step["text"])
         elif kind == "manual_checkpoint":
             ctx.manual_checkpoint(step["message"])
         elif kind == "input":

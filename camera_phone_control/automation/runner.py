@@ -14,6 +14,8 @@ from hardware.pi_api_client import PiApiError
 from .context import AutomationContext, Cancelled
 from .backends import select_device, backend_names
 from .input.base import UnsupportedOperation
+from .screen.state import ScreenStateError
+from .screen.stability import ScreenStabilityError
 from .scripts import SCRIPTS, available_scripts
 
 LOG = logging.getLogger("automation")
@@ -183,7 +185,7 @@ class Runner:
                     "phone geometry. An input may have occurred; it will not be retried."
                 )
             )
-        except UnsupportedOperation as exc:
+        except (UnsupportedOperation, ScreenStabilityError, ScreenStateError) as exc:
             state.status = "failed"
             state.message = str(exc)
         except (Exception, SystemExit):

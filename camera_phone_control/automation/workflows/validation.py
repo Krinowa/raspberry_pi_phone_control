@@ -81,7 +81,22 @@ def validate_variable_value(definition, value):
     return str(value)
 
 
+def normalize_workflow(workflow):
+    """Remove retired image-matching fields from version 1 workflows."""
+    if not isinstance(workflow, dict):
+        return workflow
+    normalized = deepcopy(workflow)
+    normalized.pop("visual_references", None)
+    steps = normalized.get("steps")
+    if isinstance(steps, list):
+        for step in steps:
+            if isinstance(step, dict):
+                step.pop("expect_after", None)
+    return normalized
+
+
 def validate_workflow(workflow, *, allow_empty=False):
+    workflow = normalize_workflow(workflow)
     fields(
         workflow,
         {
@@ -174,12 +189,21 @@ def validate_workflow(workflow, *, allow_empty=False):
             "input": {"source", "value", "variable", "message", "sensitive"},
             "key": {"key"},
             "wait": {"seconds"},
+            "wait_until_stable": {"stable_ms", "timeout_seconds"},
+            "wait_for_text": {"text", "timeout_seconds"},
             "manual_checkpoint": {"message"},
         }[kind]
 
         fields(
             step,
-            {"id", "type", "label", "preview", "recorded_at"} | specific,
+            {
+                "id",
+                "type",
+                "label",
+                "preview",
+                "recorded_at",
+            }
+            | specific,
             {"id", "type"},
         )
 
@@ -213,6 +237,32 @@ def validate_workflow(workflow, *, allow_empty=False):
             number(duration, 1, 60000)
         elif kind == "wait":
             number(step.get("seconds"), 0, 3600)
+        elif kind == "wait_until_stable":
+            for field, low, high in (
+                ("stable_ms", 100, 10000),
+                ("timeout_seconds", 1, 300),
+            ):
+                try:
+                    number(step.get(field), low, high)
+                except ValueError:
+                    raise ValueError(
+                        f"{field} must be numeric between {low} and {high}."
+                    ) from None
+            if step["timeout_seconds"] < step["stable_ms"] / 1000:
+                raise ValueError(
+                    "timeout_seconds must allow the requested stability window."
+                )
+        elif kind == "wait_for_text":
+            expected = text(step.get("text"), "Text to detect", 500).strip()
+            if not expected:
+                raise ValueError("Text to detect must not be empty.")
+            step["text"] = expected
+            try:
+                number(step.get("timeout_seconds"), 0.5, 300)
+            except ValueError:
+                raise ValueError(
+                    "timeout_seconds must be numeric between 0.5 and 300."
+                ) from None
         elif kind == "key":
             if not isinstance(step.get("key"), str) or step["key"].upper() not in KEYS:
                 raise ValueError("Unsupported workflow key.")

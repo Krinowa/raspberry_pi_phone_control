@@ -230,6 +230,13 @@ class Camera:
         with self.lock:
             return self.latest
 
+    def observation(self):
+        """Atomically pair the latest JPEG/sequence/geometry with capture time."""
+        with self.lock:
+            if self.latest is None or not self.timestamps or self.stop_event.is_set():
+                return None
+            return (*self.latest, self.timestamps[-1][1])
+
     def validate_frame(self, frame_id):
         with self.lock:
 

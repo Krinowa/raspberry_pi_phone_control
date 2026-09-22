@@ -524,3 +524,68 @@ camera_phone_control/
 ├── README.md
 └── WORKFLOWS.md
 ```
+
+### Wait for Screen to Settle
+
+During review (including editing a saved flow), open **Add Step** to insert
+**Wait for Screen to Settle**. Defaults are **Stable for: 700 ms** and
+**Maximum wait: 10 sec**. Both values can be edited with the existing step editor;
+steps can also be moved or deleted. Recording does not insert these automatically.
+Fixed Wait and Manual Checkpoint remain available.
+
+The JSON step uses the existing step ID convention:
+
+```json
+{
+  "id": "settle_1",
+  "type": "wait_until_stable",
+  "stable_ms": 700,
+  "timeout_seconds": 10
+}
+```
+
+`stable_ms` accepts finite numbers from 100–10000; `timeout_seconds` accepts 1–300
+and must cover the stability window. Allow additional time for sampling and any
+screen transition. Playback requires a live external camera and current display
+calibration, regardless of the input backend. No Pi command or Appium screenshot
+is sent during this step.
+
+The detector reuses the camera capture thread and calibration homography. Every
+150 ms it samples a reduced grayscale JPEG, warps only the phone display to
+96 × 160, trims the border, and applies a small blur. The mean absolute difference
+must stay at or below 3 grayscale levels (out of 255), against both the previous
+sample and the stability window's first sample. These are internal helper
+parameters for future tuning. Frame IDs and monotonic capture timestamps must
+advance; repeated frames cannot complete the window, feeds older than 2 seconds
+fail, and gaps over 450 ms restart the stability window. Cancellation and takeover
+are checked every sample; timeouts fail without retrying.
+
+This detects visual stillness, not successful loading. Static error pages can
+pass, small/local animations may be tolerated, and lighting changes or camera
+movement may prevent settling. A camera device that repeats identical images
+while delivering fresh IDs/timestamps cannot be distinguished from a still scene.
+Keep the camera fixed and recalibrate when its position changes.
+
+### Wait for Text
+
+Review mode can insert an explicit semantic wait:
+
+```json
+{
+  "id": "text_1",
+  "type": "wait_for_text",
+  "text": "Transfer",
+  "timeout_seconds": 10
+}
+```
+
+The text is trimmed and must contain 1–500 characters. `timeout_seconds` accepts
+finite numbers from 0.5–300. Playback polls about every 200 ms, checks cancellation
+between samples, and never repeats an earlier action. A timeout fails the run.
+
+Workflow execution depends only on `ScreenStateProvider.contains_text()` from
+`automation/screen/state.py`. Providers perform case-insensitive literal substring
+matching; fuzzy matching and regular expressions are outside the contract. This
+allows an Android accessibility service, camera OCR, or deterministic test provider
+to use the same runner path. Until a production provider is configured, the step
+fails clearly instead of falling back to a fixed delay.

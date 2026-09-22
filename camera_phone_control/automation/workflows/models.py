@@ -3,7 +3,16 @@
 import uuid
 from datetime import datetime, timezone
 
-STEP_TYPES = {"tap", "swipe", "input", "key", "wait", "manual_checkpoint"}
+STEP_TYPES = {
+    "tap",
+    "swipe",
+    "input",
+    "key",
+    "wait",
+    "wait_until_stable",
+    "wait_for_text",
+    "manual_checkpoint",
+}
 VARIABLE_TYPES = {"text", "number"}
 
 

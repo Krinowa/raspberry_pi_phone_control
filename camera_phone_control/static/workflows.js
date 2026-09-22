@@ -57,6 +57,10 @@
       );
       return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}`;
     }
+    if (step.type === "wait_until_stable")
+      return `Wait for Screen to Settle — Stable for ${step.stable_ms} ms · Max ${step.timeout_seconds} sec`;
+    if (step.type === "wait_for_text")
+      return `Wait for Text — “${step.text}” · Max ${step.timeout_seconds} sec`;
     if (step.type === "wait") return `Wait ${step.seconds} seconds`;
     if (step.type === "key")
       return (
@@ -83,6 +87,128 @@
     element.addEventListener("click", () => task(fn));
     return element;
   }
+
+  let expectedActionId = null,
+    expectedMode = null;
+
+  const annotationBusy = () =>
+    !!expectedMode || !!recording.expected_text_pending;
+
+  function canExpectText(step) {
+    return (
+      (step.type === "tap" ||
+        step.type === "swipe" ||
+        (step.type === "key" &&
+          ["HOME", "BACK"].includes(step.key.toUpperCase()))) &&
+      !/(?:^|[^a-z])(?:pin|otp)(?:$|[^a-z])|password|passwd|passcode|secret|biometric|approval_code|authoriz|authoris|confirm.*(?:pay|transfer)|final.*(?:pay|transfer)/i.test(
+        step.label || "",
+      )
+    );
+  }
+
+  async function openExpectedText(step, wait, mode = "review") {
+    expectedActionId = step?.id || null;
+    expectedMode = mode;
+    $("expected-text-editor").hidden = false;
+    $("expected-text-title").textContent = step
+      ? `Choose expected text after ${describe(step)}`
+      : "Choose expected text for the current screen";
+    $("expected-text-value").value = wait?.text || "";
+    $("expected-text-timeout").value = wait?.timeout_seconds ?? 10;
+    $("expected-suggestions").replaceChildren();
+    $("expected-text-status").textContent = "Reading current phone screen…";
+    renderRecording();
+    render();
+    try {
+      const targetMode = mode;
+      const result = await api(
+        "/api/recorder/text-suggestions",
+        mode === "current" ? { current: true } : { step_id: step.id },
+      );
+      if (
+        expectedMode !== targetMode ||
+        expectedActionId !== (step?.id || null)
+      )
+        return;
+      const choices = (result.suggestions || []).slice(0, 5);
+      $("expected-suggestions").replaceChildren(
+        ...choices.map((text) => {
+          const label = document.createElement("label");
+          const radio = document.createElement("input");
+          radio.type = "radio";
+          radio.name = "expected-suggestion";
+          radio.value = text;
+          radio.addEventListener("change", () => {
+            $("expected-text-value").value = text;
+          });
+          const caption = document.createElement("span");
+          caption.textContent = text;
+          label.append(radio, caption);
+          return label;
+        }),
+      );
+      $("expected-text-status").textContent = choices.length
+        ? "Suggestions from the current screen. Select one or enter text manually."
+        : "No reliable text suggestions found. Enter expected text manually.";
+    } catch (error) {
+      if (expectedMode === mode && expectedActionId === (step?.id || null))
+        $("expected-text-status").textContent =
+          "No reliable text suggestions found. Enter expected text manually.";
+    }
+    renderRecording();
+  }
+
+  function closeExpectedText() {
+    expectedActionId = null;
+    expectedMode = null;
+    $("expected-text-editor").hidden = true;
+    render();
+  }
+
+  async function openPendingExpectedText() {
+    const stepId = recording.pending_expected_text_step_id;
+
+    if (!recording.active || !recording.expected_text_pending || expectedMode)
+      return;
+
+    if (!stepId) {
+      await openExpectedText(null, null, "current");
+      return;
+    }
+
+    const step = recording.workflow?.steps.find((item) => item.id === stepId);
+
+    if (step) await openExpectedText(step, null, "recording");
+  }
+
+  $("expected-text-editor").addEventListener("submit", (event) => {
+    event.preventDefault();
+    task(async () => {
+      if (expectedMode === "review")
+        await review({
+          operation: "expected_text",
+          step_id: expectedActionId,
+          ...textWaitFields("expected"),
+        });
+      else
+        recording = await api("/api/recorder/expected-text", {
+          ...textWaitFields("expected"),
+        });
+      closeExpectedText();
+    });
+  });
+  $("expected-text-cancel").addEventListener("click", () =>
+    task(async () => {
+      if (expectedMode && expectedMode !== "review")
+        recording = await api("/api/recorder/expected-text/cancel", {});
+      closeExpectedText();
+    }),
+  );
+  $("expected-text-manual").addEventListener("click", () => {
+    for (const radio of $("expected-suggestions").querySelectorAll("input"))
+      radio.checked = false;
+    $("expected-text-value").focus();
+  });
 
   function renderTimeline() {
     const draft = recording.workflow;
@@ -155,6 +281,27 @@
             review({ operation: "move", step_id: step.id, index: index + 1 }),
           ),
         );
+      if (!recording.active && canExpectText(step)) {
+        const next = draft.steps[index + 1];
+        const wait = next?.type === "wait_for_text" ? next : null;
+        const expected = document.createElement("p");
+        expected.textContent = `Expected text: ${wait?.text || "Not configured"}`;
+        row.append(expected);
+        actions.append(
+          button(wait ? "Change" : "Add Expected Text", () =>
+            openExpectedText(step, wait),
+          ),
+        );
+        if (wait)
+          actions.append(
+            button("Remove", () =>
+              review({
+                operation: "remove_expected_text",
+                step_id: step.id,
+              }),
+            ),
+          );
+      }
       if (!recording.active) row.append(actions);
       positions.push(
         new Option(
@@ -233,8 +380,18 @@
 
     $("record-stop").disabled = stopping;
 
+    $("record-mark-next").textContent = recording.mark_next_screen
+      ? "✓ Next Screen Will Be Checked"
+      : "Mark Next Screen: OFF";
+    $("record-mark-next").disabled = stopping || annotationBusy();
+    $("record-expect-current").disabled = stopping || annotationBusy();
+
     $("record-undo").disabled =
-      stopping || !draft?.steps.length || queued > 0 || !!textBuffer;
+      stopping ||
+      annotationBusy() ||
+      !draft?.steps.length ||
+      queued > 0 ||
+      !!textBuffer;
 
     $("record-save").disabled = working || !draft?.steps.length || live;
 
@@ -305,6 +462,12 @@
     $("step-key-options").hidden = step.type !== "key";
     $("step-input-options").hidden = step.type !== "input";
     $("step-wait-options").hidden = step.type !== "wait";
+    $("step-stable-options").hidden = step.type !== "wait_until_stable";
+    $("step-text-options").hidden = step.type !== "wait_for_text";
+    $("step-stable-ms").value = step.stable_ms ?? 700;
+    $("step-stable-timeout").value = step.timeout_seconds ?? 10;
+    $("step-text-value").value = step.text ?? "";
+    $("step-text-timeout").value = step.timeout_seconds ?? 10;
 
     // Tap
     if (step.type === "tap") {
@@ -492,6 +655,22 @@
         await review(input);
       }
 
+      if (old.type === "wait_until_stable") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: stabilityFields("step"),
+        });
+      }
+
+      if (old.type === "wait_for_text") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: textWaitFields("step"),
+        });
+      }
+
       if (old.type === "wait") {
         if (!Number.isFinite(seconds) || seconds < 0 || seconds > 3600) {
           throw new Error("Wait duration must be between 0 and 3600 seconds.");
@@ -536,6 +715,58 @@
     ),
   );
 
+  function stabilityFields(prefix) {
+    const stable_ms = Number($(`${prefix}-stable-ms`).value);
+    const timeout_seconds = Number($(`${prefix}-stable-timeout`).value);
+    if (!Number.isFinite(stable_ms) || stable_ms < 100 || stable_ms > 10000)
+      throw new Error("Stable for must be between 100 and 10000 ms.");
+    if (
+      !Number.isFinite(timeout_seconds) ||
+      timeout_seconds < 1 ||
+      timeout_seconds > 300
+    )
+      throw new Error("Maximum wait must be between 1 and 300 seconds.");
+    if (timeout_seconds < stable_ms / 1000)
+      throw new Error(
+        "Maximum wait must allow the requested stability window.",
+      );
+    return { stable_ms, timeout_seconds };
+  }
+
+  function textWaitFields(prefix) {
+    const text = $(`${prefix}-text-value`).value.trim();
+    const timeout_seconds = Number($(`${prefix}-text-timeout`).value);
+    if (!text || text.length > 500)
+      throw new Error("Text to detect must be between 1 and 500 characters.");
+    if (
+      !Number.isFinite(timeout_seconds) ||
+      timeout_seconds < 0.5 ||
+      timeout_seconds > 300
+    )
+      throw new Error("Maximum wait must be between 0.5 and 300 seconds.");
+    return { text, timeout_seconds };
+  }
+
+  $("record-stable").addEventListener("click", () =>
+    task(() =>
+      review({
+        operation: "insert",
+        index: Number($("insert-position").value),
+        step: { type: "wait_until_stable", ...stabilityFields("record") },
+      }),
+    ),
+  );
+
+  $("record-text").addEventListener("click", () =>
+    task(() =>
+      review({
+        operation: "insert",
+        index: Number($("insert-position").value),
+        step: { type: "wait_for_text", ...textWaitFields("record") },
+      }),
+    ),
+  );
+
   $("record-wait").addEventListener("click", () =>
     task(() =>
       review({
@@ -567,6 +798,7 @@
         frame_id: frameId,
         ...extra,
       });
+      await openPendingExpectedText();
       if (recording.notice) show(recording.notice);
       else show("");
     } catch (error) {
@@ -574,6 +806,7 @@
       clearTimeout(textTimer);
       // Stop after any uncertain command. Pending commands are discarded, never retried.
       recording.active = false;
+      closeExpectedText();
 
       if (backend !== "mock") disable().catch(() => {});
       try {
@@ -594,7 +827,7 @@
   }
 
   function enqueue(step, extra = {}) {
-    if (!recording.active) return captureQueue;
+    if (!recording.active || annotationBusy()) return captureQueue;
     if (queued >= 32) {
       textBuffer = "";
       clearTimeout(textTimer);
@@ -640,6 +873,7 @@
   }
 
   function addText(value) {
+    if (annotationBusy()) return;
     if (textBuffer.length + value.length > 4096) {
       show("Text is too long for one input.", true);
       return;
@@ -650,7 +884,7 @@
   }
 
   function naturalAction(action, point) {
-    if (!recording.active || stopping) return;
+    if (!recording.active || stopping || annotationBusy()) return;
     flushText();
 
     if (action === "tap")
@@ -674,6 +908,27 @@
   }
 
   $("record-new").addEventListener("click", () => $("record-start").click());
+
+  $("record-mark-next").addEventListener("click", () =>
+    task(async () => {
+      await pendingManual;
+      await flushText();
+      recording = await api("/api/recorder/mark-next-screen", {});
+      show(
+        recording.mark_next_screen
+          ? "The next tap, swipe, Home or Back action will be checked."
+          : "Next-screen check cancelled.",
+      );
+    }),
+  );
+
+  $("record-expect-current").addEventListener("click", () =>
+    task(async () => {
+      await pendingManual;
+      await flushText();
+      await openExpectedText(null, null, "current");
+    }),
+  );
 
   $("record-start").addEventListener("click", () =>
     task(async () => {
@@ -718,6 +973,7 @@
         await pendingManual;
         await flushText();
         recording = await api("/api/recorder/stop", {});
+        closeExpectedText();
         if (piManual() || backend !== "mock") await disable();
         show(
           "Recording stopped. Review your steps, name your workflow, then save.",
@@ -747,6 +1003,7 @@
       const editingExisting = !!recording.editing_existing;
 
       recording = await api("/api/recorder/cancel", {});
+      closeExpectedText();
 
       show(editingExisting ? "Changes discarded." : "Recording discarded.");
 
@@ -797,6 +1054,7 @@
       piManual() ||
       !recording.active ||
       stopping ||
+      annotationBusy() ||
       event.defaultPrevented ||
       localTarget(event) ||
       document.hidden ||
@@ -834,6 +1092,7 @@
       piManual() ||
       !recording.active ||
       stopping ||
+      annotationBusy() ||
       localTarget(event) ||
       document.hidden ||
       !document.hasFocus()
@@ -864,6 +1123,7 @@
         piManual() ||
         !recording.active ||
         stopping ||
+        annotationBusy() ||
         event.button !== 0 ||
         !event.isPrimary ||
         calibrating
@@ -892,7 +1152,8 @@
       const saved = gesture;
       gesture = null;
 
-      if (!recording.active || stopping || calibrating) return;
+      if (!recording.active || stopping || annotationBusy() || calibrating)
+        return;
       if (camera && !fresh())
         return show("The camera frame expired; gesture discarded.", true);
 
@@ -944,8 +1205,8 @@
   }
 
   window.phoneRecorder = {
-    capturesPreview: () => recording.active && !piManual(),
-    blocksInput: () => piManual() && stopping,
+    capturesPreview: () => recording.active && !piManual() && !annotationBusy(),
+    blocksInput: () => recording.active && (stopping || annotationBusy()),
     trackManual: (operation) => {
       if (piManual() && recording.active)
         pendingManual = operation.catch(() => {});
@@ -954,10 +1215,12 @@
       if (!snapshot || !piManual()) return;
       recording = snapshot;
       renderRecording();
+      openPendingExpectedText().catch((error) => show(error.message, true));
     },
     manualFailed: async (error) => {
       if (!piManual() || !recording.active) return;
       recording.active = false;
+      closeExpectedText();
       show(
         error.message +
           " Recording stopped. Input may already have occurred; inspect the phone before continuing. No retry attempted.",
@@ -1188,6 +1451,7 @@
   task(async () => {
     await loadFlows();
     recording = await api("/api/recorder", undefined, "GET");
+    await openPendingExpectedText();
     const id = localStorage.getItem("phone-workflow-run");
     if (id) {
       try {

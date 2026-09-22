@@ -1,7 +1,9 @@
 """One browser-owned recording draft; independent of runner state."""
 
 from copy import deepcopy
+import re
 import uuid
+
 from .models import new_workflow, now
 from .validation import validate_workflow, SENSITIVE
 
@@ -14,6 +16,16 @@ class Recorder:
         self.execute = False
         self.input_target = None
         self.editing_existing = False
+        self.mark_next_screen = False
+        self.pending_expected_text = None
+
+    def _clear_annotation_state(self):
+        self.mark_next_screen = False
+        self.pending_expected_text = None
+
+    def _require_not_annotating(self):
+        if self.pending_expected_text is not None:
+            raise ValueError("Finish or cancel the expected-text check first.")
 
     def require_owner(self, owner):
         if self.owner != owner or self.workflow is None:
@@ -39,6 +51,7 @@ class Recorder:
 
         self.input_target = None
         self.editing_existing = False
+        self._clear_annotation_state()
 
         return self.snapshot()
 
@@ -55,11 +68,13 @@ class Recorder:
         self.execute = False
         self.input_target = None
         self.editing_existing = True
+        self._clear_annotation_state()
 
         return self.snapshot()
 
     def prepare(self, owner, step, variable=None):
         self.require_owner(owner)
+        self._require_not_annotating()
 
         if not self.active:
             raise ValueError("Recording is stopped.")
@@ -95,6 +110,7 @@ class Recorder:
 
     def undo(self, owner):
         self.require_owner(owner)
+        self._require_not_annotating()
         self.input_target = None
 
         if self.workflow["steps"]:
@@ -109,6 +125,7 @@ class Recorder:
     def stop(self, owner):
         self.require_owner(owner)
         self.active = False
+        self._clear_annotation_state()
         return self.snapshot()
 
     def cancel(self, owner):
@@ -116,6 +133,12 @@ class Recorder:
         self.owner, self.workflow, self.active, self.execute = None, None, False, False
         self.editing_existing = False
         self.input_target = None
+        self._clear_annotation_state()
+
+    def fail_recording(self):
+        self.active = False
+        self.input_target = None
+        self._clear_annotation_state()
 
     def prepare_capture(self, owner, step, target=None):
         """Merge consecutive chunks from the same focused text field."""
@@ -145,11 +168,145 @@ class Recorder:
         validate_workflow(check)
         return candidate
 
+    def require_expected_text_action(self, step_id):
+        step = next((s for s in self.workflow["steps"] if s["id"] == step_id), None)
+        if not step:
+            raise ValueError("Recorded step not found.")
+        navigation = step["type"] in {"tap", "swipe"} or (
+            step["type"] == "key" and step.get("key", "").upper() in {"HOME", "BACK"}
+        )
+        label = step.get("label") or ""
+        sensitive = SENSITIVE.search(label) or re.search(
+            r"authoriz|authoris|confirm.*(?:pay|transfer)|final.*(?:pay|transfer)",
+            label,
+            re.I,
+        )
+        if not navigation or sensitive:
+            raise ValueError("Expected text requires a navigation action.")
+        return step
+
+    def commit_recording(self, owner, candidate, input_target=None):
+        """Commit a successful action and expose an armed navigation target."""
+        self.require_owner(owner)
+        self.workflow = candidate
+        self.input_target = input_target
+
+        if self.mark_next_screen and candidate["steps"]:
+            step = candidate["steps"][-1]
+
+            try:
+                self.require_expected_text_action(step["id"])
+            except ValueError:
+                pass
+            else:
+                self.mark_next_screen = False
+                self.pending_expected_text = step["id"]
+
+        return self.snapshot()
+
+    def toggle_mark_next_screen(self, owner):
+        self.require_owner(owner)
+
+        if not self.active:
+            raise ValueError("Recording is stopped.")
+
+        self._require_not_annotating()
+        self.mark_next_screen = not self.mark_next_screen
+        return self.snapshot()
+
+    def begin_current_screen_annotation(self, owner):
+        self.require_owner(owner)
+
+        if not self.active:
+            raise ValueError("Recording is stopped.")
+
+        if self.pending_expected_text == "current":
+            return self.workflow
+
+        self._require_not_annotating()
+
+        previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
+
+        if previous and (
+            previous["type"] == "manual_checkpoint"
+            or SENSITIVE.search(previous.get("label") or "")
+        ):
+            raise ValueError(
+                "Expected text is unavailable after a secure or manual checkpoint."
+            )
+
+        self.mark_next_screen = False
+        self.pending_expected_text = "current"
+        return self.workflow
+
+    def authorize_text_suggestions(self, owner, step_id=None, current=False):
+        self.require_owner(owner)
+
+        if current:
+            return self.begin_current_screen_annotation(owner)
+
+        self.require_expected_text_action(step_id)
+
+        if self.active and self.pending_expected_text not in {None, step_id}:
+            raise ValueError("Expected-text target changed. Cancel and try again.")
+
+        return self.workflow
+
+    def cancel_expected_text(self, owner):
+        self.require_owner(owner)
+        self._clear_annotation_state()
+        return self.snapshot()
+
+    def add_pending_expected_text(self, owner, text, timeout_seconds=10):
+        self.require_owner(owner)
+
+        if not self.active or self.pending_expected_text is None:
+            raise ValueError("No recording-time expected-text check is open.")
+
+        candidate = deepcopy(self.workflow)
+        target = self.pending_expected_text
+        step = {
+            "id": "step_" + uuid.uuid4().hex,
+            "type": "wait_for_text",
+            "text": text,
+            "timeout_seconds": timeout_seconds,
+        }
+
+        if target == "current":
+            candidate["steps"].append(step)
+        else:
+            index = next(
+                (
+                    index
+                    for index, item in enumerate(candidate["steps"])
+                    if item["id"] == target
+                ),
+                None,
+            )
+
+            if index is None:
+                raise ValueError("Recorded action is no longer available.")
+
+            self.require_expected_text_action(target)
+            candidate["steps"].insert(index + 1, step)
+
+        for item in candidate["steps"]:
+            if item["type"] == "wait_for_text" and isinstance(item.get("text"), str):
+                item["text"] = item["text"].strip()
+
+        check = deepcopy(candidate)
+        check["financial"] = False
+        validate_workflow(check, allow_empty=True)
+        self.workflow = candidate
+        self._clear_annotation_state()
+        return self.snapshot()
+
     def prepare_manual(self, owner, step):
         """Group acknowledged printable input only; keys remain explicit steps."""
         step = deepcopy(step)
         step["recorded_at"] = now()
         self.require_owner(owner)
+        self._require_not_annotating()
         previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
         if (
             self.active
@@ -188,6 +345,8 @@ class Recorder:
                 "input",
                 "key",
                 "wait",
+                "wait_until_stable",
+                "wait_for_text",
                 "manual_checkpoint",
             }:
                 raise ValueError("Choose a supported step type.")
@@ -210,7 +369,34 @@ class Recorder:
             if index is None:
                 raise ValueError("Recorded step not found.")
             old = candidate["steps"][index]
-            if operation == "delete":
+            if operation in {"expected_text", "remove_expected_text"}:
+                self.require_expected_text_action(old["id"])
+                following = candidate["steps"][index + 1 : index + 2]
+                wait = (
+                    following[0]
+                    if following and following[0]["type"] == "wait_for_text"
+                    else None
+                )
+                if operation == "remove_expected_text":
+                    if wait is not None:
+                        candidate["steps"].pop(index + 1)
+                else:
+                    fields = {
+                        "text": data.get("text"),
+                        "timeout_seconds": data.get("timeout_seconds", 10),
+                    }
+                    if wait is not None:
+                        wait.update(fields)
+                    else:
+                        candidate["steps"].insert(
+                            index + 1,
+                            {
+                                "id": "step_" + uuid.uuid4().hex,
+                                "type": "wait_for_text",
+                                **fields,
+                            },
+                        )
+            elif operation == "delete":
                 candidate["steps"].pop(index)
             elif operation == "fields":
                 allowed = {
@@ -218,6 +404,8 @@ class Recorder:
                     "swipe": {"start", "end", "duration_ms"},
                     "key": {"key"},
                     "wait": {"seconds"},
+                    "wait_until_stable": {"stable_ms", "timeout_seconds"},
+                    "wait_for_text": {"text", "timeout_seconds"},
                     "manual_checkpoint": {"message"},
                 }.get(old["type"], set())
                 changes = data.get("fields")
@@ -337,6 +525,9 @@ class Recorder:
         candidate["variables"] = [
             v for v in candidate["variables"] if v["name"] in used
         ]
+        for step in candidate["steps"]:
+            if step["type"] == "wait_for_text" and isinstance(step.get("text"), str):
+                step["text"] = step["text"].strip()
         check = deepcopy(candidate)
         check["financial"] = False
         validate_workflow(check, allow_empty=True)
@@ -360,4 +551,11 @@ class Recorder:
             "editing_existing": self.editing_existing,
             "active": self.active,
             "execute": self.execute,
+            "mark_next_screen": self.mark_next_screen,
+            "expected_text_pending": self.pending_expected_text is not None,
+            "pending_expected_text_step_id": (
+                self.pending_expected_text
+                if self.pending_expected_text not in {None, "current"}
+                else None
+            ),
         }

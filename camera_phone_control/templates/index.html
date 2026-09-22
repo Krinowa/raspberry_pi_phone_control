@@ -100,6 +100,10 @@
                   >● Recording</strong
                 >
                 <span id="record-count">Actions recorded: 0</span>
+                <button id="record-mark-next">Mark Next Screen: OFF</button>
+                <button id="record-expect-current">
+                  Expect Current Screen
+                </button>
                 <button id="record-undo">Undo Last</button>
                 <button id="record-stop" class="stop">■ Stop Recording</button>
                 <div id="live-timeline-slot"></div>
@@ -350,6 +354,53 @@
               />
             </label>
 
+            <div id="step-stable-options" hidden>
+              <label
+                >Stable for (ms)
+                <input
+                  id="step-stable-ms"
+                  type="number"
+                  min="100"
+                  max="10000"
+                  step="any"
+                  value="700"
+                />
+              </label>
+              <label
+                >Maximum wait (sec)
+                <input
+                  id="step-stable-timeout"
+                  type="number"
+                  min="1"
+                  max="300"
+                  step="any"
+                  value="10"
+                />
+              </label>
+            </div>
+
+            <div id="step-text-options" hidden>
+              <label
+                >Text
+                <input
+                  id="step-text-value"
+                  maxlength="500"
+                  autocomplete="off"
+                />
+              </label>
+              <label
+                >Maximum wait (sec)
+                <input
+                  id="step-text-timeout"
+                  type="number"
+                  min="0.5"
+                  max="300"
+                  step="any"
+                  value="10"
+                />
+              </label>
+            </div>
+
             <div id="step-input-options" hidden>
               <label>
                 Use this input as
@@ -414,11 +465,58 @@
             </div>
           </form>
           <details id="review-insert">
-            <summary>Insert a wait or manual checkpoint</summary>
+            <summary>Add Step</summary>
             <label
               >Insert after
               <select id="insert-position"></select
             ></label>
+            <h4>Wait for Screen to Settle</h4>
+            <label
+              >Stable for (ms)
+              <input
+                id="record-stable-ms"
+                type="number"
+                min="100"
+                max="10000"
+                step="any"
+                value="700"
+              />
+            </label>
+            <label
+              >Maximum wait (sec)
+              <input
+                id="record-stable-timeout"
+                type="number"
+                min="1"
+                max="300"
+                step="any"
+                value="10"
+              />
+            </label>
+            <button id="record-stable">Insert Wait for Screen to Settle</button>
+            <h4>Wait for Text</h4>
+            <label
+              >Text
+              <input
+                id="record-text-value"
+                maxlength="500"
+                autocomplete="off"
+                placeholder="Transfer"
+              />
+            </label>
+            <label
+              >Maximum wait (sec)
+              <input
+                id="record-text-timeout"
+                type="number"
+                min="0.5"
+                max="300"
+                step="any"
+                value="10"
+              />
+            </label>
+            <button id="record-text">Insert Wait for Text</button>
+            <h4>Fixed Wait</h4>
             <div class="flow-buttons">
               <input
                 id="record-wait-seconds"
@@ -428,7 +526,7 @@
                 step="0.1"
                 value="1"
                 aria-label="Wait seconds"
-              /><button id="record-wait">Insert Wait</button>
+              /><button id="record-wait">Insert Fixed Wait</button>
             </div>
             <label
               >Checkpoint message
@@ -444,6 +542,32 @@
             flow — end with manual authorization</label
           >
         </div>
+        <form id="expected-text-editor" hidden>
+          <h3 id="expected-text-title">Choose expected text</h3>
+          <p id="expected-text-status" role="status"></p>
+          <div id="expected-suggestions"></div>
+          <button id="expected-text-manual" type="button">
+            Enter manually
+          </button>
+          <label
+            >Expected text
+            <input id="expected-text-value" maxlength="500" required
+          /></label>
+          <label
+            >Maximum wait (sec)
+            <input
+              id="expected-text-timeout"
+              type="number"
+              min="0.5"
+              max="300"
+              step="0.5"
+              value="10"
+              required
+            />
+          </label>
+          <button type="submit">Add Check</button>
+          <button id="expected-text-cancel" type="button">Cancel</button>
+        </form>
         <div id="saved-flow-panel">
           <h3>Saved Flows</h3>
           <button id="flows-refresh">Refresh Flows</button>

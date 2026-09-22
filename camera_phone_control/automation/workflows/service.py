@@ -24,8 +24,12 @@ class RunLog(logging.Handler):
 
 
 class WorkflowService:
-    def __init__(self, controller, locks):
+    def __init__(
+        self, controller, locks, external_screen=None, screen_state_provider=None
+    ):
         self.controller, self.locks = controller, locks
+        self.external_screen = external_screen
+        self.screen_state_provider = screen_state_provider
         self.lock = threading.RLock()
         self.runs = {}
 
@@ -63,7 +67,9 @@ class WorkflowService:
                 try:
                     runner.run_task(
                         workflow["id"],
-                        lambda ctx: WorkflowRunner(ctx).run(workflow, variables),
+                        lambda ctx: WorkflowRunner(
+                            ctx, self.external_screen, self.screen_state_provider
+                        ).run(workflow, variables),
                         cancel_event=cancel,
                         resume_event=resume,
                     )
@@ -96,6 +102,9 @@ class WorkflowService:
                     "duration_ms",
                     "key",
                     "seconds",
+                    "stable_ms",
+                    "timeout_seconds",
+                    "text",
                     "label",
                 }
             }
