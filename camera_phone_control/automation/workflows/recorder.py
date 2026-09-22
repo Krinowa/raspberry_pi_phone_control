@@ -5,7 +5,14 @@ import re
 import uuid
 
 from .models import new_workflow, now
-from .validation import validate_workflow, SENSITIVE
+from ..coordinates import unit
+from .validation import (
+    PROTECTED_SCREEN_INPUT,
+    SENSITIVE,
+    normalize_capture_keyboard_labels,
+    validate_keyboard_map,
+    validate_workflow,
+)
 
 
 class Recorder:
@@ -18,14 +25,110 @@ class Recorder:
         self.editing_existing = False
         self.mark_next_screen = False
         self.pending_expected_text = None
+        self.keyboard_capture = None
 
     def _clear_annotation_state(self):
         self.mark_next_screen = False
         self.pending_expected_text = None
+        self.keyboard_capture = None
 
     def _require_not_annotating(self):
         if self.pending_expected_text is not None:
             raise ValueError("Finish or cancel the expected-text check first.")
+        if self.keyboard_capture is not None:
+            raise ValueError("Finish or cancel keyboard capture first.")
+
+    def start_keyboard_capture(self, owner, name, keys, kind="numeric"):
+        self.require_owner(owner)
+        self._require_not_annotating()
+        previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
+        if previous and (
+            previous["type"] == "manual_checkpoint"
+            or SENSITIVE.search(previous.get("label") or "")
+            or PROTECTED_SCREEN_INPUT.search(previous.get("label") or "")
+        ):
+            raise ValueError(
+                "Keyboard capture is unavailable after a secure or manual checkpoint."
+            )
+        keys = normalize_capture_keyboard_labels(kind, keys)
+        existing_names = {
+            keyboard["name"].strip().casefold()
+            for keyboard in self.workflow.get("keyboards", {}).values()
+        }
+        keyboard = {
+            "id": "keyboard_" + uuid.uuid4().hex,
+            "name": name,
+            "kind": kind,
+            "keys": {},
+        }
+        # Validate the metadata with one temporary point, then keep the draft empty.
+        validate_keyboard_map(
+            keyboard["id"], {**keyboard, "keys": {keys[0]: {"x": 0, "y": 0}}}
+        )
+        keyboard["name"] = keyboard["name"].strip()
+        if keyboard["name"].casefold() in existing_names:
+            raise ValueError("A captured keyboard already uses this name.")
+        self.mark_next_screen = False
+        self.keyboard_capture = {**keyboard, "requested_keys": list(keys)}
+        return self.snapshot()
+
+    def capture_keyboard_key(self, owner, label, x, y):
+        self.require_owner(owner)
+        if self.keyboard_capture is None:
+            raise ValueError("No keyboard capture is active.")
+        if label not in self.keyboard_capture["requested_keys"]:
+            raise ValueError("Choose a requested keyboard key.")
+        self.keyboard_capture["keys"][label] = {"x": unit(x), "y": unit(y)}
+        return self.snapshot()
+
+    def save_keyboard_capture(self, owner):
+        self.require_owner(owner)
+        if self.keyboard_capture is None:
+            raise ValueError("No keyboard capture is active.")
+        capture = deepcopy(self.keyboard_capture)
+        if set(capture["keys"]) != set(capture["requested_keys"]):
+            raise ValueError("Capture every selected key before saving the keyboard.")
+        capture.pop("requested_keys")
+        validate_keyboard_map(capture["id"], capture)
+        candidate = deepcopy(self.workflow)
+        candidate.setdefault("keyboards", {})[capture["id"]] = capture
+        check = deepcopy(candidate)
+        check["financial"] = False
+        validate_workflow(check, allow_empty=True)
+        self.workflow = candidate
+        self.keyboard_capture = None
+        return self.snapshot()
+
+    def cancel_keyboard_capture(self, owner):
+        self.require_owner(owner)
+        if self.keyboard_capture is None:
+            raise ValueError("No keyboard capture is active.")
+        self.keyboard_capture = None
+        return self.snapshot()
+
+    def delete_keyboard(self, owner, keyboard_id):
+        self.require_owner(owner)
+        self._require_not_annotating()
+        keyboards = self.workflow.get("keyboards", {})
+        if keyboard_id not in keyboards:
+            raise ValueError("Captured keyboard not found.")
+        references = [
+            step
+            for step in self.workflow["steps"]
+            if step.get("input_method") == "screen_keyboard"
+            and step.get("keyboard_id") == keyboard_id
+        ]
+        if references:
+            raise ValueError(
+                "This keyboard is used by an input step. Update that step before deleting it."
+            )
+        candidate = deepcopy(self.workflow)
+        del candidate["keyboards"][keyboard_id]
+        check = deepcopy(candidate)
+        check["financial"] = False
+        validate_workflow(check, allow_empty=True)
+        self.workflow = candidate
+        return self.snapshot()
 
     def require_owner(self, owner):
         if self.owner != owner or self.workflow is None:
@@ -420,7 +523,14 @@ class Recorder:
                 label = data.get("label")
                 if (
                     isinstance(label, str)
-                    and SENSITIVE.search(label)
+                    and (
+                        SENSITIVE.search(label)
+                        or (
+                            old["type"] == "input"
+                            and old.get("input_method") == "screen_keyboard"
+                            and PROTECTED_SCREEN_INPUT.search(label)
+                        )
+                    )
                     and old["type"] != "manual_checkpoint"
                 ):
                     candidate["steps"][index] = {
@@ -440,6 +550,15 @@ class Recorder:
                 candidate["steps"].insert(destination, candidate["steps"].pop(index))
             elif operation == "input":
                 source = data.get("source")
+                input_method = data.get("input_method", "hid")
+                method_fields = (
+                    {
+                        "input_method": "screen_keyboard",
+                        "keyboard_id": data.get("keyboard_id"),
+                    }
+                    if input_method == "screen_keyboard"
+                    else {}
+                )
                 if source == "manual":
                     candidate["steps"][index] = {
                         "id": old["id"],
@@ -465,13 +584,22 @@ class Recorder:
                         **{
                             k: v
                             for k, v in old.items()
-                            if k not in {"source", "variable", "message", "value"}
+                            if k
+                            not in {
+                                "source",
+                                "variable",
+                                "message",
+                                "value",
+                                "input_method",
+                                "keyboard_id",
+                            }
                         },
                         "id": old["id"],
                         "type": "input",
                         "source": "fixed",
                         "value": new_value,
                         "label": old.get("label", ""),
+                        **method_fields,
                     }
                 elif source == "variable":
                     variable = deepcopy(data.get("variable"))
@@ -514,6 +642,7 @@ class Recorder:
                             "source": "variable",
                             "variable": variable.get("name"),
                             "label": old.get("label", ""),
+                            **method_fields,
                         }
                 else:
                     raise ValueError("Choose fixed, variable or manual input.")
@@ -558,4 +687,5 @@ class Recorder:
                 if self.pending_expected_text not in {None, "current"}
                 else None
             ),
+            "keyboard_capture": deepcopy(self.keyboard_capture),
         }

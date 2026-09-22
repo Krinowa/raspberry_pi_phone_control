@@ -26,6 +26,7 @@ def new_workflow(name):
         "name": name,
         "version": 1,
         "variables": [],
+        "keyboards": {},
         "steps": [],
         "financial": False,
     }

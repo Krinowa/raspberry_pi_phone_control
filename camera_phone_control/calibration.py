@@ -1,8 +1,22 @@
-"""Four camera corners -> normalized Android display, using a homography."""
+"""Four camera corners -> normalized Android display, with local persistence."""
+
+import json
+import logging
+import os
+import tempfile
+import threading
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 
 from automation.coordinates import normalized_to_device, unit
+
+LOG = logging.getLogger("calibration")
+DEFAULT_CALIBRATION_PATH = (
+    Path(__file__).resolve().parent / "automation" / "camera_data" / "calibration.json"
+)
 
 
 def unit_point(value):
@@ -100,3 +114,116 @@ class Calibration:
     def pixel(self, point, width, height):
         u, v = self.map(point)
         return normalized_to_device(u, v, width, height), (u, v)
+
+
+class CalibrationStorage:
+    """Persist one camera calibration using atomic local JSON replacement."""
+
+    def __init__(self, path=None):
+        self.path = Path(path or DEFAULT_CALIBRATION_PATH)
+        self.lock = threading.RLock()
+
+    @staticmethod
+    def _camera_details(camera, camera_info):
+        return {
+            "source": camera.source,
+            "rotation": camera.rotate,
+            "width": camera_info["width"],
+            "height": camera_info["height"],
+        }
+
+    def load(self, camera, camera_info, device):
+        """Return a compatible Calibration, or None for missing/unsafe data."""
+        with self.lock:
+            if not self.path.exists():
+                return None
+            if self.path.is_symlink():
+                LOG.warning("Saved calibration file is invalid; starting uncalibrated.")
+                return None
+            try:
+                if self.path.stat().st_size > 64 * 1024:
+                    raise ValueError("Calibration file is unexpectedly large.")
+                with self.path.open(encoding="utf-8") as stream:
+                    data = json.load(stream)
+                if not isinstance(data, dict) or data.get("version") != 1:
+                    raise ValueError("Unsupported calibration format.")
+                saved_camera = data.get("camera")
+                saved_device = data.get("device")
+                if not isinstance(saved_camera, dict) or not isinstance(
+                    saved_device, dict
+                ):
+                    raise ValueError("Calibration context is missing.")
+                if any(
+                    type(saved_camera.get(field)) is not int
+                    for field in ("rotation", "width", "height")
+                ):
+                    raise ValueError("Camera geometry is invalid.")
+
+                current_camera = self._camera_details(camera, camera_info)
+                if saved_camera.get("source") != current_camera["source"]:
+                    LOG.info("Saved calibration ignored because camera source changed.")
+                    return None
+                if saved_camera.get("rotation") != current_camera["rotation"]:
+                    LOG.info(
+                        "Saved calibration ignored because camera rotation changed."
+                    )
+                    return None
+                if (
+                    saved_camera.get("width"),
+                    saved_camera.get("height"),
+                ) != (current_camera["width"], current_camera["height"]):
+                    LOG.info(
+                        "Saved calibration ignored because camera resolution changed."
+                    )
+                    return None
+                if saved_device != asdict(device):
+                    LOG.info(
+                        "Saved calibration ignored because phone geometry changed."
+                    )
+                    return None
+
+                calibration = Calibration(data.get("corners"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                LOG.warning("Saved calibration file is invalid; starting uncalibrated.")
+                return None
+
+            LOG.info("Loaded saved camera calibration.")
+            return calibration
+
+    def save(self, calibration, camera, camera_info, device):
+        data = {
+            "version": 1,
+            "camera": self._camera_details(camera, camera_info),
+            "device": asdict(device),
+            "corners": calibration.corners.tolist(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.is_symlink():
+                raise OSError("Calibration path cannot be a symlink.")
+            fd, temporary = tempfile.mkstemp(
+                dir=self.path.parent,
+                prefix=".calibration-",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(data, stream, indent=2, allow_nan=False)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        LOG.info("Saved camera calibration.")
+
+    def clear(self):
+        with self.lock:
+            try:
+                if self.path.is_symlink():
+                    raise OSError("Calibration path cannot be a symlink.")
+                self.path.unlink()
+            except FileNotFoundError:
+                pass

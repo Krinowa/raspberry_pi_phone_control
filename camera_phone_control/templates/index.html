@@ -100,14 +100,152 @@
                   >● Recording</strong
                 >
                 <span id="record-count">Actions recorded: 0</span>
-                <button id="record-mark-next">Mark Next Screen: OFF</button>
-                <button id="record-expect-current">
-                  Expect Current Screen
-                </button>
-                <button id="record-undo">Undo Last</button>
-                <button id="record-stop" class="stop">■ Stop Recording</button>
+                <div class="record-action-group record-primary-actions">
+                  <span>Primary actions</span>
+                  <button id="record-input-variable">Input Variable</button>
+                  <button id="record-expect-current">
+                    Expect Current Screen
+                  </button>
+                </div>
+                <div class="record-action-group">
+                  <span>More</span>
+                  <button id="record-capture-keyboard">Capture Keyboard</button>
+                  <button id="record-mark-next">Mark Next Screen: OFF</button>
+                </div>
+                <div class="record-action-group">
+                  <span>Recording controls</span>
+                  <button id="record-undo">Undo Last</button>
+                  <button id="record-stop" class="stop">
+                    ■ Stop Recording
+                  </button>
+                </div>
+                <div id="keyboard-capture" hidden>
+                  <h3>Capture Keyboard</h3>
+                  <label>
+                    Name
+                    <input
+                      id="keyboard-capture-name"
+                      maxlength="160"
+                      value="Numeric keypad"
+                    />
+                  </label>
+                  <label>
+                    Keyboard type
+                    <select id="keyboard-capture-kind">
+                      <option value="numeric">Numeric</option>
+                      <option value="alphabetic">Alphabetic</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                  </label>
+                  <div id="keyboard-numeric-options">
+                    <p>Digits 0-9 are included.</p>
+                    <label class="check"
+                      ><input id="keyboard-include-decimal" type="checkbox" />
+                      Include decimal</label
+                    >
+                    <label class="check"
+                      ><input id="keyboard-numeric-backspace" type="checkbox" />
+                      Include backspace</label
+                    >
+                  </div>
+                  <div id="keyboard-alphabetic-options" hidden>
+                    <p>Lowercase a-z are included.</p>
+                    <label class="check"
+                      ><input id="keyboard-include-space" type="checkbox" />
+                      Include space</label
+                    >
+                    <label class="check"
+                      ><input
+                        id="keyboard-alphabetic-backspace"
+                        type="checkbox"
+                      />
+                      Include backspace</label
+                    >
+                  </div>
+                  <label id="keyboard-custom-options" hidden>
+                    Keys to capture, separated by commas
+                    <input
+                      id="keyboard-custom-keys"
+                      maxlength="3299"
+                      placeholder="A,B,C,1,2,3,-"
+                    />
+                  </label>
+                  <p id="keyboard-capture-instruction" role="status">
+                    Choose keys, then start capture.
+                  </p>
+                  <p class="small">
+                    Use only for keyboards whose key positions stay the same
+                    between runs. Do not use this for PIN, OTP, password,
+                    randomized, or authorization keypads.
+                  </p>
+                  <div class="flow-buttons">
+                    <button id="keyboard-capture-start" type="button">
+                      Start Capture
+                    </button>
+                    <button id="keyboard-capture-save" type="button" hidden>
+                      Save Keyboard
+                    </button>
+                    <button id="keyboard-capture-cancel" type="button">
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+                <form id="record-variable-input" hidden>
+                  <h3>Input Variable</h3>
+                  <label>
+                    Variable
+                    <input
+                      id="record-variable-name"
+                      placeholder="account_no"
+                      maxlength="80"
+                    />
+                  </label>
+                  <label>
+                    Input method
+                    <select id="record-variable-method">
+                      <option value="screen_keyboard">
+                        Captured on-screen keyboard
+                      </option>
+                      <option value="hid">Bluetooth HID</option>
+                    </select>
+                  </label>
+                  <label id="record-variable-keyboard-field">
+                    Keyboard
+                    <select id="record-variable-keyboard"></select>
+                  </label>
+                  <label>
+                    Sample value for recording
+                    <input
+                      id="record-variable-sample"
+                      autocomplete="off"
+                      maxlength="4096"
+                    />
+                  </label>
+                  <p class="small">
+                    The sample can be typed during recording, but it is never
+                    saved in the workflow.
+                  </p>
+                  <div class="flow-buttons">
+                    <button id="record-variable-add" type="button">
+                      Add Step Only
+                    </button>
+                    <button id="record-variable-type" type="button">
+                      Add &amp; Type Sample
+                    </button>
+                    <button id="record-variable-cancel" type="button">
+                      Cancel
+                    </button>
+                  </div>
+                </form>
                 <div id="live-timeline-slot"></div>
               </div>
+            </div>
+            <div id="captured-keyboards" hidden>
+              <h3>Captured Keyboards</h3>
+              <p class="small">
+                Input steps select one of these maps explicitly.
+              </p>
+              <ul id="captured-keyboard-list"></ul>
             </div>
           </section>
           <section class="card">
@@ -181,6 +319,11 @@
       <p id="notice" role="status" aria-live="polite">
         Checking the camera and phone…
       </p>
+      <div id="connection-banner" class="connection-banner" hidden>
+        <strong id="connection-state">Reconnecting...</strong>
+        <span>Physical controls are paused while status checks continue.</span>
+        <button id="reload-dashboard" type="button">Reload Dashboard</button>
+      </div>
       <section id="automations" class="card">
         <div class="section-heading">
           <h2>Automations</h2>
@@ -202,6 +345,9 @@
           <label>Workflow name <input id="flow-name" maxlength="160" /></label>
           <button id="flow-rename">Rename</button>
           <div class="flow-buttons">
+            <button id="review-capture-keyboard" type="button">
+              Capture Keyboard
+            </button>
             <button id="record-save" class="primary">Save Workflow</button
             ><button id="record-cancel">Discard Recording</button>
           </div>
@@ -456,6 +602,21 @@
                 The recorded value will be removed. Playback will pause for you
                 to complete this step on the phone.
               </p>
+              <div id="input-method-fields">
+                <label>
+                  Input method
+                  <select id="input-method">
+                    <option value="hid">Bluetooth HID</option>
+                    <option value="screen_keyboard">
+                      Captured on-screen keyboard
+                    </option>
+                  </select>
+                </label>
+                <label id="input-keyboard-field" hidden>
+                  Keyboard
+                  <select id="input-keyboard"></select>
+                </label>
+              </div>
             </div>
 
             <div class="flow-buttons">
@@ -470,30 +631,6 @@
               >Insert after
               <select id="insert-position"></select
             ></label>
-            <h4>Wait for Screen to Settle</h4>
-            <label
-              >Stable for (ms)
-              <input
-                id="record-stable-ms"
-                type="number"
-                min="100"
-                max="10000"
-                step="any"
-                value="700"
-              />
-            </label>
-            <label
-              >Maximum wait (sec)
-              <input
-                id="record-stable-timeout"
-                type="number"
-                min="1"
-                max="300"
-                step="any"
-                value="10"
-              />
-            </label>
-            <button id="record-stable">Insert Wait for Screen to Settle</button>
             <h4>Wait for Text</h4>
             <label
               >Text

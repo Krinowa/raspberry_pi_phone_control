@@ -15,6 +15,8 @@
     timelineSignature = "",
     timelineWasLive = false,
     stopping = false;
+  let externalPhysicalBusy = false,
+    reconnectRefreshInFlight = false;
   let textBuffer = "",
     textTimer = null,
     captureQueue = Promise.resolve(),
@@ -89,10 +91,68 @@
   }
 
   let expectedActionId = null,
-    expectedMode = null;
+    expectedMode = null,
+    keyboardSetupOpen = false,
+    variableInputOpen = false,
+    returnToVariableInput = false;
 
   const annotationBusy = () =>
-    !!expectedMode || !!recording.expected_text_pending;
+    !!expectedMode ||
+    !!recording.expected_text_pending ||
+    keyboardSetupOpen ||
+    !!recording.keyboard_capture ||
+    variableInputOpen;
+
+  function keyboardOptions(select, captureOption = false) {
+    const keyboards = Object.values(recording.workflow?.keyboards || {});
+    const options = keyboards.map(
+      (keyboard) =>
+        new Option(
+          `${keyboard.name} · ${keyboard.kind.charAt(0).toUpperCase()}${keyboard.kind.slice(1)}`,
+          keyboard.id,
+        ),
+    );
+    if (captureOption)
+      options.push(new Option("+ Capture New Keyboard", "__capture__"));
+    select.replaceChildren(...options);
+    return keyboards;
+  }
+
+  function currentKeyboardKey() {
+    const capture = recording.keyboard_capture;
+    return capture?.requested_keys?.find((key) => !capture.keys?.[key]) || null;
+  }
+
+  function displayKeyboardKey(key) {
+    if (key === " ") return "SPACE";
+    if (key.toLowerCase() === "backspace") return "BACKSPACE";
+    return key;
+  }
+
+  function keyboardCaptureKindFields() {
+    const kind = $("keyboard-capture-kind").value || "numeric";
+    $("keyboard-numeric-options").hidden = kind !== "numeric";
+    $("keyboard-alphabetic-options").hidden = kind !== "alphabetic";
+    $("keyboard-custom-options").hidden = kind !== "custom";
+  }
+
+  function keyboardCaptureKeys(kind) {
+    if (kind === "numeric") {
+      const keys = Array.from("0123456789");
+      if ($("keyboard-include-decimal").checked) keys.push(".");
+      if ($("keyboard-numeric-backspace").checked) keys.push("BACKSPACE");
+      return keys;
+    }
+    if (kind === "alphabetic") {
+      const keys = Array.from("abcdefghijklmnopqrstuvwxyz");
+      if ($("keyboard-include-space").checked) keys.push(" ");
+      if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
+      return keys;
+    }
+    return $("keyboard-custom-keys")
+      .value.split(",")
+      .map((label) => label.trim());
+  }
 
   function canExpectText(step) {
     return (
@@ -325,6 +385,61 @@
     );
   }
 
+  function renderCapturedKeyboards() {
+    const keyboards = Object.values(recording.workflow?.keyboards || {});
+    $("captured-keyboards").hidden = !recording.workflow || !keyboards.length;
+    const referenced = new Set(
+      (recording.workflow?.steps || [])
+        .filter((step) => step.input_method === "screen_keyboard")
+        .map((step) => step.keyboard_id),
+    );
+    $("captured-keyboard-list").replaceChildren(
+      ...keyboards.map((keyboard) => {
+        const row = document.createElement("li"),
+          info = document.createElement("div"),
+          name = document.createElement("strong"),
+          detail = document.createElement("span"),
+          usage = document.createElement("span"),
+          remove = button("Delete", async () => {
+            recording = await api("/api/recorder/keyboard-delete", {
+              keyboard_id: keyboard.id,
+            });
+            show("Captured keyboard deleted.");
+            renderRecording();
+          });
+        row.className = "keyboard-map-row";
+        info.className = "keyboard-map-info";
+        name.textContent = keyboard.name;
+        const kind =
+          keyboard.kind.charAt(0).toUpperCase() + keyboard.kind.slice(1);
+        detail.textContent = `${kind} · ${Object.keys(keyboard.keys).length} keys`;
+        const uses = (recording.workflow?.steps || []).filter(
+          (step) =>
+            step.input_method === "screen_keyboard" &&
+            step.keyboard_id === keyboard.id,
+        );
+        usage.textContent = uses.length
+          ? `Used by: ${uses
+              .map((step) =>
+                step.source === "variable" && step.variable
+                  ? `Input {{${step.variable}}}`
+                  : "input step",
+              )
+              .join(", ")}`
+          : "Unused";
+        remove.disabled =
+          referenced.has(keyboard.id) || annotationBusy() || working;
+        if (referenced.has(keyboard.id)) {
+          remove.textContent = "In Use";
+          remove.title = usage.textContent;
+        }
+        info.append(name, detail, usage);
+        row.append(info, remove);
+        return row;
+      }),
+    );
+  }
+
   function renderRecording() {
     const draft = recording.workflow,
       live = recording.active,
@@ -385,6 +500,34 @@
       : "Mark Next Screen: OFF";
     $("record-mark-next").disabled = stopping || annotationBusy();
     $("record-expect-current").disabled = stopping || annotationBusy();
+    $("record-capture-keyboard").disabled = stopping || annotationBusy();
+    $("review-capture-keyboard").disabled = annotationBusy();
+    $("record-input-variable").disabled = stopping || annotationBusy();
+    $("record-variable-input").hidden = !variableInputOpen;
+    const sharedPhysicalBusy =
+      externalPhysicalBusy || !!window.phoneConnection?.isPhysicalBusy?.();
+    $("record-variable-type").disabled =
+      working ||
+      sharedPhysicalBusy ||
+      !!window.phoneConnection?.isReconnecting?.();
+    $("record-variable-type").textContent = sharedPhysicalBusy
+      ? "Typing sample..."
+      : "Add & Type Sample";
+    $("keyboard-capture").hidden =
+      !keyboardSetupOpen && !recording.keyboard_capture;
+    const keyboardCaptureSlot = live ? $("record-live") : $("review-flow");
+    if ($("keyboard-capture").parentElement !== keyboardCaptureSlot)
+      keyboardCaptureSlot.append($("keyboard-capture"));
+    const captureKey = currentKeyboardKey();
+    if (recording.keyboard_capture) {
+      const done = Object.keys(recording.keyboard_capture.keys || {});
+      $("keyboard-capture-instruction").textContent = captureKey
+        ? `Currently capturing “${displayKeyboardKey(captureKey)}”. Click that key on the phone preview. Captured: ${done.map(displayKeyboardKey).join(", ") || "none"}.`
+        : "All selected keys are captured. Save the keyboard or cancel.";
+    }
+    $("keyboard-capture-start").hidden = !!recording.keyboard_capture;
+    $("keyboard-capture-save").hidden =
+      !recording.keyboard_capture || !!captureKey;
 
     $("record-undo").disabled =
       stopping ||
@@ -412,7 +555,9 @@
     $("mock-recording-preview").hidden =
       piManual() || backend !== "mock" || !live;
 
-    preview.hidden = (piManual() || backend !== "mock") && !running;
+    // Real backends use the dashboard's live camera; this canvas is only the
+    // mock phone surface used for simulated recording and playback.
+    preview.hidden = backend !== "mock";
     const reviewTitle = $("review-flow")?.querySelector("h3");
 
     if (reviewTitle) {
@@ -430,6 +575,7 @@
     }
 
     renderTimeline();
+    renderCapturedKeyboards();
   }
 
   async function review(data) {
@@ -443,6 +589,9 @@
     $("fixed-fields").hidden = source !== "fixed";
     $("variable-fields").hidden = source !== "variable";
     $("manual-input-help").hidden = source !== "manual";
+    $("input-method-fields").hidden = source === "manual";
+    $("input-keyboard-field").hidden =
+      source === "manual" || $("input-method").value !== "screen_keyboard";
   }
 
   function openEditor(step, source) {
@@ -516,6 +665,9 @@
     $("variable-required").checked = definition?.required ?? true;
     $("variable-default").value = definition?.default ?? "";
     $("variable-ask").checked = definition?.ask_when_running ?? true;
+    $("input-method").value = step.input_method || "hid";
+    const keyboards = keyboardOptions($("input-keyboard"));
+    $("input-keyboard").value = step.keyboard_id || keyboards[0]?.id || "";
 
     sourceFields();
 
@@ -526,6 +678,7 @@
   }
 
   $("input-source").addEventListener("change", sourceFields);
+  $("input-method").addEventListener("change", sourceFields);
 
   $("step-close").addEventListener("click", () => {
     editingId = null;
@@ -553,6 +706,17 @@
       step_id,
       source,
     };
+    if (source !== "manual" && $("input-method").value === "screen_keyboard") {
+      if (!$("input-keyboard").value) {
+        show(
+          "Capture a keyboard before selecting on-screen keyboard input.",
+          true,
+        );
+        return;
+      }
+      input.input_method = "screen_keyboard";
+      input.keyboard_id = $("input-keyboard").value;
+    }
 
     if (source === "fixed") {
       const value = $("input-value").value;
@@ -747,16 +911,6 @@
     return { text, timeout_seconds };
   }
 
-  $("record-stable").addEventListener("click", () =>
-    task(() =>
-      review({
-        operation: "insert",
-        index: Number($("insert-position").value),
-        step: { type: "wait_until_stable", ...stabilityFields("record") },
-      }),
-    ),
-  );
-
   $("record-text").addEventListener("click", () =>
     task(() =>
       review({
@@ -930,6 +1084,166 @@
     }),
   );
 
+  function variableMethodFields() {
+    $("record-variable-keyboard-field").hidden =
+      $("record-variable-method").value !== "screen_keyboard";
+  }
+
+  $("record-input-variable").addEventListener("click", () => {
+    variableInputOpen = true;
+    if (!["hid", "screen_keyboard"].includes($("record-variable-method").value))
+      $("record-variable-method").value = "screen_keyboard";
+    const current = $("record-variable-keyboard").value;
+    const keyboards = keyboardOptions($("record-variable-keyboard"), true);
+    $("record-variable-keyboard").value = keyboards.some(
+      (keyboard) => keyboard.id === current,
+    )
+      ? current
+      : keyboards[0]?.id || "__capture__";
+    variableMethodFields();
+    renderRecording();
+  });
+
+  $("record-variable-method").addEventListener("change", variableMethodFields);
+  $("record-variable-keyboard").addEventListener("change", () => {
+    if ($("record-variable-keyboard").value !== "__capture__") return;
+    returnToVariableInput = true;
+    variableInputOpen = false;
+    keyboardSetupOpen = true;
+    $("keyboard-capture-instruction").textContent =
+      "Choose keys, then start capture.";
+    keyboardCaptureKindFields();
+    renderRecording();
+  });
+
+  async function addVariableInput(typeSample) {
+    await pendingManual;
+    await flushText();
+    const name = $("record-variable-name").value.trim();
+    if (!name) throw new Error("Enter a variable name.");
+    const method = $("record-variable-method").value;
+    const keyboardId = $("record-variable-keyboard").value;
+    if (
+      method === "screen_keyboard" &&
+      (!keyboardId || keyboardId === "__capture__")
+    )
+      throw new Error("Capture or select a keyboard first.");
+    const request = () =>
+      api("/api/recorder/variable-input", {
+        variable: {
+          name,
+          label: name.replaceAll("_", " "),
+          type: "text",
+          required: true,
+          default: null,
+          ask_when_running: true,
+        },
+        input_method: method,
+        ...(method === "screen_keyboard" ? { keyboard_id: keyboardId } : {}),
+        sample: $("record-variable-sample").value,
+        type_sample: typeSample,
+        frame_id: frameId,
+      });
+    const runPhysical = window.phoneConnection?.runPhysical
+      ? (label, operation) =>
+          window.phoneConnection.runPhysical(label, operation)
+      : (_label, operation) => operation();
+    try {
+      recording = typeSample
+        ? await runPhysical("Typing sample...", request)
+        : await request();
+    } catch (error) {
+      if (typeSample && error.transient)
+        error.message = `${error.message} Sample result uncertain; it was not retried automatically.`;
+      throw error;
+    }
+    variableInputOpen = false;
+    $("record-variable-sample").value = "";
+    show(
+      typeSample
+        ? "Variable step added and sample typed once."
+        : "Variable step added without sending input.",
+    );
+  }
+
+  $("record-variable-add").addEventListener("click", () =>
+    task(() => addVariableInput(false)),
+  );
+  $("record-variable-type").addEventListener("click", () =>
+    task(() => addVariableInput(true)),
+  );
+  $("record-variable-cancel").addEventListener("click", () => {
+    variableInputOpen = false;
+    renderRecording();
+  });
+
+  function openKeyboardCapture() {
+    keyboardSetupOpen = true;
+    $("keyboard-capture-instruction").textContent =
+      "Choose keys, then start capture.";
+    keyboardCaptureKindFields();
+    renderRecording();
+    render();
+  }
+
+  $("record-capture-keyboard").addEventListener("click", openKeyboardCapture);
+  $("review-capture-keyboard").addEventListener("click", openKeyboardCapture);
+
+  $("keyboard-capture-kind").addEventListener(
+    "change",
+    keyboardCaptureKindFields,
+  );
+
+  $("keyboard-capture-start").addEventListener("click", () =>
+    task(async () => {
+      await pendingManual;
+      await flushText();
+      const kind = $("keyboard-capture-kind").value || "numeric";
+      const keys = keyboardCaptureKeys(kind);
+      recording = await api("/api/recorder/keyboard-capture/start", {
+        name: $("keyboard-capture-name").value.trim(),
+        kind,
+        keys,
+      });
+      keyboardSetupOpen = false;
+      show(
+        "Teaching clicks are captured only; they are not sent to the phone.",
+      );
+      render();
+    }),
+  );
+
+  $("keyboard-capture-save").addEventListener("click", () =>
+    task(async () => {
+      const capturedId = recording.keyboard_capture?.id;
+      recording = await api("/api/recorder/keyboard-capture/save", {});
+      keyboardSetupOpen = false;
+      if (returnToVariableInput) {
+        returnToVariableInput = false;
+        variableInputOpen = true;
+        keyboardOptions($("record-variable-keyboard"), true);
+        $("record-variable-keyboard").value = capturedId;
+      }
+      show("Keyboard saved. Use it only while its layout remains stable.");
+      render();
+    }),
+  );
+
+  $("keyboard-capture-cancel").addEventListener("click", () =>
+    task(async () => {
+      if (recording.keyboard_capture)
+        recording = await api("/api/recorder/keyboard-capture/cancel", {});
+      keyboardSetupOpen = false;
+      if (returnToVariableInput) {
+        returnToVariableInput = false;
+        variableInputOpen = true;
+        keyboardOptions($("record-variable-keyboard"), true);
+      }
+      show("Keyboard capture cancelled; the workflow was not changed.");
+      render();
+    }),
+  );
+
   $("record-start").addEventListener("click", () =>
     task(async () => {
       if (piManual() || backend !== "mock") {
@@ -946,6 +1260,9 @@
       }
 
       try {
+        keyboardSetupOpen = false;
+        variableInputOpen = false;
+        returnToVariableInput = false;
         recording = await api("/api/recorder/start", {
           name: "New Recording",
           execute: true,
@@ -973,6 +1290,9 @@
         await pendingManual;
         await flushText();
         recording = await api("/api/recorder/stop", {});
+        keyboardSetupOpen = false;
+        variableInputOpen = false;
+        returnToVariableInput = false;
         closeExpectedText();
         if (piManual() || backend !== "mock") await disable();
         show(
@@ -1003,6 +1323,9 @@
       const editingExisting = !!recording.editing_existing;
 
       recording = await api("/api/recorder/cancel", {});
+      keyboardSetupOpen = false;
+      variableInputOpen = false;
+      returnToVariableInput = false;
       closeExpectedText();
 
       show(editingExisting ? "Changes discarded." : "Recording discarded.");
@@ -1195,6 +1518,32 @@
 
   installGestures(canvas, true);
   installGestures(preview, false);
+
+  function installKeyboardCapture(element, camera) {
+    element.addEventListener("click", (event) => {
+      const key = currentKeyboardKey();
+      if (!recording.workflow || !key || stopping || calibrating) return;
+      if (camera && (!fresh() || !state?.calibrated))
+        return show(
+          "Calibrate a live camera view before capturing keys.",
+          true,
+        );
+      if (!camera && backend !== "mock") return;
+      const point = location(event, element);
+      if (point.some((value) => value < 0 || value > 1))
+        return show("Click inside the phone preview.", true);
+      event.preventDefault();
+      task(async () => {
+        recording = await api("/api/recorder/keyboard-capture/key", {
+          key,
+          ...(camera ? { camera_point: point, frame_id: frameId } : { point }),
+        });
+      });
+    });
+  }
+
+  installKeyboardCapture(canvas, true);
+  installKeyboardCapture(preview, false);
   let recorderOwner = clientId;
   try {
     recorderOwner =
@@ -1206,7 +1555,29 @@
 
   window.phoneRecorder = {
     capturesPreview: () => recording.active && !piManual() && !annotationBusy(),
-    blocksInput: () => recording.active && (stopping || annotationBusy()),
+    blocksInput: () => !!recording.workflow && (stopping || annotationBusy()),
+    physicalBusyChanged: (value) => {
+      externalPhysicalBusy = value;
+      renderRecording();
+    },
+    refreshAfterReconnect: async () => {
+      if (reconnectRefreshInFlight) return;
+      reconnectRefreshInFlight = true;
+      try {
+        if (recording.workflow)
+          recording = await api("/api/recorder", undefined, "GET");
+        if (running && !terminal.has(running.status))
+          running = await api(
+            `/api/workflow-runs/${running.run_id}`,
+            undefined,
+            "GET",
+          );
+        renderRecording();
+        if (running) renderRun();
+      } finally {
+        reconnectRefreshInFlight = false;
+      }
+    },
     trackManual: (operation) => {
       if (piManual() && recording.active)
         pendingManual = operation.catch(() => {});
@@ -1220,6 +1591,7 @@
     manualFailed: async (error) => {
       if (!piManual() || !recording.active) return;
       recording.active = false;
+      keyboardSetupOpen = false;
       closeExpectedText();
       show(
         error.message +

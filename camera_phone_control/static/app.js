@@ -18,31 +18,89 @@ let statusRefreshInFlight = false;
 let legacyStatusTimer = null;
 let controlVersion = 0;
 let keyboardArmed = false;
+let heartbeatInFlight = false;
+let piHealthInFlight = false;
+let physicalBusy = false;
+let physicalBusyLabel = "";
+let connectionState = "connected";
+let recoveryTimer = null;
+let recoveryInFlight = false;
+let recoveryAttempt = 0;
+let recoveryHadManualControl = false;
+const RECOVERY_DELAYS_MS = [500, 1000, 2000, 3000, 5000];
+// The browser waits longer than the Pi client's 2s connect + 5s read limits,
+// allowing the server to return its controlled uncertainty message first.
+const API_TIMEOUT_MS = 9000;
 
 function notice(text, error = false) {
   $("notice").textContent = text;
   $("notice").classList.toggle("error", error);
 }
 
-async function api(path, data, method = "POST") {
-  const response = await fetch(path, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Control-Token": token,
-      "X-Control-Client": clientId,
-      "X-Recorder-Client": window.phoneRecorder?.ownerId || clientId,
-    },
-    body: method === "GET" ? undefined : JSON.stringify(data ?? {}),
-    cache: "no-store",
-    signal: AbortSignal.timeout(12000),
-  });
+function transientFailure(error, status = 0) {
+  return (
+    [502, 503, 504].includes(status) ||
+    /timeout|timed out|network|fetch|connection|reset|temporarily unavailable|pi api.*(?:offline|unavailable)/i.test(
+      error?.message || "",
+    )
+  );
+}
 
-  const body = await response.json();
+function scheduleRecovery() {
+  if (recoveryTimer !== null || recoveryInFlight) return;
+  const delay =
+    RECOVERY_DELAYS_MS[
+      Math.min(recoveryAttempt, RECOVERY_DELAYS_MS.length - 1)
+    ];
+  recoveryAttempt++;
+  recoveryTimer = setTimeout(() => {
+    recoveryTimer = null;
+    return recoverConnection();
+  }, delay);
+}
 
-  if (!response.ok)
-    throw new Error(body.error || `Request failed (${response.status})`);
-  return body;
+function beginReconnect(error) {
+  recoveryHadManualControl ||= manual;
+  connectionState = "reconnecting";
+  notice("Connection interrupted. Retrying automatically...", true);
+  render();
+  scheduleRecovery();
+}
+
+async function api(path, data, method = "POST", options = {}) {
+  try {
+    const response = await fetch(path, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Control-Token": token,
+        "X-Control-Client": clientId,
+        "X-Recorder-Client": window.phoneRecorder?.ownerId || clientId,
+      },
+      body: method === "GET" ? undefined : JSON.stringify(data ?? {}),
+      cache: "no-store",
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    });
+    let body = {};
+    try {
+      body = await response.json();
+    } catch {
+      body = {};
+    }
+    if (!response.ok) {
+      const error = new Error(
+        body.error || `Request failed (${response.status})`,
+      );
+      error.status = response.status;
+      error.transient = transientFailure(error, response.status);
+      throw error;
+    }
+    return body;
+  } catch (error) {
+    error.transient ??= transientFailure(error);
+    if (options.monitor !== false && error.transient) beginReconnect(error);
+    throw error;
+  }
 }
 
 function fresh() {
@@ -51,6 +109,7 @@ function fresh() {
 function active() {
   return (
     manual &&
+    connectionState === "connected" &&
     !window.phoneRecorder?.blocksInput?.() &&
     state?.owned &&
     fresh() &&
@@ -107,7 +166,11 @@ function render() {
     (piMode ? "Bluetooth phone unavailable" : "No authorized USB phone");
   $("pi-connection").hidden = !piMode;
   $("pi-api-state").textContent =
-    state?.pi?.api === "online" ? "Online" : "Pi Offline";
+    connectionState === "reconnecting"
+      ? "Pi Reconnecting..."
+      : state?.pi?.api === "online"
+        ? "Online"
+        : "Pi Offline";
   $("pi-phone-state").textContent =
     state?.pi?.phone === "connected"
       ? "Connected"
@@ -143,6 +206,9 @@ function render() {
             : "Disabled";
 
   $("mode").classList.toggle("active", active());
+  $("connection-banner").hidden = connectionState === "connected";
+  $("connection-state").textContent =
+    connectionState === "reconnecting" ? "Reconnecting..." : "Offline";
   renderKeyboard();
 
   const automation = state?.control_status === "automation";
@@ -178,7 +244,7 @@ function render() {
     const supported =
       !state?.supported_actions ||
       state.supported_actions.includes(button.dataset.action);
-    button.disabled = !active() || busy || !supported;
+    button.disabled = !active() || busy || physicalBusy || !supported;
     button.title = supported
       ? ""
       : "This action is not provided by the Pi API.";
@@ -273,6 +339,102 @@ async function report(task) {
   }
 }
 
+async function runPhysical(label, operation) {
+  if (physicalBusy) {
+    const error = new Error(
+      "Controller busy. Wait for the current action to finish.",
+    );
+    error.clientBusy = true;
+    throw error;
+  }
+  physicalBusy = true;
+  physicalBusyLabel = label;
+  window.phoneRecorder?.physicalBusyChanged?.(true, label);
+  render();
+  try {
+    return await operation();
+  } finally {
+    physicalBusy = false;
+    physicalBusyLabel = "";
+    window.phoneRecorder?.physicalBusyChanged?.(false, "");
+    render();
+  }
+}
+
+async function recoverConnection() {
+  if (
+    recoveryInFlight ||
+    statusRefreshInFlight ||
+    piHealthInFlight ||
+    heartbeatInFlight ||
+    connectionState !== "reconnecting"
+  ) {
+    if (connectionState === "reconnecting") scheduleRecovery();
+    return;
+  }
+  recoveryInFlight = true;
+  try {
+    if (recoveryHadManualControl && fresh() && !document.hidden) {
+      heartbeatInFlight = true;
+      try {
+        await api("/api/heartbeat", { frame_id: frameId }, "POST", {
+          monitor: false,
+        });
+      } finally {
+        heartbeatInFlight = false;
+      }
+    }
+    piHealthInFlight = true;
+    let pi;
+    try {
+      pi = await api("/api/pi/status", undefined, "GET", {
+        monitor: false,
+      });
+    } finally {
+      piHealthInFlight = false;
+    }
+    if (state?.manual_backend === "raspberry_pi" && pi.api !== "online")
+      throw Object.assign(
+        new Error(pi.message || "Pi temporarily unavailable."),
+        {
+          transient: true,
+        },
+      );
+    statusRefreshInFlight = true;
+    let next;
+    try {
+      next = await api("/api/status", undefined, "GET", { monitor: false });
+    } finally {
+      statusRefreshInFlight = false;
+    }
+    state = next;
+    manual = !!(next.owned || next.pending_owned);
+    await window.phoneRecorder?.refreshAfterReconnect?.();
+    connectionState = "connected";
+    recoveryAttempt = 0;
+    recoveryHadManualControl = false;
+    notice("Connection restored.");
+    setTimeout(() => {
+      if ($("notice").textContent === "Connection restored.") notice("");
+    }, 2500);
+    render();
+    draw();
+  } catch (error) {
+    connectionState = "reconnecting";
+    notice("Pi temporarily unavailable. Retrying automatically...", true);
+    scheduleRecovery();
+  } finally {
+    recoveryInFlight = false;
+    if (connectionState === "reconnecting") scheduleRecovery();
+  }
+}
+
+window.phoneConnection = {
+  isReconnecting: () => connectionState !== "connected",
+  isPhysicalBusy: () => physicalBusy,
+  runPhysical,
+};
+
 async function refreshStatus() {
   if (statusRefreshInFlight) return;
   statusRefreshInFlight = true;
@@ -296,6 +458,10 @@ async function refreshStatus() {
 
     const previousMessage = state?.message;
     state = next;
+    if (state.manual_backend === "raspberry_pi" && state.pi?.api === "offline")
+      beginReconnect(
+        new Error(state.pi.message || "Pi temporarily unavailable."),
+      );
     if (!state.owned && !state.pending_owned) manual = false;
     if (!state.camera.ready || !state.device) notice(state.message, true);
     else if (state.message !== previousMessage) notice(state.message);
@@ -303,8 +469,10 @@ async function refreshStatus() {
     draw();
   } catch (error) {
     if (version !== controlVersion) return;
-    manual = false;
-    notice(`Backend unavailable: ${error.message}`, true);
+    if (!error.transient) {
+      manual = false;
+      notice(`Backend unavailable: ${error.message}`, true);
+    }
     render();
   } finally {
     statusRefreshInFlight = false;
@@ -456,15 +624,18 @@ $("save").addEventListener("click", () =>
 );
 
 function manualApi(path, data) {
-  const operation = api(path, data).then(
+  const operation = runPhysical("Sending...", () => api(path, data)).then(
     (result) => {
       window.phoneRecorder?.acceptManual?.(result.recording);
       return result;
     },
     async (error) => {
+      if (error.clientBusy) throw error;
       manual = false;
       render();
       await window.phoneRecorder?.manualFailed?.(error);
+      if (error.transient)
+        error.message = `${error.message} Action result uncertain; it was not retried automatically.`;
       throw error;
     },
   );
@@ -476,7 +647,7 @@ async function sendAction(action, point) {
   if (window.phoneRecorder?.capturesPreview()) {
     return window.phoneRecorder.action(action, point);
   }
-  if (!active() || busy) return;
+  if (!active() || busy || physicalBusy) return;
 
   await report(async () => {
     const data = { action, frame_id: frameId };
@@ -526,6 +697,7 @@ document.addEventListener("keydown", (event) => {
   if (
     !keyboardActive() ||
     busy ||
+    physicalBusy ||
     event.defaultPrevented ||
     event.repeat ||
     event.ctrlKey ||
@@ -591,7 +763,7 @@ document.addEventListener("pointerdown", (event) => {
 
 canvas.addEventListener("click", (event) => {
   if (!calibrating && window.phoneRecorder?.capturesPreview()) return;
-  if (!fresh() || busy) return;
+  if (!fresh() || busy || physicalBusy) return;
 
   canvas.focus({ preventScroll: true });
   keyboardArmed = keyboardEligible();
@@ -617,22 +789,27 @@ document.querySelectorAll("[data-action]").forEach((button) => {
 });
 
 setInterval(async () => {
-  if (!manual) return;
+  if (!manual || heartbeatInFlight || connectionState !== "connected") return;
   if (!fresh() || document.hidden) {
     disable().catch(() => {});
     return;
   }
 
   const version = controlVersion;
+  heartbeatInFlight = true;
   try {
     const result = await api("/api/heartbeat", { frame_id: frameId });
     if (version !== controlVersion || !manual) return;
     applyControlResult(result);
   } catch (error) {
     if (version !== controlVersion) return;
-    manual = false;
-    notice(error.message, true);
+    if (!error.transient) {
+      manual = false;
+      notice(error.message, true);
+    }
     render();
+  } finally {
+    heartbeatInFlight = false;
   }
 }, 1500);
 
@@ -658,6 +835,8 @@ window.addEventListener("pagehide", () => {
     }).catch(() => {});
 });
 
+$("reload-dashboard").addEventListener("click", () => location.reload());
+
 function startLegacyStatusPolling() {
   // Preserve the existing Appium dashboard/automation status updates.
   if (state?.manual_backend !== "appium" || legacyStatusTimer !== null) return;
@@ -667,9 +846,11 @@ function startLegacyStatusPolling() {
 async function loadStatus() {
   try {
     // This endpoint checks the Pi once (and is a no-op in Appium mode).
-    await api("/api/pi/status", undefined, "GET");
+    const pi = await api("/api/pi/status", undefined, "GET");
+    if (pi.api === "offline")
+      beginReconnect(new Error(pi.message || "Pi temporarily unavailable."));
   } catch (error) {
-    notice(`Backend unavailable: ${error.message}`, true);
+    if (!error.transient) notice(`Backend unavailable: ${error.message}`, true);
   }
   await refreshStatus();
   startLegacyStatusPolling();

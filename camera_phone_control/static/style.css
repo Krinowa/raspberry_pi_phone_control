@@ -253,6 +253,21 @@ button.primary:hover:not(:disabled) {
   color: #913b37;
   background: #f6e8e4;
 }
+.connection-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid #e7c98e;
+  border-radius: 8px;
+  background: #fff8e8;
+  color: #6d5424;
+  font-size: 12px;
+}
+.connection-banner span {
+  flex: 1;
+}
 footer {
   font-size: 11px;
   color: #728079;
@@ -492,6 +507,57 @@ summary {
 #record-count,
 #live-timeline-slot {
   flex-basis: 100%;
+}
+.record-action-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  flex: 1 1 210px;
+  align-self: stretch;
+  padding: 10px;
+  border: 1px solid #e2e9e5;
+  border-radius: 8px;
+  background: #f8faf9;
+}
+.record-action-group > span {
+  grid-column: 1 / -1;
+  color: #687970;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+#captured-keyboard-list {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  list-style: none;
+}
+.keyboard-map-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #dfe7e2;
+  border-radius: 8px;
+  background: #fafcfb;
+}
+.keyboard-map-info {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.keyboard-map-info strong,
+.keyboard-map-info span {
+  overflow-wrap: anywhere;
+}
+.keyboard-map-info span {
+  color: #687970;
+  font-size: 11px;
+}
+.keyboard-map-row > button {
+  min-width: 70px;
 }
 #record-count,
 #record-empty,

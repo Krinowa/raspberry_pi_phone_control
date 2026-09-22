@@ -14,7 +14,7 @@ from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
 from android_control import AndroidControl, DeviceError, validate_key
-from calibration import Calibration
+from calibration import Calibration, CalibrationStorage
 from camera import Camera
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
@@ -28,7 +28,15 @@ LEASE_SECONDS = 6
 
 
 class ControlState:
-    def __init__(self, android, camera, device_locks=None, *, pi_bridge=None):
+    def __init__(
+        self,
+        android,
+        camera,
+        device_locks=None,
+        *,
+        pi_bridge=None,
+        calibration_storage=None,
+    ):
         self.android, self.camera = android, camera
         self.pi_bridge = pi_bridge
         self.pi_connection = {
@@ -43,6 +51,8 @@ class ControlState:
         self.device = None
         self.calibration = None
         self.signature = None
+        self.calibration_storage = calibration_storage
+        self.calibration_restore_key = None
         self.owner = None
         self.manual_claim = None
         self.lease_timer = None
@@ -132,6 +142,7 @@ class ControlState:
         signature = (self.device, camera["width"], camera["height"])
         if errors:
             self.calibration = None
+            self.calibration_restore_key = None
             self.disable(" ".join(errors))
             if (
                 self.pi_bridge is not None
@@ -141,10 +152,34 @@ class ControlState:
                 self.pi_status_notice = self.message
         elif self.calibration and signature != self.signature:
             self.calibration = None
+            self.calibration_restore_key = None
             self.disable(
                 "Phone geometry or camera resolution changed. Recalibrate before enabling input."
             )
-        elif self.owner and time.monotonic() >= self.expires:
+        if (
+            not errors
+            and self.calibration is None
+            and self.calibration_storage is not None
+        ):
+            restore_key = (
+                signature,
+                self.camera.source,
+                self.camera.rotate,
+            )
+            if restore_key != self.calibration_restore_key:
+                self.calibration_restore_key = restore_key
+                restored = self.calibration_storage.load(
+                    self.camera,
+                    camera,
+                    self.device,
+                )
+                if restored is not None:
+                    self.calibration = restored
+                    self.signature = signature
+                    self.message = (
+                        "Saved calibration loaded. Enable Manual Control when ready."
+                    )
+        if not errors and self.owner and time.monotonic() >= self.expires:
             self.disable("Control heartbeat expired. Enable Manual Control again.")
         if not errors and self.pi_status_notice is not None:
             if self.message == self.pi_status_notice:
@@ -236,7 +271,8 @@ def create_app(
     workflow_storage=None,
     *,
     manual_backend=None,
-    pi_client=None
+    pi_client=None,
+    calibration_storage=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -252,8 +288,16 @@ def create_app(
         MAX_CONTENT_LENGTH=1024 * 1024, TRUSTED_HOSTS=["localhost", "127.0.0.1"]
     )
     token = secrets.token_urlsafe(32)
+    if calibration_storage is None and all(
+        hasattr(camera, field) for field in ("source", "rotate")
+    ):
+        calibration_storage = CalibrationStorage()
     state = ControlState(
-        android or AndroidControl(), camera, device_locks, pi_bridge=pi_bridge
+        android or AndroidControl(),
+        camera,
+        device_locks,
+        pi_bridge=pi_bridge,
+        calibration_storage=calibration_storage,
     )
     app.extensions["control_state"] = state
     app.config["CONTROL_TOKEN"] = token
@@ -470,19 +514,48 @@ def create_app(
         with state.lock:
             state.disable("Calibration changed. Input disabled.")
             state.calibration = None
+            state.calibration_restore_key = None
 
             if request.method == "DELETE":
+                if state.calibration_storage is not None:
+                    try:
+                        state.calibration_storage.clear()
+                    except OSError as exc:
+                        LOG.error("Could not clear saved camera calibration: %s", exc)
+                        raise ValueError(
+                            "Calibration could not be cleared from local storage."
+                        ) from exc
                 return jsonify(calibrated=False)
 
             camera_info = state.require_ready()
             state.require_frame(data.get("frame_id"))
             calibration = Calibration(data.get("corners"))
-            state.calibration = calibration
-            state.signature = (
+            signature = (
                 state.device,
                 camera_info["width"],
                 camera_info["height"],
             )
+            if state.calibration_storage is not None:
+                try:
+                    state.calibration_storage.save(
+                        calibration,
+                        state.camera,
+                        camera_info,
+                        state.device,
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    LOG.error("Could not save camera calibration: %s", exc)
+                    raise ValueError(
+                        "Calibration could not be saved to local storage."
+                    ) from exc
+            state.calibration = calibration
+            state.signature = signature
+            if state.calibration_storage is not None:
+                state.calibration_restore_key = (
+                    signature,
+                    state.camera.source,
+                    state.camera.rotate,
+                )
             state.message = "Calibration saved. You can enable Manual Control."
             LOG.info("Four-corner calibration saved for %s", state.device.serial)
             return jsonify(calibrated=True, corners=calibration.corners.tolist())

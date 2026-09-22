@@ -3,6 +3,7 @@
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -10,13 +11,14 @@ from flask import jsonify, request
 
 from ..backends import backend_names, select_device
 from ..context import AutomationContext
+from ..input.base import UnsupportedOperation
 from ..screen.accessibility import AccessibilityScreenStateProvider
 from ..screen.camera import CalibratedCamera
 from ..screen.camera_ocr import CameraOCRScreenStateProvider
 from ..screen.text_learning import text_suggestions
 from .capture import inspect_target, tap_preview
 from .recorder import Recorder
-from .runner import WorkflowRunner
+from .runner import WorkflowRunner, screen_keyboard_points, type_with_screen_keyboard
 from .service import WorkflowService
 from .storage import WorkflowStorage
 
@@ -346,6 +348,17 @@ def register_workflows(app, state, payload, client_id, storage=None):
             ):
                 yield state.device
 
+    @contextmanager
+    def recording_sample_control(client, frame_id):
+        # A Pi manual backend remains independent of the workflow backend.
+        if state.pi_bridge is not None or backend_names()[0] != "mock":
+            with state.input_control(client, frame_id):
+                yield state.device
+        else:
+            device = select_device(state.android)
+            with state.device_locks.hold(device.serial, "manual"):
+                yield device
+
     @app.post("/api/recorder/text-suggestions")
     def recording_text_suggestions():
         data = payload()
@@ -433,6 +446,191 @@ def register_workflows(app, state, payload, client_id, storage=None):
 
         with lock:
             return jsonify(recorder.cancel_expected_text(recorder_id()))
+
+    @app.post("/api/recorder/keyboard-capture/start")
+    def start_keyboard_capture():
+        data = payload()
+        if set(data) - {"name", "keys", "kind"} or not {
+            "name",
+            "keys",
+        } <= set(data):
+            raise ValueError("Keyboard name and keys are required.")
+        with lock:
+            return jsonify(
+                recorder.start_keyboard_capture(
+                    recorder_id(),
+                    data["name"],
+                    data["keys"],
+                    data.get("kind", "numeric"),
+                )
+            )
+
+    @app.post("/api/recorder/keyboard-capture/key")
+    def capture_keyboard_key():
+        data = payload()
+        if set(data) - {"key", "point", "camera_point", "frame_id"}:
+            raise ValueError("Unexpected keyboard capture fields.")
+        if ("point" in data) == ("camera_point" in data):
+            raise ValueError("Provide exactly one keyboard capture coordinate.")
+        with lock:
+            point = data.get("point")
+            if "camera_point" in data:
+                state.require_ready()
+                state.require_frame(data.get("frame_id"))
+                if state.calibration is None:
+                    raise ValueError(
+                        "Calibrate the phone display before capturing keyboard keys."
+                    )
+                point = state.calibration.map(data["camera_point"])
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError("A keyboard key coordinate is required.")
+            return jsonify(
+                recorder.capture_keyboard_key(
+                    recorder_id(), data.get("key"), point[0], point[1]
+                )
+            )
+
+    @app.post("/api/recorder/keyboard-capture/save")
+    def save_keyboard_capture():
+        if payload():
+            raise ValueError("Expected an empty JSON object.")
+        with lock:
+            return jsonify(recorder.save_keyboard_capture(recorder_id()))
+
+    @app.post("/api/recorder/keyboard-capture/cancel")
+    def cancel_keyboard_capture():
+        if payload():
+            raise ValueError("Expected an empty JSON object.")
+        with lock:
+            return jsonify(recorder.cancel_keyboard_capture(recorder_id()))
+
+    @app.post("/api/recorder/keyboard-delete")
+    def delete_recording_keyboard():
+        data = payload()
+        if set(data) != {"keyboard_id"}:
+            raise ValueError("Choose one captured keyboard to delete.")
+        with lock:
+            return jsonify(recorder.delete_keyboard(recorder_id(), data["keyboard_id"]))
+
+    @app.post("/api/recorder/variable-input")
+    def record_variable_input():
+        data = payload()
+        allowed = {
+            "variable",
+            "input_method",
+            "keyboard_id",
+            "sample",
+            "type_sample",
+            "frame_id",
+        }
+        required = {"variable", "input_method", "type_sample"}
+        if set(data) - allowed or not required <= set(data):
+            raise ValueError("Variable, input method, and sample action are required.")
+        if type(data["type_sample"]) is not bool:
+            raise ValueError("type_sample must be a boolean.")
+        method = data["input_method"]
+        if method not in {"hid", "screen_keyboard"}:
+            raise ValueError("Choose Bluetooth HID or a captured on-screen keyboard.")
+        sample = data.get("sample", "")
+        if not isinstance(sample, str) or len(sample) > 4096:
+            raise ValueError("Sample value must be text up to 4096 characters.")
+
+        client = client_id()
+        owner = recorder_id()
+        action_acquired = data["type_sample"] and state.action_lock.acquire(
+            blocking=False
+        )
+        if data["type_sample"] and not action_acquired:
+            return (
+                jsonify(
+                    error=(
+                        "Controller busy. Wait for the current action to finish; "
+                        "sample was not sent."
+                    )
+                ),
+                409,
+            )
+        action_started = False
+        try:
+            with lock:
+                recorder.require_owner(owner)
+                step = {
+                    "type": "input",
+                    "source": "variable",
+                    "variable": (
+                        data["variable"].get("name")
+                        if isinstance(data["variable"], dict)
+                        else None
+                    ),
+                    **(
+                        {
+                            "input_method": "screen_keyboard",
+                            "keyboard_id": data.get("keyboard_id"),
+                        }
+                        if method == "screen_keyboard"
+                        else {}
+                    ),
+                }
+                candidate = recorder.prepare(owner, step, data["variable"])
+                keyboard = None
+                if method == "screen_keyboard":
+                    keyboard = recorder.workflow.get("keyboards", {}).get(
+                        data.get("keyboard_id")
+                    )
+                    if keyboard is None:
+                        raise ValueError(
+                            "Input references an undefined captured keyboard."
+                        )
+                    # Validate the complete sample before sending its first tap.
+                    try:
+                        screen_keyboard_points(keyboard, sample)
+                    except UnsupportedOperation as exc:
+                        raise ValueError(str(exc)) from None
+
+                if not data["type_sample"]:
+                    return jsonify(recorder.commit_recording(owner, candidate))
+
+                with recording_sample_control(client, data.get("frame_id")) as device:
+                    action_started = bool(sample)
+                    if state.pi_bridge is not None:
+                        if method == "screen_keyboard":
+                            type_with_screen_keyboard(
+                                state.pi_bridge, time.sleep, keyboard, sample
+                            )
+                        else:
+                            state.pi_bridge.type_text(sample)
+                    else:
+                        context = AutomationContext(
+                            device,
+                            state.android,
+                            threading.Event(),
+                            logging.getLogger("recorder"),
+                            SimpleNamespace(),
+                            input_backend=(
+                                "mock" if backend_names()[0] == "mock" else "appium"
+                            ),
+                        )
+                        if method == "screen_keyboard":
+                            type_with_screen_keyboard(
+                                context.input, context.wait, keyboard, sample
+                            )
+                        else:
+                            context.input.type_text(sample)
+                    with state.lock:
+                        if state.owner == client:
+                            state.renew_lease()
+                return jsonify(recorder.commit_recording(owner, candidate))
+        except Exception:
+            if action_started:
+                with lock:
+                    recorder.fail_recording()
+                    state.disable(
+                        "Recording stopped after uncertain input; no retry attempted."
+                    )
+            raise
+        finally:
+            if action_acquired:
+                state.action_lock.release()
 
     @app.post("/api/recorder/review")
     def review_recording():

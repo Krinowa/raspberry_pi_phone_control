@@ -2,8 +2,38 @@
 
 from .validation import validate_workflow, resolve_variables
 from ..context import Cancelled
+from ..input.base import UnsupportedOperation
 from ..screen.state import UnavailableScreenStateProvider, wait_for_text
 from ..screen.stability import wait_until_stable
+
+SCREEN_KEYBOARD_KEY_DELAY = 0.08
+
+
+def screen_keyboard_points(keyboard, value):
+    """Validate a complete value before returning any physical tap targets."""
+    if keyboard["kind"] == "alphabetic":
+        uppercase = sorted({character for character in value if character.isupper()})
+        if uppercase:
+            labels = ", ".join(repr(character) for character in uppercase)
+            raise UnsupportedOperation(
+                "Alphabetic captured keyboard has no Shift/caps support for "
+                f"uppercase: {labels}. No input sent."
+            )
+    missing = sorted(set(value) - set(keyboard["keys"]))
+    if missing:
+        labels = ", ".join(repr(character) for character in missing)
+        raise UnsupportedOperation(
+            f"Captured keyboard does not support: {labels}. No input sent."
+        )
+    return [keyboard["keys"][character] for character in value]
+
+
+def type_with_screen_keyboard(input_bridge, wait, keyboard, value):
+    points = screen_keyboard_points(keyboard, value)
+    for index, point in enumerate(points):
+        input_bridge.tap(point["x"], point["y"])
+        if index + 1 < len(points):
+            wait(SCREEN_KEYBOARD_KEY_DELAY)
 
 
 class WorkflowRunner:
@@ -34,7 +64,7 @@ class WorkflowRunner:
                     step["type"],
                 )
                 try:
-                    self.execute_step(step, values)
+                    self.execute_step(step, values, workflow.get("keyboards", {}))
                     ctx.check_cancelled()
                 except Cancelled:
                     ctx.logger.info("Workflow step %s cancelled.", index)
@@ -49,7 +79,7 @@ class WorkflowRunner:
             values.clear()
             ctx.logger.info("Workflow execution finished.")
 
-    def execute_step(self, step, values=None):
+    def execute_step(self, step, values=None, keyboards=None):
         ctx = self.context
         ctx.check_cancelled()
         kind = step["type"]
@@ -92,6 +122,10 @@ class WorkflowRunner:
                     if step["source"] == "fixed"
                     else values[step["variable"]]
                 )
-                ctx.input.type_text(value)
+                if step.get("input_method", "hid") == "screen_keyboard":
+                    keyboard = (keyboards or {})[step["keyboard_id"]]
+                    type_with_screen_keyboard(ctx.input, ctx.wait, keyboard, value)
+                else:
+                    ctx.input.type_text(value)
         else:
             raise ValueError("Unsupported workflow step type.")

@@ -4,6 +4,7 @@ import base64
 import binascii
 import math
 import re
+import unicodedata
 from copy import deepcopy
 from ..coordinates import unit
 from .models import STEP_TYPES, VARIABLE_TYPES
@@ -13,6 +14,15 @@ SENSITIVE = re.compile(
     r"(?:^|[^a-z])(?:pin|otp)(?:$|[^a-z])|password|passwd|passcode|secret|biometric|approval_code",
     re.I,
 )
+PROTECTED_SCREEN_INPUT = re.compile(
+    r"randomi[sz]ed|secure.?keypad|authoriz|authoris|confirm.*(?:pay|transfer)|final.*(?:pay|transfer)",
+    re.I,
+)
+KEYBOARD_KINDS = {"numeric", "alphabetic", "custom"}
+NUMERIC_KEY_LABELS = set("0123456789.") | {"BACKSPACE"}
+ALPHABETIC_KEY_LABELS = set("abcdefghijklmnopqrstuvwxyz ") | {"backspace"}
+MAX_CUSTOM_KEYS = 100
+MAX_CUSTOM_KEY_LABEL = 32
 KEYS = {
     "ENTER",
     "BACKSPACE",
@@ -95,6 +105,91 @@ def normalize_workflow(workflow):
     return normalized
 
 
+def normalize_capture_keyboard_labels(kind, labels):
+    if not isinstance(kind, str) or kind not in KEYBOARD_KINDS:
+        raise ValueError("Keyboard kind must be numeric, alphabetic, or custom.")
+    if not isinstance(labels, list) or not labels:
+        raise ValueError("Choose at least one keyboard key.")
+    normalized = []
+    for label in labels:
+        if (
+            kind == "numeric"
+            and isinstance(label, str)
+            and label.casefold() == "backspace"
+        ):
+            label = "BACKSPACE"
+        elif kind == "alphabetic" and isinstance(label, str):
+            label = "backspace" if label.casefold() == "backspace" else label.lower()
+        normalized.append(label)
+    validate_keyboard_labels(kind, normalized)
+    return normalized
+
+
+def validate_keyboard_labels(kind, labels):
+    if not isinstance(kind, str) or kind not in KEYBOARD_KINDS:
+        raise ValueError("Keyboard kind must be numeric, alphabetic, or custom.")
+    maximum = (
+        len(NUMERIC_KEY_LABELS)
+        if kind == "numeric"
+        else (len(ALPHABETIC_KEY_LABELS) if kind == "alphabetic" else MAX_CUSTOM_KEYS)
+    )
+    if not labels or len(labels) > maximum:
+        raise ValueError("A keyboard must contain a supported number of keys.")
+    if any(not isinstance(label, str) for label in labels):
+        raise ValueError("Keyboard key labels must be strings.")
+    if len(set(labels)) != len(labels):
+        raise ValueError("Keyboard key labels must not contain duplicates.")
+    if kind == "numeric" and any(label not in NUMERIC_KEY_LABELS for label in labels):
+        raise ValueError("Numeric keyboards support digits, decimal, and backspace.")
+    if kind == "alphabetic" and any(
+        label not in ALPHABETIC_KEY_LABELS for label in labels
+    ):
+        raise ValueError(
+            "Alphabetic keyboards support lowercase a-z, space, and backspace."
+        )
+    if kind == "custom":
+        for label in labels:
+            if (
+                not label.strip()
+                or len(label) > MAX_CUSTOM_KEY_LABEL
+                or any(
+                    unicodedata.category(character).startswith("C")
+                    for character in label
+                )
+            ):
+                raise ValueError(
+                    "Custom key labels must be 1-32 visible characters without controls."
+                )
+
+
+def validate_keyboard_map(keyboard_id, keyboard):
+    identifier(keyboard_id)
+    fields(
+        keyboard,
+        {"id", "name", "kind", "keys"},
+        {"id", "name", "kind", "keys"},
+    )
+    if keyboard["id"] != keyboard_id:
+        raise ValueError("Keyboard ID does not match its workflow key.")
+    name = text(keyboard["name"], "Keyboard name", 160).strip()
+    if not name:
+        raise ValueError("Keyboard name is required.")
+    if SENSITIVE.search(name) or PROTECTED_SCREEN_INPUT.search(name):
+        raise ValueError("Protected or randomized keyboards must remain manual.")
+    kind = keyboard["kind"]
+    if not isinstance(kind, str) or kind not in KEYBOARD_KINDS:
+        raise ValueError("Keyboard kind must be numeric, alphabetic, or custom.")
+    keys = keyboard["keys"]
+    if not isinstance(keys, dict):
+        raise ValueError("Keyboard keys must be an object.")
+    validate_keyboard_labels(kind, list(keys))
+    for label, coordinate in keys.items():
+        if not isinstance(coordinate, dict) or set(coordinate) != {"x", "y"}:
+            raise ValueError("Malformed screen-keyboard coordinates.")
+        unit(coordinate["x"])
+        unit(coordinate["y"])
+
+
 def validate_workflow(workflow, *, allow_empty=False):
     workflow = normalize_workflow(workflow)
     fields(
@@ -104,6 +199,7 @@ def validate_workflow(workflow, *, allow_empty=False):
             "name",
             "version",
             "variables",
+            "keyboards",
             "steps",
             "created_at",
             "updated_at",
@@ -122,7 +218,18 @@ def validate_workflow(workflow, *, allow_empty=False):
         if field in workflow:
             text(workflow[field], "Timestamp", 80)
     variables = workflow["variables"]
+    keyboards = workflow.get("keyboards", {})
     steps = workflow["steps"]
+
+    if not isinstance(keyboards, dict) or len(keyboards) > 32:
+        raise ValueError("At most 32 captured keyboards are supported.")
+    keyboard_names = set()
+    for keyboard_id, keyboard in keyboards.items():
+        validate_keyboard_map(keyboard_id, keyboard)
+        keyboard_name = keyboard["name"].strip().casefold()
+        if keyboard_name in keyboard_names:
+            raise ValueError("Captured keyboard names must be unique.")
+        keyboard_names.add(keyboard_name)
 
     if not isinstance(variables, list) or len(variables) > 100:
         raise ValueError("At most 100 variable definitions are supported.")
@@ -186,7 +293,15 @@ def validate_workflow(workflow, *, allow_empty=False):
         specific = {
             "tap": {"x", "y"},
             "swipe": {"start", "end", "duration_ms"},
-            "input": {"source", "value", "variable", "message", "sensitive"},
+            "input": {
+                "source",
+                "value",
+                "variable",
+                "message",
+                "sensitive",
+                "input_method",
+                "keyboard_id",
+            },
             "key": {"key"},
             "wait": {"seconds"},
             "wait_until_stable": {"stable_ms", "timeout_seconds"},
@@ -294,6 +409,38 @@ def validate_workflow(workflow, *, allow_empty=False):
                     raise ValueError("Manual inputs cannot contain stored values.")
             else:
                 raise ValueError("Input source must be fixed, variable, or manual.")
+            input_method = step.get("input_method", "hid")
+            if source == "manual":
+                if "input_method" in step or "keyboard_id" in step:
+                    raise ValueError("Manual inputs cannot select an input method.")
+            elif input_method == "hid":
+                if "keyboard_id" in step:
+                    raise ValueError("HID input cannot reference a captured keyboard.")
+            elif input_method == "screen_keyboard":
+                keyboard_id = step.get("keyboard_id")
+                if keyboard_id not in keyboards:
+                    raise ValueError("Input references an undefined captured keyboard.")
+                protected = " ".join(
+                    str(value)
+                    for value in (
+                        step.get("label", ""),
+                        step.get("variable", ""),
+                        next(
+                            (
+                                definition["label"]
+                                for definition in variables
+                                if definition["name"] == step.get("variable")
+                            ),
+                            "",
+                        ),
+                    )
+                )
+                if SENSITIVE.search(protected) or PROTECTED_SCREEN_INPUT.search(
+                    protected
+                ):
+                    raise ValueError("Protected input must use a manual checkpoint.")
+            else:
+                raise ValueError("Input method must be hid or screen_keyboard.")
 
     if workflow.get("financial") and steps and steps[-1]["type"] != "manual_checkpoint":
         raise ValueError(
@@ -310,7 +457,13 @@ def resolve_variables(workflow, supplied=None):
     names = {v["name"] for v in workflow["variables"]}
     if set(supplied) - names:
         raise ValueError("Unknown workflow variable supplied.")
-    return {
-        v["name"]: validate_variable_value(v, supplied.get(v["name"], v.get("default")))
-        for v in workflow["variables"]
-    }
+    resolved = {}
+    for definition in workflow["variables"]:
+        name = definition["name"]
+        try:
+            resolved[name] = validate_variable_value(
+                definition, supplied.get(name, definition.get("default"))
+            )
+        except ValueError as exc:
+            raise ValueError(f"Variable {name!r}: {exc}") from None
+    return resolved
