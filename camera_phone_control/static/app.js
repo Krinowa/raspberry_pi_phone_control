@@ -5,6 +5,8 @@ const canvas = $("video");
 const ctx = canvas.getContext("2d");
 const clientId = crypto.randomUUID();
 const token = document.querySelector('meta[name="control-token"]').content;
+const previewDebug =
+  document.querySelector('meta[name="preview-debug"]')?.content === "1";
 const names = ["top-left", "top-right", "bottom-right", "bottom-left"];
 let state = null,
   frameId = null,
@@ -31,6 +33,54 @@ const RECOVERY_DELAYS_MS = [500, 1000, 2000, 3000, 5000];
 // The browser waits longer than the Pi client's 2s connect + 5s read limits,
 // allowing the server to return its controlled uncertainty message first.
 const API_TIMEOUT_MS = 9000;
+let previewDebugWindow = null;
+let previewTimer = null;
+let previewInFlight = false;
+const PREVIEW_INTERVAL_MS = 65;
+const PREVIEW_ERROR_RETRY_MS = 600;
+const PREVIEW_BACKGROUND_MS = 1000;
+
+function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
+  if (!previewDebug) return;
+  const now = performance.now();
+  previewDebugWindow ||= {
+    started: now,
+    last: null,
+    count: 0,
+    fetch: 0,
+    body: 0,
+    decode: 0,
+    total: 0,
+    interval: 0,
+    maxInterval: 0,
+  };
+  const metrics = previewDebugWindow;
+  if (metrics.last !== null) {
+    const interval = now - metrics.last;
+    metrics.interval += interval;
+    metrics.maxInterval = Math.max(metrics.maxInterval, interval);
+  }
+  metrics.last = now;
+  metrics.count++;
+  metrics.fetch += fetchMs;
+  metrics.body += bodyMs;
+  metrics.decode += decodeMs;
+  metrics.total += totalMs;
+  const elapsed = now - metrics.started;
+  if (elapsed >= 1000) {
+    console.info(
+      `Browser preview FPS=${((metrics.count * 1000) / elapsed).toFixed(1)} ` +
+        `render interval avg=${(
+          metrics.interval / Math.max(1, metrics.count - 1)
+        ).toFixed(1)}ms max=${metrics.maxInterval.toFixed(1)}ms ` +
+        `fetch=${(metrics.fetch / metrics.count).toFixed(1)}ms ` +
+        `body=${(metrics.body / metrics.count).toFixed(1)}ms ` +
+        `decode=${(metrics.decode / metrics.count).toFixed(1)}ms ` +
+        `total=${(metrics.total / metrics.count).toFixed(1)}ms`,
+    );
+    previewDebugWindow = null;
+  }
+}
 
 function notice(text, error = false) {
   $("notice").textContent = text;
@@ -479,8 +529,24 @@ async function refreshStatus() {
   }
 }
 
+function schedulePreview(delay = PREVIEW_INTERVAL_MS) {
+  if (previewTimer !== null) clearTimeout(previewTimer);
+  const scheduledDelay = document.hidden
+    ? Math.max(delay, PREVIEW_BACKGROUND_MS)
+    : delay;
+  previewTimer = setTimeout(() => {
+    previewTimer = null;
+    videoLoop();
+  }, scheduledDelay);
+}
+
 async function videoLoop() {
+  if (previewInFlight) return;
+  previewInFlight = true;
+  let succeeded = false;
+  const cycleStarted = performance.now();
   try {
+    const previewStarted = performance.now();
     const response = await fetch("/api/frame", {
       cache: "no-store",
       signal: AbortSignal.timeout(4000),
@@ -488,8 +554,12 @@ async function videoLoop() {
 
     if (!response.ok)
       throw new Error((await response.json()).error || "Camera unavailable");
+    const responseAt = performance.now();
     const nextId = Number(response.headers.get("X-Frame-Id"));
-    const next = await createImageBitmap(await response.blob());
+    const body = await response.blob();
+    const bodyAt = performance.now();
+    const next = await createImageBitmap(body);
+    const decodedAt = performance.now();
 
     if (
       bitmap &&
@@ -518,6 +588,14 @@ async function videoLoop() {
     $("video-placeholder").classList.add("hidden");
     draw();
     render();
+    const renderedAt = performance.now();
+    recordPreviewTiming(
+      responseAt - previewStarted,
+      bodyAt - responseAt,
+      decodedAt - bodyAt,
+      renderedAt - previewStarted,
+    );
+    succeeded = true;
   } catch (error) {
     frameAt = 0;
     const wasManual = manual;
@@ -526,8 +604,15 @@ async function videoLoop() {
     $("video-placeholder").textContent = error.message;
     $("video-placeholder").classList.remove("hidden");
     render();
+  } finally {
+    previewInFlight = false;
+    const elapsed = performance.now() - cycleStarted;
+    schedulePreview(
+      succeeded
+        ? Math.max(0, PREVIEW_INTERVAL_MS - elapsed)
+        : PREVIEW_ERROR_RETRY_MS,
+    );
   }
-  setTimeout(videoLoop, fresh() ? 65 : 600);
 }
 
 function applyControlResult(result) {
@@ -815,6 +900,9 @@ setInterval(async () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && manual) disable().catch(() => {});
+  // Background tabs are intentionally low-rate. Restore the normal cadence
+  // immediately when Chrome makes the page visible again.
+  schedulePreview(document.hidden ? PREVIEW_BACKGROUND_MS : 0);
 });
 
 window.addEventListener("pagehide", () => {

@@ -95,6 +95,97 @@ For a standalone copy, Python 3.10+ is required. Create an environment with
 `python3 -m venv venv`, then `source venv/bin/activate` and
 `pip install -r requirements.txt` before starting `python app.py`.
 
+### Camera OCR setup
+
+Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector and its
+English-specific PP-OCRv5 mobile recognizer on the CPU. The document-orientation
+and document-unwarping models are disabled; text line orientation is also
+disabled by default. Paddle and its models are created lazily, exactly once in a
+persistent spawned worker process, then reused for the life of the server. This
+keeps Paddle's native inference work and Python-runtime contention out of the
+camera/Flask process. The first request can take longer while the models are
+downloaded and initialized.
+
+On an Apple Silicon Mac (`uname -m` prints `arm64`), install the CPU build in the
+active virtual environment with:
+
+```zsh
+python -m pip install --upgrade pip
+python -m pip install paddlepaddle==3.3.0 \
+  -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+python -m pip install "paddleocr>=3.3,<4"
+```
+
+The same dependencies are pinned in `requirements.txt`, so a fresh environment
+can instead use `python -m pip install -r requirements.txt`. Current PaddlePaddle
+macOS wheels support Apple Silicon; use Linux or another supported platform for
+an Intel Mac that cannot install the pinned wheel.
+
+The default input is the calibrated, high-resolution display crop converted to
+BGR without thresholding. Set `CAMERA_OCR_SCALE=1.25` or `1.5` only when the
+camera image makes very small text benefit from upscaling. Enable text-line
+orientation only for screens that regularly rotate individual lines:
+
+```zsh
+CAMERA_OCR_TEXTLINE_ORIENTATION=1 python app.py --camera 0
+```
+
+OCR uses four CPU inference threads in the worker by default. Tune this between
+1 and 16 only after measuring on the target machine:
+
+```zsh
+CAMERA_OCR_CPU_THREADS=2 python app.py --camera 0
+```
+
+Successful OCR results are reused only when a downsampled screen signature is
+effectively unchanged. `CAMERA_OCR_CACHE_THRESHOLD` controls both the normalized
+mean difference and changed-pixel ratio; its conservative default is `0.001`,
+`0` disables caching, and the accepted range is 0 through 0.1:
+
+```zsh
+CAMERA_OCR_CACHE_THRESHOLD=0.002 python app.py --camera 0
+```
+
+For one-request diagnostics, save the exact NumPy image passed to PaddleOCR and
+log its dimensions, detected text, region count, confidence, and separate
+capture, decode, warp, copy, preprocessing, worker startup, IPC send/wait,
+child-process inference, total timing, cache status, worker PID, and main PID:
+
+```zsh
+CAMERA_OCR_DEBUG=1 \
+CAMERA_OCR_DEBUG_DIR=/tmp/camera-ocr-debug \
+python app.py --camera 0
+curl http://127.0.0.1:8765/api/ocr/texts
+```
+
+To profile camera delivery around an OCR request, restart with preview debugging
+enabled:
+
+```zsh
+CAMERA_PREVIEW_DEBUG=1 CAMERA_OCR_DEBUG=1 python app.py --camera 0
+```
+
+The server logs physical capture FPS, latest-frame publication FPS, preview
+response FPS, camera-sequence FPS, response intervals, route time, active request
+count, thread count, and OCR start/finish timing. The browser console separately
+logs frame-fetch, response-body, bitmap-decode, canvas-render, and total preview
+timings. This instrumentation is disabled unless `CAMERA_PREVIEW_DEBUG` is set.
+
+PaddleOCR is the normal implementation and does not invoke Tesseract. The prior
+provider remains available for a temporary same-camera comparison when
+Tesseract is installed. Stop the server between runs, keep the phone and camera
+fixed, and call the same endpoint after each start:
+
+```zsh
+# PaddleOCR
+python app.py --camera 0
+curl http://127.0.0.1:8765/api/ocr/texts
+
+# Optional legacy comparison
+CAMERA_OCR_ENGINE=tesseract python app.py --camera 0
+curl http://127.0.0.1:8765/api/ocr/texts
+```
+
 ### Camera selection and permission
 
 Attach your external USB camera and aim it at the phone. Camera index `0` is only

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from types import SimpleNamespace
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
 from android_control import AndroidControl, DeviceError, validate_key
@@ -287,6 +287,26 @@ def create_app(
     app.config.update(
         MAX_CONTENT_LENGTH=1024 * 1024, TRUSTED_HOSTS=["localhost", "127.0.0.1"]
     )
+    preview_debug = os.environ.get("CAMERA_PREVIEW_DEBUG", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    app.config["CAMERA_PREVIEW_DEBUG"] = preview_debug
+    request_metrics = {
+        "lock": threading.Lock(),
+        "active": 0,
+        "window_started": time.monotonic(),
+        "frames": 0,
+        "first_sequence": None,
+        "last_sequence": None,
+        "last_response": None,
+        "interval_total": 0.0,
+        "interval_max": 0.0,
+        "route_total": 0.0,
+    }
+    app.extensions["preview_request_metrics"] = request_metrics
     token = secrets.token_urlsafe(32)
     if calibration_storage is None and all(
         hasattr(camera, field) for field in ("source", "rotate")
@@ -304,6 +324,10 @@ def create_app(
 
     @app.before_request
     def protect_local_requests():
+        if preview_debug:
+            g.preview_request_started = time.monotonic()
+            with request_metrics["lock"]:
+                request_metrics["active"] += 1
         # Reject cross-site fetches/embeds, including camera requests. No CORS enabled.
         if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
             return jsonify(error="Only same-origin local requests are accepted."), 403
@@ -325,6 +349,9 @@ def create_app(
             "default-src 'self'; script-src 'self'; style-src 'self'; "
             "img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         )
+        if preview_debug and hasattr(g, "preview_request_started"):
+            with request_metrics["lock"]:
+                request_metrics["active"] -= 1
         return response
 
     @app.errorhandler(ValueError)
@@ -381,7 +408,11 @@ def create_app(
 
     @app.get("/")
     def index():
-        return render_template("index.html", control_token=token)
+        return render_template(
+            "index.html",
+            control_token=token,
+            preview_debug=preview_debug,
+        )
 
     @app.get("/api/status")
     def status():
@@ -401,12 +432,73 @@ def create_app(
 
     @app.get("/api/frame")
     def frame():
-        if not camera.status()["ready"]:
-            return jsonify(error=camera.status()["error"]), 503
+        camera_status = camera.status()
+        if not camera_status["ready"]:
+            return jsonify(error=camera_status["error"]), 503
         latest = camera.frame()
         if latest is None:
             return jsonify(error="Camera frame unavailable."), 503
         jpeg, number, _, _ = latest
+        if preview_debug:
+            now = time.monotonic()
+            report = None
+            with request_metrics["lock"]:
+                previous = request_metrics["last_response"]
+                if previous is not None:
+                    interval = now - previous
+                    request_metrics["interval_total"] += interval
+                    request_metrics["interval_max"] = max(
+                        request_metrics["interval_max"], interval
+                    )
+                request_metrics["last_response"] = now
+                request_metrics["frames"] += 1
+                request_metrics["first_sequence"] = (
+                    number
+                    if request_metrics["first_sequence"] is None
+                    else request_metrics["first_sequence"]
+                )
+                request_metrics["last_sequence"] = number
+                request_metrics["route_total"] += now - getattr(
+                    g, "preview_request_started", now
+                )
+                elapsed = now - request_metrics["window_started"]
+                if elapsed >= 1:
+                    count = request_metrics["frames"]
+                    report = (
+                        count / elapsed,
+                        (
+                            request_metrics["last_sequence"]
+                            - request_metrics["first_sequence"]
+                        )
+                        / elapsed,
+                        (request_metrics["interval_total"] / max(1, count - 1)),
+                        request_metrics["interval_max"],
+                        request_metrics["route_total"] / count,
+                        request_metrics["active"],
+                    )
+                    request_metrics.update(
+                        window_started=now,
+                        frames=0,
+                        first_sequence=None,
+                        last_sequence=None,
+                        last_response=None,
+                        interval_total=0.0,
+                        interval_max=0.0,
+                        route_total=0.0,
+                    )
+            if report is not None:
+                LOG.info(
+                    "Preview response FPS=%.1f camera-sequence FPS=%.1f "
+                    "yield interval avg=%.1fms max=%.1fms route=%.1fms "
+                    "active_requests=%d threads=%d",
+                    report[0],
+                    report[1],
+                    report[2] * 1000,
+                    report[3] * 1000,
+                    report[4] * 1000,
+                    report[5],
+                    threading.active_count(),
+                )
         return Response(
             jpeg, mimetype="image/jpeg", headers={"X-Frame-Id": str(number)}
         )
@@ -814,6 +906,10 @@ def main():
         )
 
     finally:
+        screen_provider = app.extensions.get("workflow_screen_state_provider")
+        close_provider = getattr(screen_provider, "close", None)
+        if close_provider is not None:
+            close_provider()
         with app.extensions["control_state"].lock:
             app.extensions["control_state"].disable()
         camera.close()

@@ -1,5 +1,7 @@
 """Display-only observations from the dashboard's existing external camera."""
 
+import time
+
 import cv2
 import numpy as np
 
@@ -38,7 +40,8 @@ class _DisplaySession:
         self.last_ocr_id = None
         self.ocr_image = None
 
-    def _sample(self):
+    def _sample(self, timings=None):
+        started = time.monotonic()
         with self.state.lock:
             if (
                 self.state.calibration is not self.calibration
@@ -48,13 +51,23 @@ class _DisplaySession:
                     "Phone display calibration changed; restart the workflow."
                 )
 
-            observe = getattr(
-                self.state.camera,
-                "observation",
-                None,
-            )
+            camera = self.state.camera
 
-            sample = observe() if observe else None
+        # Camera.observation() has its own short lock. Do not nest the dashboard
+        # state lock around it, and never hold either lock while decoding or
+        # warping the copied JPEG bytes.
+        observe = getattr(camera, "observation", None)
+        sample = observe() if observe else None
+        with self.state.lock:
+            if (
+                self.state.calibration is not self.calibration
+                or self.state.signature != self.signature
+            ):
+                raise ScreenStabilityError(
+                    "Phone display calibration changed; restart the workflow."
+                )
+        if timings is not None:
+            timings["capture"] = time.monotonic() - started
 
         if sample is None:
             raise ScreenStabilityError(
@@ -127,8 +140,10 @@ class _DisplaySession:
 
     def capture_for_ocr(
         self,
-        output_width=600,
+        output_width=None,
         output_height=1000,
+        *,
+        timings=None,
     ):
         """Return a higher-resolution calibrated phone display for OCR.
 
@@ -136,9 +151,10 @@ class _DisplaySession:
         representation and does not blur the text.
         """
 
-        jpeg, sequence, _, _, timestamp = self._sample()
+        jpeg, sequence, frame_width, frame_height, timestamp = self._sample(timings)
 
         if sequence != self.last_ocr_id:
+            decode_started = time.monotonic()
             try:
                 image = cv2.imdecode(
                     np.frombuffer(jpeg, np.uint8),
@@ -153,8 +169,39 @@ class _DisplaySession:
                 raise ScreenStabilityError(
                     "External camera frame could not be decoded."
                 )
+            if timings is not None:
+                timings["decode"] = time.monotonic() - decode_started
 
             height, width = image.shape
+
+            if output_width is None:
+                device = self.signature[0]
+                device_width = getattr(device, "width", None)
+                device_height = getattr(device, "height", None)
+                if (
+                    type(device_width) is int
+                    and type(device_height) is int
+                    and min(device_width, device_height) >= 2
+                ):
+                    aspect = device_width / device_height
+                else:
+                    # Pi control exposes normalized coordinates without Android
+                    # pixel geometry. Estimate the phone aspect from the
+                    # calibrated quadrilateral in actual camera pixels instead
+                    # of stretching every screen to the former fixed 0.60 ratio.
+                    points = self.calibration.corners * np.array(
+                        [frame_width, frame_height]
+                    )
+                    horizontal = (
+                        np.linalg.norm(points[1] - points[0])
+                        + np.linalg.norm(points[2] - points[3])
+                    ) / 2
+                    vertical = (
+                        np.linalg.norm(points[3] - points[0])
+                        + np.linalg.norm(points[2] - points[1])
+                    ) / 2
+                    aspect = horizontal / vertical
+                output_width = round(output_height * float(np.clip(aspect, 0.3, 2.5)))
 
             matrix = (
                 np.diag(
@@ -174,16 +221,20 @@ class _DisplaySession:
                 )
             )
 
+            warp_started = time.monotonic()
             crop = cv2.warpPerspective(
                 image,
                 matrix,
                 (output_width, output_height),
             )
+            if timings is not None:
+                timings["warp"] = time.monotonic() - warp_started
 
-            # Remove a small outer border to avoid phone bezel/background
-            # interfering with OCR.
-            border_x = max(2, int(output_width * 0.01))
-            border_y = max(2, int(output_height * 0.01))
+            # The warp already follows the calibrated display. Keep only the two
+            # interpolation-edge pixels; the former 1% crop removed ten bottom
+            # pixels at the default size and could clip small labels.
+            border_x = 2
+            border_y = 2
 
             crop = crop[
                 border_y : output_height - border_y,

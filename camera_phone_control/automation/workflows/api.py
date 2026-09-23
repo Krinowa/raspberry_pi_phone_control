@@ -15,12 +15,15 @@ from ..input.base import UnsupportedOperation
 from ..screen.accessibility import AccessibilityScreenStateProvider
 from ..screen.camera import CalibratedCamera
 from ..screen.camera_ocr import CameraOCRScreenStateProvider
+from ..screen.state import ScreenStateError
 from ..screen.text_learning import text_suggestions
 from .capture import inspect_target, tap_preview
 from .recorder import Recorder
 from .runner import WorkflowRunner, screen_keyboard_points, type_with_screen_keyboard
 from .service import WorkflowService
 from .storage import WorkflowStorage
+
+LOG = logging.getLogger("workflow_api")
 
 
 def register_workflows(app, state, payload, client_id, storage=None):
@@ -51,11 +54,35 @@ def register_workflows(app, state, payload, client_id, storage=None):
         workflow_storage=storage,
         workflow_recorder=recorder,
         workflow_service=service,
+        workflow_screen_state_provider=screen_state_provider,
     )
 
     @app.get("/api/ocr/texts")
     def debug_ocr_texts():
-        texts = screen_state_provider.visible_texts()
+        started = time.monotonic()
+        preview_debug = app.config.get("CAMERA_PREVIEW_DEBUG", False)
+        if preview_debug:
+            metrics = app.extensions.get("preview_request_metrics", {})
+            metrics_lock = metrics.get("lock")
+            if metrics_lock is not None:
+                with metrics_lock:
+                    active_requests = metrics.get("active", 0)
+            else:
+                active_requests = 0
+            LOG.info(
+                "OCR request started active_requests=%d threads=%d",
+                active_requests,
+                threading.active_count(),
+            )
+        try:
+            texts = screen_state_provider.visible_texts()
+        finally:
+            if preview_debug:
+                LOG.info(
+                    "OCR request finished duration=%.3fs threads=%d",
+                    time.monotonic() - started,
+                    threading.active_count(),
+                )
 
         return jsonify(
             texts=texts,
@@ -118,6 +145,10 @@ def register_workflows(app, state, payload, client_id, storage=None):
     @app.errorhandler(FileNotFoundError)
     def missing_file(exc):
         return jsonify(error="Workflow not found."), 404
+
+    @app.errorhandler(ScreenStateError)
+    def screen_state_error(exc):
+        return jsonify(error=str(exc)), 503
 
     def run_snapshot(run_id):
         try:
