@@ -78,6 +78,12 @@ The existing single-command gate ignores additional input while a request runs;
 type individual keys at a pace the connection can handle. No key queue or retry
 is introduced.
 
+Pi action endpoints may acknowledge input with any successful HTTP `2xx` status.
+The current asynchronous Pi service normally returns `202 Accepted` with
+`accepted: true`, `status: "queued"`, and a `command_id`. The laptop client keeps
+the most recent command ID and queue status for diagnostics, then returns without
+polling for completion. Legacy synchronous `200` responses remain supported.
+
 Recent Apps and Screen Off are disabled in Pi mode because
 the supplied API has no corresponding endpoints.
 

@@ -40,6 +40,18 @@ class RaspberryPiInputBridge:
         self.client = client if client is not None else PiApiClient()
         self.target = PiControlTarget("pi-api:" + self.client.base_url)
 
+    @property
+    def last_command_id(self):
+        return self.client.last_command_id
+
+    @property
+    def last_action_status(self):
+        return self.client.last_action_status
+
+    @property
+    def last_action_http_status(self):
+        return self.client.last_action_http_status
+
     def tap(self, x, y):
         return self.client.tap(x, y)
 
