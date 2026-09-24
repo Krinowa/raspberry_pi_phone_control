@@ -7,11 +7,16 @@ import os
 import re
 import socket
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from automation.coordinates import unit
+from .device_config import (
+    DEFAULT_DEVICE_ID,
+    DEFAULT_PI_BASE_URL,
+    get_device_config,
+)
 
-DEFAULT_BASE_URL = "http://192.168.68.61:8766"
+DEFAULT_BASE_URL = DEFAULT_PI_BASE_URL
 MAX_RESPONSE_BYTES = 65536
 
 # Only log "slow" requests above this threshold.
@@ -20,6 +25,10 @@ SLOW_REQUEST_SECONDS = float(os.environ.get("PI_API_SLOW_REQUEST_SECONDS", "0.5"
 
 class PiApiError(RuntimeError):
     """Safe-to-display Pi error: never includes typed text or response bodies."""
+
+    def __init__(self, message, *, http_status=None):
+        super().__init__(message)
+        self.http_status = http_status
 
 
 def timeout_value(value, name):
@@ -48,21 +57,22 @@ class PiApiClient:
     last_command_id = None
     last_action_status = None
     last_action_http_status = None
+    device_id = DEFAULT_DEVICE_ID
 
     def __init__(
         self,
         base_url=None,
         connect_timeout=None,
         read_timeout=None,
+        *,
+        device_id=None,
     ):
-        base_url = (
-            base_url
-            if base_url is not None
-            else os.environ.get(
-                "PI_API_BASE_URL",
-                DEFAULT_BASE_URL,
-            )
+        self.device_config = get_device_config(
+            device_id,
+            pi_base_url=base_url,
         )
+        self.device_id = self.device_config.device_id
+        base_url = self.device_config.pi_base_url
 
         if not isinstance(base_url, str):
             raise ValueError("PI_API_BASE_URL must be an HTTP(S) URL.")
@@ -149,6 +159,8 @@ class PiApiClient:
         method,
         path,
         payload=None,
+        *,
+        physical_action=False,
     ):
         connection_type = (
             http.client.HTTPSConnection
@@ -163,7 +175,7 @@ class PiApiClient:
         )
 
         suffix = (
-            " Input may have occurred; no retry attempted." if method == "POST" else ""
+            " Input may have occurred; no retry attempted." if physical_action else ""
         )
 
         started = time.monotonic()
@@ -248,7 +260,8 @@ class PiApiClient:
                 )
 
                 raise PiApiError(
-                    f"Pi API {path} returned " f"HTTP {response.status}." + suffix
+                    f"Pi API {path} returned " f"HTTP {response.status}." + suffix,
+                    http_status=response.status,
                 )
 
             # -----------------------------------------------------------------
@@ -332,7 +345,7 @@ class PiApiClient:
             # Retain async metadata
             # -----------------------------------------------------------------
 
-            if method == "POST":
+            if physical_action:
                 self._retain_action_metadata(
                     result,
                     response.status,
@@ -399,13 +412,47 @@ class PiApiClient:
     def status(self):
         result = self._request(
             "GET",
-            "/status",
+            self._device_path("status"),
         )
 
         if type(result.get("connected")) is not bool:
             raise PiApiError("Pi /status response " "is missing boolean connected.")
 
         return result
+
+    def _device_path(self, operation=None, device_id=None):
+        selected = get_device_config(
+            self.device_id if device_id is None else device_id,
+            pi_base_url=self.base_url,
+        ).device_id
+        path = "/devices/" + quote(selected, safe="")
+        return path + ("/" + operation if operation else "")
+
+    def select_device(self, device_id):
+        self.device_config = get_device_config(device_id, pi_base_url=self.base_url)
+        self.device_id = self.device_config.device_id
+
+    def devices(self):
+        return self._request("GET", "/devices")
+
+    def device_status(self, device_id):
+        return self._request("GET", self._device_path("status", device_id))
+
+    def enrollment(self):
+        return self._request("GET", "/enrollment")
+
+    def start_enrollment(self, device_id):
+        selected = get_device_config(device_id, pi_base_url=self.base_url).device_id
+        return self._request("POST", "/enrollment/start", {"device_id": selected})
+
+    def stop_enrollment(self):
+        return self._request("POST", "/enrollment/stop")
+
+    def replace_device(self, device_id):
+        return self._request("POST", self._device_path("replace", device_id))
+
+    def delete_device(self, device_id):
+        return self._request("DELETE", self._device_path(device_id=device_id))
 
     def tap(
         self,
@@ -414,11 +461,12 @@ class PiApiClient:
     ):
         return self._request(
             "POST",
-            "/tap",
+            self._device_path("tap"),
             {
                 "x": unit(x),
                 "y": unit(y),
             },
+            physical_action=True,
         )
 
     def swipe(
@@ -430,13 +478,14 @@ class PiApiClient:
     ):
         return self._request(
             "POST",
-            "/swipe",
+            self._device_path("swipe"),
             {
                 "x1": unit(x1),
                 "y1": unit(y1),
                 "x2": unit(x2),
                 "y2": unit(y2),
             },
+            physical_action=True,
         )
 
     def type_text(
@@ -447,10 +496,11 @@ class PiApiClient:
 
         return self._request(
             "POST",
-            "/text",
+            self._device_path("text"),
             {
                 "text": text,
             },
+            physical_action=True,
         )
 
     def key(
@@ -465,26 +515,30 @@ class PiApiClient:
 
         return self._request(
             "POST",
-            "/key",
+            self._device_path("key"),
             {
                 "key": key.upper(),
             },
+            physical_action=True,
         )
 
     def home(self):
         return self._request(
             "POST",
-            "/home",
+            self._device_path("home"),
+            physical_action=True,
         )
 
     def back(self):
         return self._request(
             "POST",
-            "/back",
+            self._device_path("back"),
+            physical_action=True,
         )
 
     def wake(self):
         return self._request(
             "POST",
-            "/wake",
+            self._device_path("wake"),
+            physical_action=True,
         )

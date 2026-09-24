@@ -36,6 +36,13 @@ const API_TIMEOUT_MS = 9000;
 let previewDebugWindow = null;
 let previewTimer = null;
 let previewInFlight = false;
+let deviceCatalog = null;
+let deviceRefreshInFlight = false;
+let deviceRefreshTimer = null;
+let deviceRenderSignature = null;
+let devicePollingStopped = false;
+const deviceDeletesInFlight = new Set();
+const DEVICE_REFRESH_MS = 1000;
 const PREVIEW_INTERVAL_MS = 65;
 const PREVIEW_ERROR_RETRY_MS = 600;
 const PREVIEW_BACKGROUND_MS = 1000;
@@ -153,6 +160,229 @@ async function api(path, data, method = "POST", options = {}) {
   }
 }
 
+// Keep all Pi device-management HTTP details beside the dashboard's existing
+// API helper. Rendering and event handlers use this service rather than fetch.
+const deviceService = {
+  list: () => api("/api/devices", undefined, "GET", { monitor: false }),
+  select: (deviceId) => api("/api/devices/select", { device_id: deviceId }),
+  startEnrollment: (deviceId) =>
+    api("/api/enrollment/start", { target_device_id: deviceId }),
+  stopEnrollment: () => api("/api/enrollment/stop", {}),
+  remove: (deviceId) =>
+    api(`/api/devices/${encodeURIComponent(deviceId)}`, {}, "DELETE"),
+};
+
+function setDeviceError(message = "") {
+  const node = $("device-error");
+  node.textContent = message;
+  node.hidden = !message;
+}
+
+function nextDeviceId(devices) {
+  const ids = new Set(devices.map((device) => device.id));
+  for (let code = "B".charCodeAt(0); code <= "Z".charCodeAt(0); code++) {
+    const candidate = `phone_${String.fromCharCode(code)}`;
+    if (!ids.has(candidate)) return candidate;
+  }
+  let number = 2;
+  while (ids.has(`phone_${number}`)) number++;
+  return `phone_${number}`;
+}
+
+function scheduleDeviceRefresh(active = true) {
+  clearTimeout(deviceRefreshTimer);
+  deviceRefreshTimer = null;
+  if (!active) return;
+  deviceRefreshTimer = setTimeout(() => loadDevices(), DEVICE_REFRESH_MS);
+}
+
+function selectedPiDevice() {
+  const selected = deviceCatalog?.selected_device;
+  return Array.isArray(deviceCatalog?.devices)
+    ? deviceCatalog.devices.find((device) => device.id === selected)
+    : null;
+}
+
+function selectedPiDeviceConnected() {
+  if (state?.manual_backend !== "raspberry_pi") return true;
+  return selectedPiDevice()?.connected === true;
+}
+
+window.selectedPiDeviceConnected = selectedPiDeviceConnected;
+
+function deviceManagementBlocked() {
+  return (
+    calibrating ||
+    state?.control_status === "automation" ||
+    !!window.phoneRecorder?.deviceManagementBlocked?.()
+  );
+}
+
+function renderDevices() {
+  const devices = Array.isArray(deviceCatalog?.devices)
+    ? deviceCatalog.devices
+    : [];
+  const enrollment = deviceCatalog?.enrollment || { active: false };
+  const selected = deviceCatalog?.selected_device;
+  $("device-state").textContent = devices.length
+    ? `${devices.length} registered phone${devices.length === 1 ? "" : "s"}. Select which phone this dashboard controls.`
+    : "No phones are registered with this Pi yet.";
+
+  const cards = devices.map((device) => {
+    const card = document.createElement("article");
+    card.className =
+      "device-item" + (device.id === selected ? " selected" : "");
+
+    const heading = document.createElement("div");
+    heading.className = "device-item-heading";
+    const name = document.createElement("h3");
+    name.textContent = device.name || device.id;
+    heading.append(name);
+    if (device.default || device.id === deviceCatalog.default_device) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "Default";
+      heading.append(badge);
+    }
+
+    const details = document.createElement("dl");
+    const addDetail = (label, value, className = "") => {
+      const term = document.createElement("dt");
+      const description = document.createElement("dd");
+      term.textContent = label;
+      description.textContent = value;
+      description.className = className;
+      details.append(term, description);
+    };
+    addDetail("Device ID", device.id || "—");
+    addDetail(
+      "Status",
+      device.connected ? "Connected" : "Disconnected",
+      "device-status" + (device.connected ? " connected" : ""),
+    );
+    addDetail("Bluetooth MAC", device.bluetooth_address || "Not paired");
+
+    const actions = document.createElement("div");
+    actions.className = "device-item-actions";
+    const select = document.createElement("button");
+    select.type = "button";
+    select.textContent = device.id === selected ? "Selected" : "Select";
+    select.disabled = device.id === selected || deviceManagementBlocked();
+    select.addEventListener("click", () => selectDashboardDevice(device.id));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "stop";
+    remove.textContent = deviceDeletesInFlight.has(device.id)
+      ? "Deleting…"
+      : "Delete";
+    remove.disabled =
+      deviceDeletesInFlight.has(device.id) || deviceManagementBlocked();
+    remove.addEventListener("click", () => deleteDevice(device, remove));
+    actions.append(select, remove);
+    card.append(heading, details, actions);
+    return card;
+  });
+  $("device-list").replaceChildren(...cards);
+
+  $("device-enrollment-active").hidden = !enrollment.active;
+  $("device-enrollment-form").hidden = true;
+  $("device-add").disabled = !!enrollment.active || deviceManagementBlocked();
+  if (enrollment.active) {
+    $("device-enrollment-target").textContent = enrollment.target_device_id
+      ? `Registering ${enrollment.target_device_id}`
+      : "Pair the phone from its Bluetooth settings";
+    $("device-enrollment-time").textContent = Number.isFinite(
+      enrollment.remaining_seconds,
+    )
+      ? `${Math.max(0, Math.ceil(enrollment.remaining_seconds))} seconds remaining`
+      : "Enrollment window active";
+  }
+}
+
+async function loadDevices() {
+  if (deviceRefreshInFlight || state?.manual_backend !== "raspberry_pi") return;
+  deviceRefreshInFlight = true;
+  try {
+    const nextCatalog = await deviceService.list();
+    const nextSignature = JSON.stringify({
+      devices: nextCatalog.devices,
+      enrollment: nextCatalog.enrollment,
+      default_device: nextCatalog.default_device,
+      selected_device: nextCatalog.selected_device,
+    });
+    deviceCatalog = nextCatalog;
+    setDeviceError();
+    if (nextSignature !== deviceRenderSignature) {
+      deviceRenderSignature = nextSignature;
+      renderDevices();
+      render();
+      window.phoneRecorder?.deviceStateChanged?.();
+    }
+  } catch (error) {
+    setDeviceError(error.message);
+  } finally {
+    deviceRefreshInFlight = false;
+    scheduleDeviceRefresh(
+      !devicePollingStopped &&
+        state?.manual_backend === "raspberry_pi" &&
+        !document.hidden,
+    );
+  }
+}
+
+async function selectDashboardDevice(deviceId) {
+  setDeviceError();
+  if (calibrating) {
+    setDeviceError("Finish or cancel calibration before switching phones.");
+    return;
+  }
+  try {
+    await deviceService.select(deviceId);
+    manual = false;
+    controlVersion++;
+    await refreshStatus();
+    await loadDevices();
+    notice(`Selected ${deviceId}. Calibrate this phone if required.`);
+  } catch (error) {
+    setDeviceError(error.message);
+  }
+}
+
+async function deleteDevice(device, button) {
+  setDeviceError();
+  if (calibrating) {
+    setDeviceError("Finish or cancel calibration before deleting a phone.");
+    return;
+  }
+  if (
+    !window.confirm(
+      `Delete ${device.id}? This will unregister and unpair this phone from the Raspberry Pi.`,
+    )
+  )
+    return;
+  deviceDeletesInFlight.add(device.id);
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  try {
+    const result = await deviceService.remove(device.id);
+    if (Array.isArray(result.devices)) deviceCatalog = result;
+    notice(`Deleted ${device.id} from the Raspberry Pi.`);
+    deviceRenderSignature = null;
+    renderDevices();
+    await loadDevices();
+  } catch (error) {
+    setDeviceError(error.message);
+    // The Pi may report that a device vanished between the poll and delete.
+    // Refresh in every failure case while preserving the server's selection.
+    deviceRenderSignature = null;
+    await loadDevices();
+  } finally {
+    deviceDeletesInFlight.delete(device.id);
+    deviceRenderSignature = null;
+    renderDevices();
+  }
+}
+
 function fresh() {
   return frameId !== null && performance.now() - frameAt < 1800;
 }
@@ -165,7 +395,8 @@ function active() {
     fresh() &&
     !calibrating &&
     state?.control_status !== "automation" &&
-    !state?.pending
+    !state?.pending &&
+    selectedPiDeviceConnected()
   );
 }
 
@@ -210,6 +441,7 @@ function renderKeyboard() {
 
 function render() {
   const piMode = state?.manual_backend === "raspberry_pi";
+  $("devices").hidden = !piMode;
   $("serial").textContent =
     state?.device?.label ||
     state?.device?.serial ||
@@ -277,6 +509,7 @@ function render() {
     !state?.device ||
     !state?.calibrated ||
     automation ||
+    !selectedPiDeviceConnected() ||
     state?.enabled;
 
   $("calibrate").disabled = busy || !fresh() || !state?.device;
@@ -903,11 +1136,16 @@ document.addEventListener("visibilitychange", () => {
   // Background tabs are intentionally low-rate. Restore the normal cadence
   // immediately when Chrome makes the page visible again.
   schedulePreview(document.hidden ? PREVIEW_BACKGROUND_MS : 0);
+  if (document.hidden) scheduleDeviceRefresh(false);
+  else if (state?.manual_backend === "raspberry_pi") loadDevices();
 });
 
 window.addEventListener("pagehide", () => {
   clearInterval(legacyStatusTimer);
   legacyStatusTimer = null;
+  clearTimeout(deviceRefreshTimer);
+  deviceRefreshTimer = null;
+  devicePollingStopped = true;
   // Best effort on close; the server's six-second lease is the fallback.
   if (manual)
     fetch("/api/control", {
@@ -941,11 +1179,49 @@ async function loadStatus() {
     if (!error.transient) notice(`Backend unavailable: ${error.message}`, true);
   }
   await refreshStatus();
+  if (state?.manual_backend === "raspberry_pi") await loadDevices();
   startLegacyStatusPolling();
 }
+
+$("device-add").addEventListener("click", () => {
+  const devices = Array.isArray(deviceCatalog?.devices)
+    ? deviceCatalog.devices
+    : [];
+  $("device-enrollment-id").value = nextDeviceId(devices);
+  $("device-enrollment-form").hidden = false;
+  $("device-enrollment-id").focus();
+  setDeviceError();
+});
+
+$("device-enrollment-cancel").addEventListener("click", () => {
+  $("device-enrollment-form").hidden = true;
+});
+
+$("device-enrollment-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  setDeviceError();
+  try {
+    await deviceService.startEnrollment($("device-enrollment-id").value.trim());
+    await loadDevices();
+  } catch (error) {
+    setDeviceError(error.message);
+  }
+});
+
+$("device-enrollment-stop").addEventListener("click", async () => {
+  setDeviceError();
+  try {
+    await deviceService.stopEnrollment();
+    await loadDevices();
+  } catch (error) {
+    setDeviceError(error.message);
+  }
+});
 window.addEventListener("pageshow", (event) => {
   if (event.persisted) {
+    devicePollingStopped = false;
     refreshStatus();
+    loadDevices();
     startLegacyStatusPolling();
   }
 });

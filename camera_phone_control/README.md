@@ -344,9 +344,9 @@ Without `--serial`, automation selects a phone only when exactly one authorized
 physical USB phone is available. Zero/multiple candidates fail clearly. With
 `--serial`, it validates that exact phone; unauthorized/offline phones, emulators,
 and wireless ADB remain unsupported. The manual dashboard retains its stricter
-single-attached-phone selection. **One tested Android phone remains the current
-hardware scope**; serial selection and lock isolation prepare for future devices,
-not a multi-device dashboard.
+single-attached-phone selection. Raspberry Pi mode supports selecting registered
+logical phones through the dashboard with separate lock and calibration
+identities.
 
 ### Exclusive device ownership
 

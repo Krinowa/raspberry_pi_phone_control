@@ -25,13 +25,24 @@ class RunLog(logging.Handler):
 
 class WorkflowService:
     def __init__(
-        self, controller, locks, external_screen=None, screen_state_provider=None
+        self,
+        controller,
+        locks,
+        external_screen=None,
+        screen_state_provider=None,
+        *,
+        device_id=None,
     ):
         self.controller, self.locks = controller, locks
         self.external_screen = external_screen
         self.screen_state_provider = screen_state_provider
+        self.device_id = device_id
         self.lock = threading.RLock()
         self.runs = {}
+
+    def has_active_run(self):
+        with self.lock:
+            return any(item["thread"].is_alive() for item in self.runs.values())
 
     def start(self, workflow, variables=None):
         workflow = validate_workflow(workflow)
@@ -39,7 +50,7 @@ class WorkflowService:
         resolve_variables(workflow, variables)
         backend_names()
         with self.lock:
-            if any(item["thread"].is_alive() for item in self.runs.values()):
+            if self.has_active_run():
                 raise ValueError(
                     "A workflow is already running. Stop it or wait for completion."
                 )
@@ -72,6 +83,7 @@ class WorkflowService:
                         ).run(workflow, variables),
                         cancel_event=cancel,
                         resume_event=resume,
+                        device_id=self.device_id,
                     )
                 finally:
                     if isinstance(variables, dict):

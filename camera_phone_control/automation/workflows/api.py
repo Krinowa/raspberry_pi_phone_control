@@ -26,7 +26,15 @@ from .storage import WorkflowStorage
 LOG = logging.getLogger("workflow_api")
 
 
-def register_workflows(app, state, payload, client_id, storage=None):
+def register_workflows(
+    app,
+    state,
+    payload,
+    client_id,
+    storage=None,
+    *,
+    device_id=None,
+):
     storage = storage or WorkflowStorage()
     recorder = Recorder()
     lock = state.lock
@@ -48,6 +56,7 @@ def register_workflows(app, state, payload, client_id, storage=None):
         state.device_locks,
         external_screen,
         screen_state_provider,
+        device_id=device_id,
     )
 
     app.extensions.update(
@@ -220,6 +229,13 @@ def register_workflows(app, state, payload, client_id, storage=None):
                 raise ValueError("Save or cancel recording " "before playback.")
 
             with state.lock:
+                if (
+                    state.pi_bridge is not None
+                    and state.selected_pi_connected() is False
+                ):
+                    raise ValueError(
+                        "The selected phone is disconnected. Reconnect it before running a workflow."
+                    )
                 if state.owner and state.owner != client:
                     raise ValueError("Another browser owns " "manual control.")
 

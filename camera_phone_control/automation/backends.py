@@ -28,10 +28,17 @@ def backend_names():
     return input_name, screen_name
 
 
-def select_device(controller, serial=None, *, authorized_only=True, input_backend=None):
+def select_device(
+    controller,
+    serial=None,
+    *,
+    authorized_only=True,
+    input_backend=None,
+    device_id=None,
+):
     input_name = input_backend or backend_names()[0]
     if input_name == "raspberry_pi":
-        target = RaspberryPiInputBridge().target
+        target = RaspberryPiInputBridge(device_id=device_id).target
         if serial is not None and serial != target.serial:
             raise BackendConfigurationError(
                 "Pi input uses PI_API_BASE_URL, not a USB serial."

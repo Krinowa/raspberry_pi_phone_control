@@ -550,6 +550,7 @@
       working ||
       !selected ||
       !!draft ||
+      (piManual() && !window.selectedPiDeviceConnected?.()) ||
       (running && !terminal.has(running.status));
 
     $("mock-recording-preview").hidden =
@@ -1615,6 +1616,9 @@
     },
     ownerId: recorderOwner,
     action: naturalAction,
+    deviceStateChanged: renderRecording,
+    deviceManagementBlocked: () =>
+      recording.active || (running && !terminal.has(running.status)),
   };
 
   async function loadFlows() {

@@ -19,6 +19,29 @@ export PI_API_READ_TIMEOUT=5
 python app.py --camera 0
 ```
 
+The original phone has the stable logical ID `phone_A`. `DeviceConfig` routes
+logical phone IDs through `http://192.168.68.61:8766`; `PI_API_BASE_URL` remains
+the compatible local override. Callers that omit `device_id` use `phone_A`.
+`phone_A` keeps its legacy lock and calibration identity. Other enrolled phones
+receive separate lock and calibration identities while using the same Pi.
+
+Camera calibration is stored per logical device. The original `phone_A` keeps
+the existing `automation/camera_data/calibration.json` file and version-1 JSON
+shape. Additional phones use sibling files such as
+`calibration.phone_B.json` and `calibration.phone_C.json`. Selecting a phone
+clears the previous in-memory transform and loads only the selected phone's file;
+if that file is absent or does not match the camera metadata, calibration is
+required. Deleting calibration removes only the selected phone's file.
+
+The dashboard's **Devices** section manages the Pi registry. **Add Phone** starts
+targeted enrollment for a new logical ID and polls until the phone appears.
+Every registered card has **Delete**, with confirmation; deletion unregisters
+and unpairs the Bluetooth phone but deliberately leaves its calibration file in
+place for future re-enrollment under the same ID. If the selected phone is
+deleted, the dashboard selects `phone_A` when available, otherwise the first
+remaining phone. Replace is supported by the Pi service but is temporarily not
+shown in the dashboard.
+
 Open http://127.0.0.1:8765. Choose the external camera index and allow macOS camera
 access as needed. These environment settings are also the normal manual-control
 defaults. They are read from the process environment, not automatically from a
@@ -32,12 +55,15 @@ network and the phone must already be paired with the proven Pi HID setup.
 ## Check status
 
 The dashboard displays **Pi API: Online** and **Phone HID: Connected** using the
-Pi's `/status` alone, once on dashboard load and once when you explicitly enable
+selected phone's `/devices/<device_id>/status`, once on dashboard load and once when you explicitly enable
 Manual Control. Enabling requires a fresh response reporting the phone HID as
 connected; a failed check or waiting phone leaves input disabled, without retrying.
-The badges retain the last-known status. There is no background Pi polling.
-Actions, lease heartbeats, and ordinary dashboard status requests never check the
-Pi. `/health` remains available in the client for explicit diagnostics.
+The badges retain the last-known status. Actions and lease heartbeats do not add
+status requests. While the dashboard is visible, the Devices section refreshes
+`/devices` once per second, including during enrollment, so connected state and
+Bluetooth metadata update automatically. Polls never overlap and do not change
+a valid current selection. `/health` remains available in the client for
+explicit diagnostics.
 Reload the dashboard to refresh its badges, or request a fresh summary without
 sending phone input:
 
@@ -47,7 +73,7 @@ curl http://127.0.0.1:8765/api/pi/status
 
 Expected: `api` is `online` and `phone` is `connected`. The live Pi returned
 `ok: true` from both endpoints during integration, including `connected: true`
-and `OK connected mode=mt keyboard=yes` from `/status`.
+from `/devices/phone_A/status`.
 
 ## Verify manual controls
 
@@ -102,7 +128,7 @@ remains `appium` or `mock`; it is not migrated to the camera. See
 Existing global mock mode stays hardware-free unless Pi manual mode is explicitly
 selected.
 
-Pi manual input and Pi workflow playback share an endpoint-based lock identity,
+Pi manual input and Pi workflow playback share a per-phone lock identity,
 including Take Over. Legacy automation uses Android serial-based locks, so
 Take Over does not coordinate across these two transports.
 Do not run both against the same phone concurrently. Within each existing lock

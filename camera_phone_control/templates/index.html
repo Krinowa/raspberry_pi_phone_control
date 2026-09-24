@@ -48,6 +48,54 @@
           <span>Phone HID</span><strong id="pi-phone-state">Checking…</strong>
         </div>
       </section>
+      <section id="devices" class="card devices-card" hidden>
+        <div class="section-heading">
+          <div>
+            <h2>Devices</h2>
+            <p class="small">
+              Phones registered with the Raspberry Pi controller.
+            </p>
+          </div>
+          <button id="device-add" type="button">Add Phone</button>
+        </div>
+        <p id="device-state" role="status" aria-live="polite">
+          Loading registered phones…
+        </p>
+        <div id="device-list" class="device-list" aria-live="polite"></div>
+        <form id="device-enrollment-form" class="device-enrollment" hidden>
+          <label>
+            Logical device ID
+            <input
+              id="device-enrollment-id"
+              maxlength="64"
+              pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+              placeholder="phone_B"
+              required
+            />
+          </label>
+          <div class="flow-buttons">
+            <button id="device-enrollment-start" class="primary" type="submit">
+              Start Enrollment
+            </button>
+            <button id="device-enrollment-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+        <div
+          id="device-enrollment-active"
+          class="device-enrollment-active"
+          hidden
+        >
+          <div>
+            <strong>Waiting for phone to pair</strong>
+            <span id="device-enrollment-target"></span>
+          </div>
+          <span id="device-enrollment-time"></span>
+          <button id="device-enrollment-stop" class="stop" type="button">
+            Stop Enrollment
+          </button>
+        </div>
+        <p id="device-error" class="device-error" role="alert" hidden></p>
+      </section>
       <div class="workspace">
         <section class="viewer">
           <div class="section-heading">

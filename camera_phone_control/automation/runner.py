@@ -29,6 +29,7 @@ def now():
 class RunState:
     script_name: str
     device_serial: str | None = None
+    device_id: str | None = None
     status: str = "running"
     start_time: str | None = None
     end_time: str | None = None
@@ -58,28 +59,54 @@ class Runner:
         self.state = None
         self._run_lock = threading.Lock()
 
-    def run(self, script_name, serial=None, *, cancel_event=None):
+    def run(self, script_name, serial=None, *, cancel_event=None, device_id=None):
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("This runner is already running a script.")
         try:
-            return self._run(script_name, serial, cancel_event or threading.Event())
+            return self._run(
+                script_name,
+                serial,
+                cancel_event or threading.Event(),
+                device_id=device_id,
+            )
         finally:
             self._run_lock.release()
 
     def run_task(
-        self, name, task, serial=None, *, cancel_event=None, resume_event=None
+        self,
+        name,
+        task,
+        serial=None,
+        *,
+        cancel_event=None,
+        resume_event=None,
+        device_id=None,
     ):
         """Use the same device ownership lifecycle for data-driven workflows."""
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("This runner is already running.")
         try:
             return self._run(
-                name, serial, cancel_event or threading.Event(), task, resume_event
+                name,
+                serial,
+                cancel_event or threading.Event(),
+                task,
+                resume_event,
+                device_id=device_id,
             )
         finally:
             self._run_lock.release()
 
-    def _run(self, script_name, serial, cancel_event, task=None, resume_event=None):
+    def _run(
+        self,
+        script_name,
+        serial,
+        cancel_event,
+        task=None,
+        resume_event=None,
+        *,
+        device_id=None,
+    ):
         backend_names()  # Fail with an actionable configuration error before discovery.
         script = task or SCRIPTS.get(script_name)
         self.state = state = RunState(
@@ -96,8 +123,9 @@ class Runner:
             if cancel_event.is_set():
                 raise Cancelled()
 
-            device = select_device(self.controller, serial)
+            device = select_device(self.controller, serial, device_id=device_id)
             state.device_serial = device.serial
+            state.device_id = getattr(device, "device_id", None)
 
             if cancel_event.is_set():
                 raise Cancelled()
@@ -223,6 +251,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("script", nargs="?")
     parser.add_argument("--serial", help="Select an authorized physical USB phone")
+    parser.add_argument(
+        "--device-id",
+        help="Select a configured logical phone (defaults to phone_A for Pi input)",
+    )
     parser.add_argument("--list", action="store_true", help="List predefined scripts")
     args = parser.parse_args(argv)
 
@@ -237,7 +269,10 @@ def main(argv=None):
     previous = signal.signal(signal.SIGINT, lambda signum, frame: cancel_event.set())
 
     try:
-        return run(args.script, args.serial, cancel_event=cancel_event).exit_code
+        options = {"cancel_event": cancel_event}
+        if args.device_id is not None:
+            options["device_id"] = args.device_id
+        return run(args.script, args.serial, **options).exit_code
     finally:
         signal.signal(signal.SIGINT, previous)
 

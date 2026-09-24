@@ -45,6 +45,8 @@ class ControlState:
             "message": "Waiting for Pi status.",
         }
         self.pi_status_notice = None
+        self.pi_devices = {}
+        self.pi_catalog_initialized = False
         self.lock = threading.RLock()
         self.action_lock = threading.Lock()
         self.device_locks = device_locks or DeviceLocks()
@@ -117,6 +119,43 @@ class ControlState:
         # Explicit checks only; snapshots, inputs and heartbeats use last-known state.
         self.pi_connection = self.pi_bridge.connection_state()
         return self.pi_connection
+
+    def select_pi_device(self, device_id):
+        """Switch the idle dashboard to another phone on the same Pi."""
+        if self.pi_bridge is None:
+            raise ValueError("Raspberry Pi input is not selected.")
+        self.disable("Phone selection changed. Input disabled.")
+        self.pi_bridge.select_device(device_id)
+        self.refresh_pi_status()
+        self.refresh()
+        return self.pi_bridge.device_id
+
+    def clear_pi_device(self):
+        self.disable("No registered phone is available. Input disabled.")
+        self.pi_bridge.clear_device()
+        self.device = None
+        self.calibration = None
+        self.signature = None
+        self.calibration_restore_key = None
+        self.pi_connection = self.pi_bridge.connection_state()
+
+    def update_pi_devices(self, catalog):
+        devices = catalog.get("devices")
+        if isinstance(devices, list):
+            self.pi_devices = {
+                item["id"]: item
+                for item in devices
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+
+    def selected_pi_connected(self):
+        if self.pi_bridge is None:
+            return None
+        selected = self.pi_bridge.device_id
+        if selected is None:
+            return False
+        details = self.pi_devices.get(selected)
+        return details.get("connected") if isinstance(details, dict) else None
 
     def refresh(self):
         errors = []
@@ -273,6 +312,7 @@ def create_app(
     manual_backend=None,
     pi_client=None,
     calibration_storage=None,
+    device_id=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -281,7 +321,9 @@ def create_app(
     if manual_backend not in {"raspberry_pi", "appium"}:
         raise ValueError("PHONE_MANUAL_INPUT_BACKEND must be raspberry_pi or appium.")
     pi_bridge = (
-        RaspberryPiInputBridge(pi_client) if manual_backend == "raspberry_pi" else None
+        RaspberryPiInputBridge(pi_client, device_id=device_id)
+        if manual_backend == "raspberry_pi"
+        else None
     )
     app = Flask(__name__)
     app.config.update(
@@ -364,7 +406,9 @@ def create_app(
         with state.lock:
             state.disable(str(exc))
         LOG.warning("%s", exc)
-        return jsonify(error=str(exc)), 409
+        return jsonify(error=str(exc)), (
+            404 if getattr(exc, "http_status", None) == 404 else 409
+        )
 
     @app.errorhandler(DeviceBusy)
     def device_busy(exc):
@@ -429,6 +473,192 @@ def create_app(
             )
         with state.lock:
             return jsonify(state.refresh_pi_status())
+
+    def require_pi_bridge():
+        if state.pi_bridge is None:
+            raise ValueError("Device management requires Raspberry Pi input.")
+        return state.pi_bridge
+
+    def registered_pi_devices():
+        bridge = require_pi_bridge()
+        catalog = bridge.devices()
+        devices = catalog.get("devices")
+        if not isinstance(devices, list):
+            raise PiApiError("Pi /devices response is missing the device list.")
+        return (
+            bridge,
+            catalog,
+            {
+                item.get("id")
+                for item in devices
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            },
+        )
+
+    @app.get("/api/devices")
+    def pi_devices():
+        bridge = require_pi_bridge()
+        result = dict(bridge.devices())
+        devices = result.get("devices")
+        with state.lock:
+            first_catalog = not state.pi_catalog_initialized
+            state.pi_catalog_initialized = True
+            state.update_pi_devices(result)
+            registered = (
+                [
+                    item.get("id")
+                    for item in devices
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                ]
+                if isinstance(devices, list)
+                else []
+            )
+            workflow_service = app.extensions.get("workflow_service")
+            recorder = app.extensions.get("workflow_recorder")
+            active_work = (
+                workflow_service is not None and workflow_service.has_active_run()
+            ) or (recorder is not None and recorder.active)
+            if first_catalog and bridge.device_id not in registered and not active_work:
+                fallback = (
+                    "phone_A"
+                    if "phone_A" in registered
+                    else (registered[0] if registered else None)
+                )
+                if fallback is None:
+                    state.clear_pi_device()
+                else:
+                    selected = state.select_pi_device(fallback)
+                    if workflow_service is not None:
+                        workflow_service.device_id = selected
+            result["selected_device"] = bridge.device_id
+        return jsonify(result)
+
+    @app.get("/api/devices/<device_id>/status")
+    def pi_device_status(device_id):
+        return jsonify(require_pi_bridge().device_status(device_id))
+
+    @app.post("/api/devices/select")
+    def select_pi_device():
+        data = payload()
+        if set(data) != {"device_id"}:
+            raise ValueError("Expected device_id only.")
+        bridge, _, registered = registered_pi_devices()
+        if data["device_id"] not in registered:
+            raise ValueError("Select a registered phone returned by the Pi.")
+        workflow_service = app.extensions.get("workflow_service")
+        recorder = app.extensions.get("workflow_recorder")
+        with state.lock:
+            if workflow_service is not None and workflow_service.has_active_run():
+                raise ValueError(
+                    "Wait for the active workflow to finish before switching phones."
+                )
+            if recorder is not None and recorder.active:
+                raise ValueError(
+                    "Stop or discard the recording before switching phones."
+                )
+            selected = state.select_pi_device(data["device_id"])
+            if workflow_service is not None:
+                workflow_service.device_id = selected
+            return jsonify(ok=True, selected_device=selected)
+
+    @app.get("/api/enrollment")
+    def pi_enrollment():
+        return jsonify(require_pi_bridge().enrollment())
+
+    @app.post("/api/enrollment/start")
+    def start_pi_enrollment():
+        data = payload()
+        if set(data) != {"target_device_id"}:
+            raise ValueError("Expected target_device_id only.")
+        bridge, _, registered = registered_pi_devices()
+        if data["target_device_id"] in registered:
+            raise ValueError(
+                "This device ID is already registered. Use Replace on its device card."
+            )
+        return jsonify(bridge.start_enrollment(data["target_device_id"]))
+
+    @app.post("/api/enrollment/stop")
+    def stop_pi_enrollment():
+        data = payload()
+        if data:
+            raise ValueError("Stop Enrollment expects an empty JSON object.")
+        return jsonify(require_pi_bridge().stop_enrollment())
+
+    @app.post("/api/devices/<device_id>/replace")
+    def replace_pi_device(device_id):
+        data = payload()
+        if data:
+            raise ValueError("Replace expects an empty JSON object.")
+        bridge, _, registered = registered_pi_devices()
+        if device_id not in registered:
+            raise ValueError(
+                "Replace is available only for a registered phone. Use Add Phone first."
+            )
+        return jsonify(bridge.replace_device(device_id))
+
+    @app.delete("/api/devices/<device_id>")
+    def delete_pi_device(device_id):
+        data = payload()
+        if data:
+            raise ValueError("Delete Phone expects an empty JSON object.")
+        bridge = require_pi_bridge()
+        workflow_service = app.extensions.get("workflow_service")
+        recorder = app.extensions.get("workflow_recorder")
+        with state.lock:
+            if workflow_service is not None and workflow_service.has_active_run():
+                raise ValueError(
+                    "Wait for the active workflow to finish before deleting a phone."
+                )
+            if recorder is not None and recorder.active:
+                raise ValueError(
+                    "Stop or discard the recording before deleting a phone."
+                )
+
+        _, _, registered = registered_pi_devices()
+        if device_id not in registered:
+            raise PiApiError(
+                f"Pi device {device_id!r} is not registered.",
+                http_status=404,
+            )
+        try:
+            result = bridge.delete_device(device_id)
+        except PiApiError as exc:
+            if exc.http_status != 404:
+                raise
+            # It existed in the immediately preceding catalog, so a 404 here
+            # means it disappeared during the delete race. Reconcile normally.
+            result = {"ok": True, "already_deleted": True}
+        catalog = bridge.devices()
+        devices = catalog.get("devices")
+        if not isinstance(devices, list):
+            raise PiApiError("Pi /devices response is missing the device list.")
+        remaining = [
+            item.get("id")
+            for item in devices
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+
+        with state.lock:
+            state.update_pi_devices(catalog)
+            if bridge.device_id == device_id:
+                fallback = (
+                    "phone_A"
+                    if "phone_A" in remaining
+                    else (remaining[0] if remaining else None)
+                )
+                if fallback is None:
+                    state.clear_pi_device()
+                    if workflow_service is not None:
+                        workflow_service.device_id = None
+                else:
+                    selected = state.select_pi_device(fallback)
+                    if workflow_service is not None:
+                        workflow_service.device_id = selected
+
+        response = dict(result)
+        response.update(catalog)
+        response["selected_device"] = bridge.device_id
+        return jsonify(response)
 
     @app.get("/api/frame")
     def frame():
@@ -611,7 +841,10 @@ def create_app(
             if request.method == "DELETE":
                 if state.calibration_storage is not None:
                     try:
-                        state.calibration_storage.clear()
+                        calibration_device = state.device or (
+                            state.pi_bridge.target if state.pi_bridge else None
+                        )
+                        state.calibration_storage.clear(calibration_device)
                     except OSError as exc:
                         LOG.error("Could not clear saved camera calibration: %s", exc)
                         raise ValueError(
@@ -813,7 +1046,14 @@ def create_app(
         finally:
             state.action_lock.release()
 
-    register_workflows(app, state, payload, client_id, workflow_storage)
+    register_workflows(
+        app,
+        state,
+        payload,
+        client_id,
+        workflow_storage,
+        device_id=device_id,
+    )
     return app
 
 
