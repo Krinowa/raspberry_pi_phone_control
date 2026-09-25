@@ -12,6 +12,19 @@ import cv2
 LOG = logging.getLogger("camera")
 
 
+def rotate_frame(frame, rotation):
+    """Apply one configured clockwise rotation to a raw camera frame."""
+    if rotation == 0:
+        return frame
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError("Camera rotation must be 0, 90, 180, or 270 degrees.")
+
+
 class Camera:
     def __init__(
         self,
@@ -50,6 +63,8 @@ class Camera:
         self._debug_encode_seconds = 0.0
 
     def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
         self.thread = threading.Thread(
             target=self._capture,
             daemon=True,
@@ -141,24 +156,10 @@ class Camera:
                         "Check the camera stream/network and restart the server."
                     )
 
-                # Rotate camera image before displaying it.
-                if self.rotate == 90:
-                    frame = cv2.rotate(
-                        frame,
-                        cv2.ROTATE_90_CLOCKWISE,
-                    )
-
-                elif self.rotate == 180:
-                    frame = cv2.rotate(
-                        frame,
-                        cv2.ROTATE_180,
-                    )
-
-                elif self.rotate == 270:
-                    frame = cv2.rotate(
-                        frame,
-                        cv2.ROTATE_90_COUNTERCLOCKWISE,
-                    )
+                # Rotate exactly once, before the shared JPEG is stored. Preview,
+                # calibration, OCR, stability checks, and frame APIs all consume
+                # this same encoded frame and its rotated dimensions.
+                frame = rotate_frame(frame, self.rotate)
 
                 encode_started = time.monotonic()
                 ok, encoded = cv2.imencode(

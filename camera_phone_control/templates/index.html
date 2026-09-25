@@ -53,7 +53,7 @@
           <div>
             <h2>Devices</h2>
             <p class="small">
-              Phones registered with the Raspberry Pi controller.
+              Monitor every phone camera and choose one control target.
             </p>
           </div>
           <button id="device-add" type="button">Add Phone</button>
@@ -96,6 +96,78 @@
         </div>
         <p id="device-error" class="device-error" role="alert" hidden></p>
       </section>
+      <div
+        id="camera-settings-dialog"
+        class="modal-backdrop"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="camera-settings-title"
+        hidden
+      >
+        <form id="camera-settings-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">DEVICE CAMERA</p>
+              <h2 id="camera-settings-title">Camera Settings</h2>
+            </div>
+            <button id="camera-settings-close" type="button" aria-label="Close">
+              ×
+            </button>
+          </div>
+          <label>
+            Camera source
+            <input
+              id="camera-settings-source"
+              list="camera-source-options"
+              maxlength="2048"
+              placeholder="0 or camera URL"
+              required
+            />
+            <datalist id="camera-source-options"></datalist>
+          </label>
+          <label>
+            Rotation
+            <select id="camera-settings-rotation">
+              <option value="0">0°</option>
+              <option value="90">90°</option>
+              <option value="180">180°</option>
+              <option value="270">270°</option>
+            </select>
+          </label>
+          <label class="check">
+            <input id="camera-settings-enabled" type="checkbox" /> Enabled
+          </label>
+          <p
+            id="camera-settings-status"
+            class="camera-settings-status"
+            role="status"
+          >
+            Loading camera status…
+          </p>
+          <div id="camera-test-preview" class="camera-test-preview">
+            <img id="camera-test-image" alt="Test camera preview" hidden />
+            <span id="camera-test-placeholder"
+              >Test the camera to preview it here.</span
+            >
+          </div>
+          <p
+            id="camera-settings-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+          <div class="flow-buttons">
+            <button id="camera-settings-refresh" type="button">
+              Refresh Cameras
+            </button>
+            <button id="camera-settings-test" type="button">Test Camera</button>
+            <button id="camera-settings-save" class="primary" type="submit">
+              Save
+            </button>
+            <button id="camera-settings-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
       <div class="workspace">
         <section class="viewer">
           <div class="section-heading">

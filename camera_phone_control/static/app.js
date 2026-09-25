@@ -37,11 +37,15 @@ let previewDebugWindow = null;
 let previewTimer = null;
 let previewInFlight = false;
 let deviceCatalog = null;
+let deviceCameraDetails = {};
 let deviceRefreshInFlight = false;
 let deviceRefreshTimer = null;
 let deviceRenderSignature = null;
 let devicePollingStopped = false;
 const deviceDeletesInFlight = new Set();
+const devicePreviewTimers = new Map();
+let devicePreviewGeneration = 0;
+let cameraSettingsDeviceId = null;
 const DEVICE_REFRESH_MS = 1000;
 const PREVIEW_INTERVAL_MS = 65;
 const PREVIEW_ERROR_RETRY_MS = 600;
@@ -170,6 +174,31 @@ const deviceService = {
   stopEnrollment: () => api("/api/enrollment/stop", {}),
   remove: (deviceId) =>
     api(`/api/devices/${encodeURIComponent(deviceId)}`, {}, "DELETE"),
+  camera: (deviceId) =>
+    api(
+      `/api/devices/${encodeURIComponent(deviceId)}/camera`,
+      undefined,
+      "GET",
+      {
+        monitor: false,
+      },
+    ),
+  updateCamera: (deviceId, settings) =>
+    api(`/api/devices/${encodeURIComponent(deviceId)}/camera`, settings, "PUT"),
+  discoverCameras: (refresh = false) =>
+    api(
+      refresh ? "/api/cameras?refresh=true" : "/api/cameras",
+      undefined,
+      "GET",
+      { monitor: false },
+    ),
+  testCamera: (cameraSource, rotation) =>
+    api(
+      "/api/cameras/test",
+      { camera_source: cameraSource, rotation },
+      "POST",
+      { monitor: false },
+    ),
 };
 
 function setDeviceError(message = "") {
@@ -218,17 +247,89 @@ function deviceManagementBlocked() {
   );
 }
 
+function cameraState(details) {
+  const config = details?.config;
+  if (
+    !config ||
+    config.camera_source === null ||
+    config.camera_source === undefined
+  )
+    return { label: "Unassigned", className: "" };
+  if (!config.enabled) return { label: "Disabled", className: "" };
+  return details?.status?.ready
+    ? { label: "Available", className: "connected" }
+    : { label: "Unavailable", className: "" };
+}
+
+function applyCameraPreviewGeometry(preview, width, height) {
+  preview.className = preview.className
+    .split(/\s+/)
+    .filter((name) => name && name !== "portrait" && name !== "landscape")
+    .join(" ");
+  preview.style.aspectRatio = "";
+  preview.style.maxWidth = "";
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0
+  )
+    return;
+
+  preview.className += height > width ? " portrait" : " landscape";
+  preview.style.aspectRatio = `${width} / ${height}`;
+  // Constrain the width that corresponds to a 460px-tall frame. Combined
+  // with width: 100%, this preserves the source ratio in narrow cards too.
+  preview.style.maxWidth = `${Math.round((460 * width) / height)}px`;
+}
+
+function stopDevicePreviews() {
+  devicePreviewGeneration++;
+  for (const timer of devicePreviewTimers.values()) clearTimeout(timer);
+  devicePreviewTimers.clear();
+}
+
+function startDevicePreview(deviceId, image, placeholder) {
+  // Unit-test DOM shims do not decode images. Avoid creating background timers there.
+  if (typeof image.decode !== "function") return;
+  const generation = devicePreviewGeneration;
+  const schedule = (delay) => {
+    if (generation !== devicePreviewGeneration || devicePollingStopped) return;
+    const timer = setTimeout(() => {
+      if (document.hidden) return schedule(PREVIEW_BACKGROUND_MS);
+      image.src = `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`;
+    }, delay);
+    devicePreviewTimers.set(deviceId, timer);
+  };
+  image.addEventListener("load", () => {
+    placeholder.hidden = true;
+    image.hidden = false;
+    schedule(333);
+  });
+  image.addEventListener("error", () => {
+    image.hidden = true;
+    placeholder.hidden = false;
+    placeholder.textContent = "Camera unavailable";
+    schedule(1000);
+  });
+  image.src = `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`;
+}
+
 function renderDevices() {
+  stopDevicePreviews();
   const devices = Array.isArray(deviceCatalog?.devices)
     ? deviceCatalog.devices
     : [];
   const enrollment = deviceCatalog?.enrollment || { active: false };
   const selected = deviceCatalog?.selected_device;
   $("device-state").textContent = devices.length
-    ? `${devices.length} registered phone${devices.length === 1 ? "" : "s"}. Select which phone this dashboard controls.`
+    ? `${devices.length} registered phone${devices.length === 1 ? "" : "s"}. All cameras remain visible; one phone receives control.`
     : "No phones are registered with this Pi yet.";
 
   const cards = devices.map((device) => {
+    const details = deviceCameraDetails?.[device.id] || {};
+    const camera = details.config || {};
+    const status = cameraState(details);
     const card = document.createElement("article");
     card.className =
       "device-item" + (device.id === selected ? " selected" : "");
@@ -237,38 +338,86 @@ function renderDevices() {
     heading.className = "device-item-heading";
     const name = document.createElement("h3");
     name.textContent = device.name || device.id;
-    heading.append(name);
+    const badges = document.createElement("div");
+    badges.className = "device-badges";
     if (device.default || device.id === deviceCatalog.default_device) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = "Default";
-      heading.append(badge);
+      badges.append(badge);
     }
+    if (device.id === selected) {
+      const badge = document.createElement("span");
+      badge.className = "badge control-target";
+      badge.textContent = "Control target";
+      badges.append(badge);
+    }
+    heading.append(name, badges);
 
-    const details = document.createElement("dl");
-    const addDetail = (label, value, className = "") => {
-      const term = document.createElement("dt");
-      const description = document.createElement("dd");
-      term.textContent = label;
-      description.textContent = value;
-      description.className = className;
-      details.append(term, description);
-    };
-    addDetail("Device ID", device.id || "—");
-    addDetail(
-      "Status",
-      device.connected ? "Connected" : "Disconnected",
-      "device-status" + (device.connected ? " connected" : ""),
+    const states = document.createElement("div");
+    states.className = "device-states";
+    const bluetooth = document.createElement("span");
+    bluetooth.className =
+      "device-status" + (device.connected ? " connected" : "");
+    bluetooth.textContent = `Bluetooth: ● ${device.connected ? "Connected" : "Disconnected"}`;
+    const cameraStatus = document.createElement("span");
+    cameraStatus.className = "device-status " + status.className;
+    cameraStatus.textContent = `Camera: ● ${status.label}`;
+    states.append(bluetooth, cameraStatus);
+
+    const mac = document.createElement("p");
+    mac.className = "device-mac";
+    mac.textContent = device.bluetooth_address || "Bluetooth MAC not paired";
+
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.className = "device-preview";
+    applyCameraPreviewGeometry(
+      preview,
+      details.status?.width,
+      details.status?.height,
     );
-    addDetail("Bluetooth MAC", device.bluetooth_address || "Not paired");
+    preview.disabled = device.id === selected || deviceManagementBlocked();
+    preview.setAttribute?.(
+      "aria-label",
+      `Select ${device.name || device.id} for control`,
+    );
+    const previewImage = document.createElement("img");
+    previewImage.alt = `${device.name || device.id} live camera preview`;
+    previewImage.hidden = true;
+    const previewPlaceholder = document.createElement("span");
+    previewPlaceholder.textContent =
+      status.label === "Available"
+        ? "Loading camera…"
+        : `Camera ${status.label.toLowerCase()}`;
+    preview.append(previewImage, previewPlaceholder);
+    preview.addEventListener("click", () => selectDashboardDevice(device.id));
+    if (
+      camera.enabled &&
+      camera.camera_source !== null &&
+      camera.camera_source !== undefined
+    )
+      startDevicePreview(device.id, previewImage, previewPlaceholder);
+
+    const summary = document.createElement("p");
+    summary.className = "camera-summary";
+    summary.textContent =
+      camera.camera_source === null || camera.camera_source === undefined
+        ? "No camera assigned"
+        : `Camera ${camera.camera_source} · ${camera.rotation ?? 0}°`;
 
     const actions = document.createElement("div");
     actions.className = "device-item-actions";
     const select = document.createElement("button");
     select.type = "button";
-    select.textContent = device.id === selected ? "Selected" : "Select";
+    select.textContent = device.id === selected ? "Controlling" : "Select";
     select.disabled = device.id === selected || deviceManagementBlocked();
     select.addEventListener("click", () => selectDashboardDevice(device.id));
+    const settings = document.createElement("button");
+    settings.type = "button";
+    settings.textContent = "Camera Settings";
+    settings.disabled = deviceManagementBlocked();
+    settings.addEventListener("click", () => openCameraSettings(device));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "stop";
@@ -278,8 +427,8 @@ function renderDevices() {
     remove.disabled =
       deviceDeletesInFlight.has(device.id) || deviceManagementBlocked();
     remove.addEventListener("click", () => deleteDevice(device, remove));
-    actions.append(select, remove);
-    card.append(heading, details, actions);
+    actions.append(select, settings, remove);
+    card.append(heading, states, mac, preview, summary, actions);
     return card;
   });
   $("device-list").replaceChildren(...cards);
@@ -304,13 +453,34 @@ async function loadDevices() {
   deviceRefreshInFlight = true;
   try {
     const nextCatalog = await deviceService.list();
+    deviceCatalog = nextCatalog;
+    const devices = Array.isArray(nextCatalog.devices)
+      ? nextCatalog.devices
+      : [];
+    const cameraEntries = await Promise.all(
+      devices.map(async (device) => {
+        try {
+          return [device.id, await deviceService.camera(device.id)];
+        } catch (error) {
+          return [
+            device.id,
+            {
+              config: null,
+              status: { ready: false, error: error.message },
+            },
+          ];
+        }
+      }),
+    );
+    const nextCameras = Object.fromEntries(cameraEntries);
     const nextSignature = JSON.stringify({
       devices: nextCatalog.devices,
       enrollment: nextCatalog.enrollment,
       default_device: nextCatalog.default_device,
       selected_device: nextCatalog.selected_device,
+      cameras: nextCameras,
     });
-    deviceCatalog = nextCatalog;
+    deviceCameraDetails = nextCameras;
     setDeviceError();
     if (nextSignature !== deviceRenderSignature) {
       deviceRenderSignature = nextSignature;
@@ -337,6 +507,7 @@ async function selectDashboardDevice(deviceId) {
     return;
   }
   try {
+    clearPreview(`Switching to ${deviceId} camera…`);
     await deviceService.select(deviceId);
     manual = false;
     controlVersion++;
@@ -346,6 +517,169 @@ async function selectDashboardDevice(deviceId) {
   } catch (error) {
     setDeviceError(error.message);
   }
+}
+
+function setCameraSettingsError(message = "") {
+  $("camera-settings-error").textContent = message;
+  $("camera-settings-error").hidden = !message;
+}
+
+function closeCameraSettings() {
+  cameraSettingsDeviceId = null;
+  $("camera-settings-dialog").hidden = true;
+  $("camera-test-image").hidden = true;
+  $("camera-test-placeholder").hidden = false;
+  applyCameraPreviewGeometry($("camera-test-preview"));
+  setCameraSettingsError();
+}
+
+function cameraSourceValue(value) {
+  return /^\d+$/.test(value) ? Number(value) : value;
+}
+
+function populateCameraSources(cameras, current) {
+  const input = $("camera-settings-source");
+  const list = $("camera-source-options");
+  const values = new Set();
+  const options = [];
+  for (const camera of cameras || []) {
+    values.add(String(camera.source));
+    const option = document.createElement("option");
+    option.value = String(camera.source);
+    option.textContent = `Camera ${camera.source} — ${camera.available ? "Available" : "Unavailable"}`;
+    options.push(option);
+  }
+  if (
+    current !== null &&
+    current !== undefined &&
+    !values.has(String(current))
+  ) {
+    const option = document.createElement("option");
+    option.value = String(current);
+    option.textContent = `Saved source ${current} — Unavailable`;
+    options.unshift(option);
+  }
+  list.replaceChildren(...options);
+  input.value = String(current ?? options[0]?.value ?? "");
+}
+
+async function openCameraSettings(device) {
+  cameraSettingsDeviceId = device.id;
+  const details = deviceCameraDetails?.[device.id] || {};
+  const config = details.config || {};
+  $("camera-settings-title").textContent =
+    `Camera Settings · ${device.name || device.id}`;
+  $("camera-settings-rotation").value = String(config.rotation ?? 0);
+  $("camera-settings-enabled").checked = config.enabled === true;
+  $("camera-settings-status").textContent = cameraState(details).label;
+  populateCameraSources([], config.camera_source);
+  $("camera-settings-dialog").hidden = false;
+  setCameraSettingsError();
+  await refreshCameraSources(false, device.id, config.camera_source);
+}
+
+async function refreshCameraSources(
+  force = true,
+  deviceId = cameraSettingsDeviceId,
+  current = $("camera-settings-source").value,
+) {
+  const button = $("camera-settings-refresh");
+  button.disabled = true;
+  try {
+    const discovery = await deviceService.discoverCameras(force);
+    if (cameraSettingsDeviceId !== deviceId) return;
+    populateCameraSources(discovery.cameras, current);
+  } catch (error) {
+    if (cameraSettingsDeviceId === deviceId)
+      setCameraSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function testCameraSettings() {
+  const button = $("camera-settings-test");
+  const save = $("camera-settings-save");
+  button.disabled = true;
+  save.disabled = true;
+  setCameraSettingsError();
+  try {
+    const result = await deviceService.testCamera(
+      cameraSourceValue($("camera-settings-source").value),
+      Number($("camera-settings-rotation").value),
+    );
+    $("camera-settings-status").textContent = "Available";
+    applyCameraPreviewGeometry(
+      $("camera-test-preview"),
+      result.width,
+      result.height,
+    );
+    $("camera-test-image").src = result.preview || "";
+    $("camera-test-image").hidden = !result.preview;
+    $("camera-test-placeholder").hidden = !!result.preview;
+  } catch (error) {
+    $("camera-settings-status").textContent = "Unavailable";
+    applyCameraPreviewGeometry($("camera-test-preview"));
+    $("camera-test-image").hidden = true;
+    $("camera-test-placeholder").hidden = false;
+    $("camera-test-placeholder").textContent = "Camera test failed";
+    setCameraSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+    save.disabled = false;
+  }
+}
+
+async function saveDeviceCamera(event) {
+  event.preventDefault();
+  const deviceId = cameraSettingsDeviceId;
+  if (!deviceId) return;
+  const button = $("camera-settings-save");
+  const test = $("camera-settings-test");
+  button.disabled = true;
+  test.disabled = true;
+  setCameraSettingsError();
+  try {
+    const result = await deviceService.updateCamera(deviceId, {
+      camera_source: cameraSourceValue($("camera-settings-source").value),
+      rotation: Number($("camera-settings-rotation").value),
+      enabled: $("camera-settings-enabled").checked,
+    });
+    const selected = deviceId === deviceCatalog?.selected_device;
+    if (selected) {
+      manual = false;
+      calibrating = false;
+      corners = [];
+      clearPreview("Waiting for the assigned camera…");
+    }
+    closeCameraSettings();
+    deviceRenderSignature = null;
+    await refreshStatus();
+    await loadDevices();
+    if (result.calibration_revalidation_required) {
+      notice(
+        "Camera configuration changed. Existing screen calibration may no longer match. Recalibrate before control.",
+      );
+      if (selected) $("calibrate").textContent = "Recalibrate";
+    } else {
+      notice(`Camera settings saved for ${deviceId}.`);
+    }
+  } catch (error) {
+    setCameraSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+    test.disabled = false;
+  }
+}
+
+function clearPreview(message = "Waiting for camera access…") {
+  bitmap?.close();
+  bitmap = null;
+  frameId = null;
+  frameAt = 0;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $("video-placeholder").textContent = message;
+  $("video-placeholder").classList.remove("hidden");
 }
 
 async function deleteDevice(device, button) {
@@ -441,9 +775,12 @@ function renderKeyboard() {
 
 function render() {
   const piMode = state?.manual_backend === "raspberry_pi";
+  const selectedDevice = selectedPiDevice();
   $("devices").hidden = !piMode;
   $("serial").textContent =
-    state?.device?.label ||
+    (piMode && selectedDevice
+      ? `Controlling: ${selectedDevice.name || selectedDevice.id}`
+      : state?.device?.label) ||
     state?.device?.serial ||
     (piMode ? "Bluetooth phone unavailable" : "No authorized USB phone");
   $("pi-connection").hidden = !piMode;
@@ -779,8 +1116,12 @@ async function videoLoop() {
   let succeeded = false;
   const cycleStarted = performance.now();
   try {
+    const requestedDevice = deviceCatalog?.selected_device || null;
+    const framePath = requestedDevice
+      ? `/api/devices/${encodeURIComponent(requestedDevice)}/camera/frame`
+      : "/api/frame";
     const previewStarted = performance.now();
-    const response = await fetch("/api/frame", {
+    const response = await fetch(framePath, {
       cache: "no-store",
       signal: AbortSignal.timeout(4000),
     });
@@ -793,6 +1134,11 @@ async function videoLoop() {
     const bodyAt = performance.now();
     const next = await createImageBitmap(body);
     const decodedAt = performance.now();
+    if (requestedDevice !== (deviceCatalog?.selected_device || null)) {
+      next.close();
+      succeeded = true;
+      return;
+    }
 
     if (
       bitmap &&
@@ -1141,6 +1487,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("pagehide", () => {
+  stopDevicePreviews();
   clearInterval(legacyStatusTimer);
   legacyStatusTimer = null;
   clearTimeout(deviceRefreshTimer);
@@ -1216,6 +1563,16 @@ $("device-enrollment-stop").addEventListener("click", async () => {
   } catch (error) {
     setDeviceError(error.message);
   }
+});
+$("camera-settings-form").addEventListener("submit", saveDeviceCamera);
+$("camera-settings-test").addEventListener("click", testCameraSettings);
+$("camera-settings-refresh").addEventListener("click", () =>
+  refreshCameraSources(true),
+);
+$("camera-settings-cancel").addEventListener("click", closeCameraSettings);
+$("camera-settings-close").addEventListener("click", closeCameraSettings);
+$("camera-settings-dialog").addEventListener("click", (event) => {
+  if (event.target === $("camera-settings-dialog")) closeCameraSettings();
 });
 window.addEventListener("pageshow", (event) => {
   if (event.persisted) {

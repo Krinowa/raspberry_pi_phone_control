@@ -348,6 +348,30 @@ single-attached-phone selection. Raspberry Pi mode supports selecting registered
 logical phones through the dashboard with separate lock and calibration
 identities.
 
+Logical phones can also use separate external cameras. Camera assignments are
+stored in `automation/camera_data/cameras.json`; the selected phone controls the
+main preview, calibration, OCR, recorder capture, and workflow screen observer.
+Configure source `0` for `phone_A`, source `1` for `phone_B`, or any supported
+OpenCV camera URL through **Camera Settings** on its device card. The Devices
+grid shows every registered phone's monitoring preview and keeps Bluetooth and
+camera availability as separate states. Selecting a card changes the control
+target while the other previews remain visible. **Test Camera** checks a source
+and displays a temporary frame without saving the assignment.
+
+Changing source or rotation invalidates only that phone's in-memory calibration
+and prompts for recalibration; its saved calibration file is retained.
+`GET /api/cameras?probe=true` checks
+local indexes 0–10 without retaining probe handles. On macOS, AVFoundation camera
+indexes may differ from ffmpeg enumeration. Monitoring previews run at a modest
+rate, the selected main preview runs at the normal rate, and OCR remains
+request-driven through the single persistent OCR worker.
+Camera discovery runs only when Camera Settings requests it. Results are cached
+for 20 seconds; **Refresh Cameras** explicitly refreshes the probe. The one-second
+device poll reads assigned-camera status and does not probe indexes 0–10. The
+discovery list includes an index only after OpenCV opens it and reads a frame.
+An unavailable saved assignment remains visible as unavailable but is never
+silently replaced.
+
 ### Exclusive device ownership
 
 Each serial has an OS ownership lock shared by dashboard and runner processes

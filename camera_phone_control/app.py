@@ -1,6 +1,7 @@
 """Local external-camera dashboard. Every Android input comes from a browser action."""
 
 import argparse
+import base64
 import logging
 import os
 import secrets
@@ -16,6 +17,12 @@ from werkzeug.exceptions import HTTPException
 from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration, CalibrationStorage
 from camera import Camera
+from camera_manager import (
+    CameraConfig,
+    CameraManager,
+    CameraManagerError,
+    UnavailableCamera,
+)
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
 from automation.context import AutomationContext
@@ -36,8 +43,10 @@ class ControlState:
         *,
         pi_bridge=None,
         calibration_storage=None,
+        camera_manager=None,
     ):
         self.android, self.camera = android, camera
+        self.camera_manager = camera_manager
         self.pi_bridge = pi_bridge
         self.pi_connection = {
             "api": "offline",
@@ -126,6 +135,11 @@ class ControlState:
             raise ValueError("Raspberry Pi input is not selected.")
         self.disable("Phone selection changed. Input disabled.")
         self.pi_bridge.select_device(device_id)
+        if self.camera_manager is not None:
+            self.camera = self.camera_manager.activate(device_id)
+        self.calibration = None
+        self.signature = None
+        self.calibration_restore_key = None
         self.refresh_pi_status()
         self.refresh()
         return self.pi_bridge.device_id
@@ -133,6 +147,12 @@ class ControlState:
     def clear_pi_device(self):
         self.disable("No registered phone is available. Input disabled.")
         self.pi_bridge.clear_device()
+        if self.camera_manager is not None:
+            self.camera_manager.release_all()
+            self.camera = UnavailableCamera(
+                CameraConfig("phone_A", None, 0, False),
+                "Select a registered phone before using its camera.",
+            )
         self.device = None
         self.calibration = None
         self.signature = None
@@ -313,6 +333,7 @@ def create_app(
     pi_client=None,
     calibration_storage=None,
     device_id=None,
+    camera_manager=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -325,6 +346,26 @@ def create_app(
         if manual_backend == "raspberry_pi"
         else None
     )
+    selected_camera_device = pi_bridge.device_id if pi_bridge is not None else "phone_A"
+    if not isinstance(selected_camera_device, str):
+        selected_camera_device = "phone_A"
+    if camera_manager is None:
+        legacy_source = getattr(camera, "source", 0)
+        if not isinstance(legacy_source, (int, str)) or isinstance(legacy_source, bool):
+            legacy_source = 0
+        legacy_rotation = getattr(camera, "rotate", 0)
+        if legacy_rotation not in {0, 90, 180, 270}:
+            legacy_rotation = 0
+        camera_manager = CameraManager(
+            default_source=legacy_source,
+            default_rotation=legacy_rotation,
+            default_camera=camera,
+            # Existing test/adaptor cameras may intentionally represent one
+            # shared feed. A real Camera must be managed per device so saved
+            # source and rotation changes rebuild the actual frame pipeline.
+            shared_camera=not isinstance(camera, Camera),
+        )
+    camera = camera_manager.activate(selected_camera_device)
     app = Flask(__name__)
     app.config.update(
         MAX_CONTENT_LENGTH=1024 * 1024, TRUSTED_HOSTS=["localhost", "127.0.0.1"]
@@ -360,8 +401,10 @@ def create_app(
         device_locks,
         pi_bridge=pi_bridge,
         calibration_storage=calibration_storage,
+        camera_manager=camera_manager,
     )
     app.extensions["control_state"] = state
+    app.extensions["camera_manager"] = camera_manager
     app.config["CONTROL_TOKEN"] = token
 
     @app.before_request
@@ -398,7 +441,12 @@ def create_app(
 
     @app.errorhandler(ValueError)
     def invalid_input(exc):
-        return jsonify(error=str(exc)), 400
+        return jsonify(ok=False, error=str(exc)), 400
+
+    @app.errorhandler(CameraManagerError)
+    def camera_error(exc):
+        LOG.warning("Camera operation failed: %s", exc)
+        return jsonify(ok=False, error=str(exc)), 503
 
     @app.errorhandler(PiApiError)
     @app.errorhandler(DeviceError)
@@ -434,7 +482,15 @@ def create_app(
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
-        return jsonify(error=exc.description), exc.code
+        return jsonify(ok=False, error=exc.description), exc.code
+
+    @app.errorhandler(Exception)
+    def unexpected_error(exc):
+        LOG.exception("Unhandled dashboard request error")
+        return (
+            jsonify(ok=False, error="The dashboard could not complete this request."),
+            500,
+        )
 
     def payload():
         data = request.get_json()
@@ -494,6 +550,109 @@ def create_app(
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             },
         )
+
+    def selected_camera_device_id():
+        if state.pi_bridge is not None:
+            return state.pi_bridge.device_id
+        return "phone_A"
+
+    def camera_work_active():
+        workflow_service = app.extensions.get("workflow_service")
+        recorder = app.extensions.get("workflow_recorder")
+        return (workflow_service is not None and workflow_service.has_active_run()) or (
+            recorder is not None and recorder.active
+        )
+
+    @app.get("/api/cameras")
+    def cameras():
+        probe = request.args.get("probe", "true").casefold()
+        refresh = request.args.get("refresh", "false").casefold()
+        if probe not in {"false", "true", "0", "1"}:
+            raise ValueError("probe must be true or false.")
+        if refresh not in {"false", "true", "0", "1"}:
+            raise ValueError("refresh must be true or false.")
+        result = {
+            "configs": camera_manager.all_configs(),
+            "selected_device": selected_camera_device_id(),
+        }
+        if probe in {"true", "1"}:
+            result["cameras"] = camera_manager.discover(force=refresh in {"true", "1"})
+        return jsonify(result)
+
+    @app.post("/api/cameras/test")
+    def test_camera():
+        data = payload()
+        if set(data) != {"camera_source", "rotation"}:
+            raise ValueError("Expected camera_source and rotation only.")
+        result, jpeg = camera_manager.test_source(
+            data["camera_source"], data["rotation"]
+        )
+        response = {"ok": bool(result.get("available")), **result}
+        if jpeg is not None:
+            response["preview"] = "data:image/jpeg;base64," + base64.b64encode(
+                jpeg
+            ).decode("ascii")
+        return jsonify(response), (200 if response["ok"] else 422)
+
+    @app.route("/api/devices/<device_id>/camera", methods=["GET", "PUT"])
+    def device_camera(device_id):
+        # config() performs the shared logical-ID validation.
+        camera_manager.config(device_id)
+        if request.method == "GET":
+            selected = device_id == selected_camera_device_id()
+            status = camera_manager.status(device_id, open_camera=True)
+            return jsonify({**status, "selected": selected})
+
+        data = payload()
+        allowed = {"camera_source", "rotation", "enabled", "display_name"}
+        if not set(data).issubset(allowed) or not {
+            "camera_source",
+            "rotation",
+            "enabled",
+        }.issubset(data):
+            raise ValueError(
+                "Expected camera_source, rotation, and enabled; display_name is optional."
+            )
+        with state.lock:
+            if camera_work_active():
+                raise ValueError(
+                    "Stop the active workflow or recording before changing cameras."
+                )
+            previous_config = camera_manager.config(device_id)
+            config = camera_manager.update(
+                device_id,
+                camera_source=data["camera_source"],
+                rotation=data["rotation"],
+                enabled=data["enabled"],
+                display_name=data.get("display_name"),
+            )
+            changed = config != previous_config
+            calibration_revalidation = (
+                config.camera_source != previous_config.camera_source
+                or config.rotation != previous_config.rotation
+            )
+            selected = device_id == selected_camera_device_id()
+            if selected and changed:
+                state.disable("Camera assignment changed. Recalibrate before input.")
+                if calibration_revalidation:
+                    state.calibration = None
+                    state.signature = None
+                    state.calibration_restore_key = None
+                state.camera = camera_manager.activate(device_id)
+            details = camera_manager.status(device_id, open_camera=selected)
+        return jsonify(
+            ok=True,
+            selected=selected,
+            changed=changed,
+            calibration_revalidation_required=calibration_revalidation,
+            **details,
+        )
+
+    @app.get("/api/devices/<device_id>/camera/status")
+    def device_camera_status(device_id):
+        selected = device_id == selected_camera_device_id()
+        status = camera_manager.status(device_id, open_camera=True)
+        return jsonify({**status, "selected": selected})
 
     @app.get("/api/devices")
     def pi_devices():
@@ -654,6 +813,7 @@ def create_app(
                     selected = state.select_pi_device(fallback)
                     if workflow_service is not None:
                         workflow_service.device_id = selected
+            camera_manager.release_device(device_id)
 
         response = dict(result)
         response.update(catalog)
@@ -661,13 +821,36 @@ def create_app(
         return jsonify(response)
 
     @app.get("/api/frame")
-    def frame():
-        camera_status = camera.status()
+    @app.get("/api/devices/<device_id>/camera/frame")
+    def frame(device_id=None):
+        with state.lock:
+            selected = selected_camera_device_id()
+            requested_device = device_id or selected
+            if requested_device is None:
+                return (
+                    jsonify(error="Select a phone before requesting a camera frame."),
+                    409,
+                )
+            camera_manager.config(requested_device)
+            active_camera = (
+                state.camera
+                if requested_device == selected
+                else camera_manager.get_camera(requested_device)
+            )
+        camera_status = active_camera.status()
         if not camera_status["ready"]:
             return jsonify(error=camera_status["error"]), 503
-        latest = camera.frame()
+        latest = active_camera.frame()
         if latest is None:
             return jsonify(error="Camera frame unavailable."), 503
+        with state.lock:
+            if not camera_manager.is_current(requested_device, active_camera) or (
+                requested_device == selected and selected != selected_camera_device_id()
+            ):
+                return (
+                    jsonify(error="Camera selection changed; request a new frame."),
+                    409,
+                )
         jpeg, number, _, _ = latest
         if preview_debug:
             now = time.monotonic()
@@ -1120,16 +1303,14 @@ def main():
     # otherwise use local camera index.
     camera_source = args.camera_url if args.camera_url else args.camera
 
-    camera = Camera(
-        camera_source,
-        args.width,
-        args.height,
-        rotate=args.rotate,
+    camera_manager = CameraManager(
+        default_source=camera_source,
+        default_rotation=args.rotate,
+        width=args.width,
+        height=args.height,
     )
-
-    app = create_app(camera)
-
-    camera.start()
+    camera = camera_manager.activate("phone_A")
+    app = create_app(camera, camera_manager=camera_manager)
 
     LOG.info(
         "Open http://127.0.0.1:%d — input starts disabled",
@@ -1152,7 +1333,7 @@ def main():
             close_provider()
         with app.extensions["control_state"].lock:
             app.extensions["control_state"].disable()
-        camera.close()
+        camera_manager.release_all()
 
 
 if __name__ == "__main__":

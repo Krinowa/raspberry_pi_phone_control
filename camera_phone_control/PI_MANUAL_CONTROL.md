@@ -52,6 +52,44 @@ No Appium or ADB connection, USB debugging, Developer Options, or Android serial
 is needed to start or use Pi manual control. The Mac and Pi must share the private
 network and the phone must already be paired with the proven Pi HID setup.
 
+## Cameras for multiple phones
+
+Each logical phone has its own external-camera assignment. Select a phone in the
+**Devices** section, open **Camera Settings**, choose its camera source and
+rotation, enable the camera, and press **Save**. **Test Camera** can verify the
+source and show a temporary frame before saving. For example, use source `0` for `phone_A` and source `1`
+for `phone_B`. The mapping is saved atomically in
+`automation/camera_data/cameras.json` and supports arbitrary logical device IDs.
+
+The main preview, calibration, OCR, recorder coordinate capture, and workflow
+screen detection all follow the selected phone. Changing a source or rotation
+releases the old capture and requires that phone to be calibrated again. Other
+phones' calibration files and camera assignments are unchanged. `phone_A` still
+uses `--camera` and `--rotate` as defaults when no saved camera mapping exists.
+
+`GET /api/cameras?probe=true` probes local indexes 0 through 10 and releases each
+probe immediately. macOS AVFoundation indexes are not guaranteed to match ffmpeg
+device numbering, so confirm an index in the dashboard preview. The dashboard
+Devices shows all registered camera previews for monitoring. The selected card
+is the only control target for HID input, calibration, OCR, recording, and
+workflow playback. Bluetooth and camera health are displayed independently.
+Monitoring previews use a lower frame rate and do not run OCR; OCR remains
+request-driven through the existing single worker.
+Index discovery is cached for 20 seconds and runs only from the camera discovery
+API or **Refresh Cameras**. Normal one-second device polling checks existing
+assignments without probing unassigned indexes. Only sources that OpenCV can
+open and read are offered as discovered choices; an unavailable saved source is
+retained and labelled unavailable.
+
+Camera routes are:
+
+- `GET /api/cameras` for configured mappings and local-index discovery
+- `POST /api/cameras/test` to test a source without saving it
+- `GET|PUT /api/devices/<device_id>/camera` for one mapping and its state
+- `GET /api/devices/<device_id>/camera/status` for explicit status
+- `GET /api/devices/<device_id>/camera/frame` for the selected phone's JPEG
+- `GET /api/frame` as the selected-phone compatibility route
+
 ## Check status
 
 The dashboard displays **Pi API: Online** and **Phone HID: Connected** using the
