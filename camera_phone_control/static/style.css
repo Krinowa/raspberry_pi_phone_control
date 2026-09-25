@@ -253,6 +253,21 @@ button.primary:hover:not(:disabled) {
   color: #913b37;
   background: #f6e8e4;
 }
+.connection-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid #e7c98e;
+  border-radius: 8px;
+  background: #fff8e8;
+  color: #6d5424;
+  font-size: 12px;
+}
+.connection-banner span {
+  flex: 1;
+}
 footer {
   font-size: 11px;
   color: #728079;
@@ -300,4 +315,270 @@ footer {
     flex-direction: column;
     gap: 4px;
   }
+}
+
+#automations {
+  margin-top: 24px;
+}
+.automation-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+}
+.automation-grid > div {
+  min-width: 0;
+}
+h3 {
+  font-size: 15px;
+  margin: 22px 0 12px;
+}
+label {
+  display: block;
+  font-size: 13px;
+  margin: 12px 0;
+}
+input,
+select {
+  padding: 9px;
+  border: 1px solid #c9d6cd;
+  border-radius: 6px;
+  font: inherit;
+  max-width: 100%;
+}
+label > input:not([type="checkbox"]),
+label > select {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+}
+.check {
+  display: flex;
+  align-items: start;
+  gap: 8px;
+  line-height: 1.5;
+}
+.flow-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.flow-buttons input {
+  width: 110px;
+}
+.recording {
+  color: #a42d34 !important;
+  font-weight: 700;
+}
+.step-list {
+  max-height: 260px;
+  overflow: auto;
+  padding-left: 28px;
+}
+.step-list li {
+  padding: 8px;
+  font:
+    12px ui-monospace,
+    monospace;
+  overflow-wrap: anywhere;
+}
+.step-list .latest {
+  background: #ddf2e5;
+  border-radius: 6px;
+}
+.saved-flows {
+  padding: 0;
+  list-style: none;
+}
+.saved-flows li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid #e1e9e4;
+  padding: 12px 0;
+}
+.saved-flows span {
+  flex-basis: 100%;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+summary {
+  cursor: pointer;
+  padding: 12px 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+#workflow-preview {
+  width: 180px;
+  height: 320px;
+  border-radius: 12px;
+  margin: 16px auto;
+}
+#workflow-logs {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 230px;
+  overflow: auto;
+  font-size: 11px;
+  background: #f1f5f2;
+  padding: 12px;
+}
+#workflow-notice.error {
+  color: #963d3d;
+}
+[hidden] {
+  display: none !important;
+}
+@media (max-width: 800px) {
+  .automation-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+#record-live {
+  position: sticky;
+  bottom: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 16px;
+  border: 1px solid #d9e4dc;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 4px 20px #0002;
+}
+#record-count {
+  flex: 1;
+  font-size: 13px;
+}
+.review-timeline {
+  max-height: none;
+  padding-left: 28px;
+}
+.review-timeline li {
+  border-bottom: 1px solid #dfe5e2;
+  padding: 18px 8px;
+  font-family: inherit;
+  font-size: 14px;
+}
+.review-timeline img {
+  display: block;
+  object-fit: contain;
+  border-radius: 8px;
+  margin: 12px 0;
+}
+#step-editor {
+  padding: 18px;
+  margin: 16px 0;
+  background: #edf5ef;
+  border-radius: 10px;
+}
+#workflow-debug-data {
+  overflow: auto;
+  max-height: 300px;
+  font-size: 11px;
+}
+
+.pi-metrics {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+#video.keyboard-active {
+  outline: 2px solid var(--accent, #38bdf8);
+  outline-offset: -2px;
+}
+
+/* Keep recording controls and its live timeline beside the full camera view. */
+#record-card.is-recording {
+  border-color: #b7454b;
+  background: #fffafb;
+}
+#record-live {
+  position: static;
+  box-shadow: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  gap: 10px;
+}
+#record-status,
+#record-count,
+#live-timeline-slot {
+  flex-basis: 100%;
+}
+.record-action-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  flex: 1 1 210px;
+  align-self: stretch;
+  padding: 10px;
+  border: 1px solid #e2e9e5;
+  border-radius: 8px;
+  background: #f8faf9;
+}
+.record-action-group > span {
+  grid-column: 1 / -1;
+  color: #687970;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+#captured-keyboard-list {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  list-style: none;
+}
+.keyboard-map-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #dfe7e2;
+  border-radius: 8px;
+  background: #fafcfb;
+}
+.keyboard-map-info {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.keyboard-map-info strong,
+.keyboard-map-info span {
+  overflow-wrap: anywhere;
+}
+.keyboard-map-info span {
+  color: #687970;
+  font-size: 11px;
+}
+.keyboard-map-row > button {
+  min-width: 70px;
+}
+#record-count,
+#record-empty,
+.review-timeline p {
+  font-size: 12px;
+  color: #566b60;
+  line-height: 1.5;
+}
+#live-timeline-slot .review-timeline {
+  max-height: 280px;
+  overflow-y: auto;
+  margin-bottom: 0;
+}
+#live-timeline-slot .review-timeline li {
+  padding: 10px 4px;
+}
+#record-review-link {
+  display: inline-block;
+  margin: 12px 0;
+}
+#review-flow .review-timeline {
+  max-height: 420px;
+  overflow-y: auto;
 }

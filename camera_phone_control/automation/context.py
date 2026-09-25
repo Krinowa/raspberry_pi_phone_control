@@ -4,7 +4,9 @@ import math
 import time
 from contextlib import contextmanager
 
-from android_control import DeviceError
+from android_control import validate_key
+from .backends import bind
+from .coordinates import device_to_normalized
 
 
 class Cancelled(Exception):
@@ -14,7 +16,15 @@ class Cancelled(Exception):
 
 class AutomationContext:
     def __init__(
-        self, device, controller, cancel_event, logger, state, takeover_requested=None
+        self,
+        device,
+        controller,
+        cancel_event,
+        logger,
+        state,
+        takeover_requested=None,
+        *,
+        input_backend=None
     ):
         self.device = device
         self.controller = controller
@@ -23,6 +33,10 @@ class AutomationContext:
         self.state = state
         self.takeover_requested = takeover_requested or (lambda: False)
         self.cancelled_for_takeover = False
+        self.input_backend, self.input, self.screen = bind(
+            self, input_backend=input_backend
+        )
+        self.manual_handler = None
 
     def check_cancelled(self):
         if self.takeover_requested():
@@ -51,27 +65,28 @@ class AutomationContext:
 
     def _check_device(self):
         self.check_cancelled()
-        current = self.controller.device(
-            serial=self.device.serial, authorized_only=True
-        )
-        if current != self.device:
-            raise DeviceError("Phone geometry changed. Script stopped.")
+        self._health_check()
         self.check_cancelled()
 
     def send(self, action, pixel=None):
-        with self._step("navigation"):
-            self._check_device()
-            self.controller.send(self.device, action, pixel)
+        point = None
+        if action == "tap" and pixel is not None:
+            point = device_to_normalized(*pixel, self.device.width, self.device.height)
+        return self.input.action(action, point)
 
     def send_key(self, kind, value):
-        with self._step("keyboard input"):
-            self._check_device()
-            self.controller.send_key(self.device, kind, value)
+        validate_key(kind, value)
+        return self.input.type_text(value) if kind == "text" else self.input.key(value)
 
     def launch_app(self, package):
-        with self._step("launch app"):
-            self._check_device()
-            self.controller.launch_app(self.device, package)
+        return self.input.launch_app(package)
+
+    def manual_checkpoint(self, message):
+        self.check_cancelled()
+        if self.manual_handler is None:
+            raise RuntimeError("This runner does not support manual checkpoints.")
+        self.manual_handler(message)
+        self.check_cancelled()
 
     def wait(self, seconds):
         if (
@@ -94,6 +109,4 @@ class AutomationContext:
                     raise Cancelled()
 
     def dump_ui(self):
-        with self._step("inspect ui"):
-            self._check_device()
-            return self.controller.dump_ui(self.device)
+        return self.screen.inspect()

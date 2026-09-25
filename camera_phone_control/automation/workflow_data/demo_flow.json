@@ -1,0 +1,29 @@
+{
+  "id": "demo_flow",
+  "name": "Demo: navigation and search (example coordinates)",
+  "version": 1,
+  "financial": false,
+  "variables": [
+    {
+      "name": "search_text",
+      "label": "Search Text",
+      "type": "text",
+      "required": true,
+      "default": null
+    }
+  ],
+  "steps": [
+    {
+      "id": "prepare",
+      "type": "manual_checkpoint",
+      "message": "For mock playback, press Resume. For a real phone, use your own recorded flow: these coordinates are examples, not Settings selectors. Stop if the screen is not suitable."
+    },
+    {"id": "tap_search", "type": "tap", "x": 0.51, "y": 0.73},
+    {"id": "type_search", "type": "input", "source": "variable", "variable": "search_text"},
+    {"id": "wait_search", "type": "wait", "seconds": 1.0},
+    {"id": "scroll", "type": "swipe", "start": [0.5, 0.8], "end": [0.5, 0.2], "duration_ms": 350},
+    {"id": "finish", "type": "manual_checkpoint", "message": "Inspect the result, then Resume to finish."}
+  ],
+  "created_at": "2026-09-18T00:00:00+00:00",
+  "updated_at": "2026-09-18T00:00:00+00:00"
+}

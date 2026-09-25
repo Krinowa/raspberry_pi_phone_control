@@ -1,18 +1,27 @@
 # Local camera phone controller
 
-A small macOS dashboard for manually controlling **one physical USB Android phone**
-while viewing it through an **external webcam or camera**. Python captures that
-camera; the browser displays its live feed. A calibrated click sends one ADB tap.
-Back, Home, Swipe up, and Swipe down are explicit buttons.
-Manual Control also forwards supported keyboard input from the browser document
-to the phone, without a text box or Send button.
+A macOS dashboard for controlling a phone through the existing **Raspberry Pi
+Bluetooth HID API**, while viewing it through an **external camera**. Manual
+controls now default to the Pi; camera calibration maps clicks to normalized
+phone coordinates.
 
-This is separate from `appium_phone_poc`. It does not import or execute that script,
-launch banking apps, acknowledge warnings, or enter credentials. A separate terminal
-runner can execute predefined, harmless navigation scripts such as `settings_demo`.
-The existing Appium server at `http://127.0.0.1:4723` is not required by this
-dashboard: these controls use ADB directly. The dashboard and this project's runner
-share a device lock. Stop external automation scripts that bypass that lock.
+**[Pi manual-control setup and verification](PI_MANUAL_CONTROL.md)** covers the
+configuration, startup command, status checks, and each supported control. Pi
+manual mode needs no Appium server, ADB, USB debugging, or Android device serial.
+
+Recorder, workflow playback, and automation scripts retain their existing
+backends in this incremental integration. For those features, explicitly select
+`PHONE_MANUAL_INPUT_BACKEND=appium` and follow the legacy USB instructions below.
+Do not run legacy automation and Pi manual control concurrently on the same phone:
+their lock identities are separate until those features are migrated.
+
+**[Recorder, workflows, backend interfaces and complete implementation guide](WORKFLOWS.md)**
+includes the **record first → Stop → review/edit → save** workflow, mock mode,
+recording/playback instructions, JSON/API examples,
+file inventory, tests and future hardware integration points. Automation defaults remain
+`PHONE_INPUT_BACKEND=appium` and `PHONE_SCREEN_BACKEND=appium`. For a hardware-free
+workflow test, run `PHONE_INPUT_BACKEND=mock python app.py --camera 0` and use the
+Automations section's normalized mock preview.
 
 ## Source layout
 
@@ -25,23 +34,34 @@ camera_phone_control/
 │   ├── __init__.py
 │   ├── runner.py          # Callable runner, run state, and CLI entry point
 │   ├── context.py         # Controller helpers, cancellation, explicit waits
+│   ├── backends.py        # Selected input/screen backends and guarded facades
+│   ├── coordinates.py     # Shared normalized/pixel conversion
+│   ├── input/             # Generic, current ADB-backed, and mock input
+│   ├── screen/            # Generic/current screen providers; camera placeholder
+│   ├── workflows/         # Schema, storage, recorder, execution, local API
+│   ├── workflow_data/     # Saved JSON workflows
 │   └── scripts/
 │       ├── __init__.py    # Explicit registry of predefined scripts
-│       └── settings_demo.py
+│       ├── settings_demo.py
+│       └── open_mae.py
 ├── camera.py              # External camera capture and in-memory JPEG frames
 ├── calibration.py         # Four-point perspective mapping using NumPy
 ├── requirements.txt
 ├── templates/index.html
+├── static/workflows.js
 ├── static/app.js
 ├── static/style.css
 └── tests/
-    ├── test_control.py    # Backend, ADB, calibration, and camera regression tests
+    ├── test_control.py    # Shared simulated camera fixture
+    ├── test_workflows.py  # Backend, workflows, storage, API, ownership
+    ├── test_record_first.py # Automatic capture, privacy and timeline editing
+    ├── test_workflow_ui.js # Recorder pointer/input UI tests
     ├── test_automation.py # Runner, discovery, cancellation, cross-process locking
     ├── test_takeover.py   # Manual preemption, safe handoff, lease expiry
     └── test_keyboard.js   # Dashboard keyboard behavior tests
 ```
 
-## Setup on this Mac
+## Legacy USB setup on this Mac
 
 From `/Users/weizhe/Documents/phone_controller`, inspect the existing tools:
 
@@ -64,7 +84,7 @@ cd /Users/weizhe/Documents/phone_controller
 source appium_phone_poc/venv/bin/activate
 pip install -r camera_phone_control/requirements.txt
 cd camera_phone_control
-python app.py --camera 0
+PHONE_MANUAL_INPUT_BACKEND=appium python app.py --camera 0
 ```
 
 Open **http://127.0.0.1:8765** in Chrome or Safari on this Mac. Input starts
@@ -74,6 +94,97 @@ The dependencies have been installed in the existing environment during developm
 For a standalone copy, Python 3.10+ is required. Create an environment with
 `python3 -m venv venv`, then `source venv/bin/activate` and
 `pip install -r requirements.txt` before starting `python app.py`.
+
+### Camera OCR setup
+
+Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector and its
+English-specific PP-OCRv5 mobile recognizer on the CPU. The document-orientation
+and document-unwarping models are disabled; text line orientation is also
+disabled by default. Paddle and its models are created lazily, exactly once in a
+persistent spawned worker process, then reused for the life of the server. This
+keeps Paddle's native inference work and Python-runtime contention out of the
+camera/Flask process. The first request can take longer while the models are
+downloaded and initialized.
+
+On an Apple Silicon Mac (`uname -m` prints `arm64`), install the CPU build in the
+active virtual environment with:
+
+```zsh
+python -m pip install --upgrade pip
+python -m pip install paddlepaddle==3.3.0 \
+  -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+python -m pip install "paddleocr>=3.3,<4"
+```
+
+The same dependencies are pinned in `requirements.txt`, so a fresh environment
+can instead use `python -m pip install -r requirements.txt`. Current PaddlePaddle
+macOS wheels support Apple Silicon; use Linux or another supported platform for
+an Intel Mac that cannot install the pinned wheel.
+
+The default input is the calibrated, high-resolution display crop converted to
+BGR without thresholding. Set `CAMERA_OCR_SCALE=1.25` or `1.5` only when the
+camera image makes very small text benefit from upscaling. Enable text-line
+orientation only for screens that regularly rotate individual lines:
+
+```zsh
+CAMERA_OCR_TEXTLINE_ORIENTATION=1 python app.py --camera 0
+```
+
+OCR uses four CPU inference threads in the worker by default. Tune this between
+1 and 16 only after measuring on the target machine:
+
+```zsh
+CAMERA_OCR_CPU_THREADS=2 python app.py --camera 0
+```
+
+Successful OCR results are reused only when a downsampled screen signature is
+effectively unchanged. `CAMERA_OCR_CACHE_THRESHOLD` controls both the normalized
+mean difference and changed-pixel ratio; its conservative default is `0.001`,
+`0` disables caching, and the accepted range is 0 through 0.1:
+
+```zsh
+CAMERA_OCR_CACHE_THRESHOLD=0.002 python app.py --camera 0
+```
+
+For one-request diagnostics, save the exact NumPy image passed to PaddleOCR and
+log its dimensions, detected text, region count, confidence, and separate
+capture, decode, warp, copy, preprocessing, worker startup, IPC send/wait,
+child-process inference, total timing, cache status, worker PID, and main PID:
+
+```zsh
+CAMERA_OCR_DEBUG=1 \
+CAMERA_OCR_DEBUG_DIR=/tmp/camera-ocr-debug \
+python app.py --camera 0
+curl http://127.0.0.1:8765/api/ocr/texts
+```
+
+To profile camera delivery around an OCR request, restart with preview debugging
+enabled:
+
+```zsh
+CAMERA_PREVIEW_DEBUG=1 CAMERA_OCR_DEBUG=1 python app.py --camera 0
+```
+
+The server logs physical capture FPS, latest-frame publication FPS, preview
+response FPS, camera-sequence FPS, response intervals, route time, active request
+count, thread count, and OCR start/finish timing. The browser console separately
+logs frame-fetch, response-body, bitmap-decode, canvas-render, and total preview
+timings. This instrumentation is disabled unless `CAMERA_PREVIEW_DEBUG` is set.
+
+PaddleOCR is the normal implementation and does not invoke Tesseract. The prior
+provider remains available for a temporary same-camera comparison when
+Tesseract is installed. Stop the server between runs, keep the phone and camera
+fixed, and call the same endpoint after each start:
+
+```zsh
+# PaddleOCR
+python app.py --camera 0
+curl http://127.0.0.1:8765/api/ocr/texts
+
+# Optional legacy comparison
+CAMERA_OCR_ENGINE=tesseract python app.py --camera 0
+curl http://127.0.0.1:8765/api/ocr/texts
+```
 
 ### Camera selection and permission
 
@@ -120,7 +231,7 @@ rejected. Emulators cannot be controlled. Multiple physical devices are rejected
 Keep the phone awake and manually unlocked; the server never unlocks it.
 Open **Android Settings manually** for the first calibration and navigation test.
 
-## Calibrate and control
+## Legacy USB calibration and control
 
 1. Secure the camera and phone so neither moves. Prefer a straight view with all
    four display corners visible. Leave the phone's orientation fixed.
@@ -147,7 +258,7 @@ One perspective transform assumes a flat screen; extreme lens distortion, glare,
 occlusion, or a curved display can reduce accuracy. No automatic image analysis
 or lens correction is performed.
 
-## Keyboard passthrough
+## Legacy USB keyboard passthrough
 
 After calibration, enable **Manual Control**, then click a harmless text field
 on the phone through the camera view (for example, Android Settings search).
@@ -207,10 +318,10 @@ Enter/Backspace/Tab use `adb -s SERIAL shell input keyevent KEYCODE` with the fi
 codes above. No PIN, OTP, password, banking credential, transaction confirmation,
 biometric, or security-warning handling is implemented.
 
-## Backend automation (terminal only)
+## Predefined scripts from the terminal
 
-The browser remains a manual dashboard with one explicit Take Over operation and
-no script execution controls or script-launch API.
+The browser supports manual control, Take Over and saved JSON workflows. Predefined
+Python scripts remain terminal-based; there is no arbitrary script-launch API.
 The runner uses the same `AndroidControl` implementation as manual input and needs
 neither Flask, calibration, a browser lease, nor a running camera. The existing
 dashboard can remain open to observe the camera feed.
@@ -253,8 +364,8 @@ input or script details are written to these files.
   Normal manual input and Enable Manual Control return HTTP 409 with
   `{"ok":false,"error":"device_busy","owner":"automation"}`; they never request
   cancellation or queue input.
-- To interrupt a run, explicitly press **Take Over**. This is the dashboard's only
-  automation-related operation; it has no script selector or launcher. Take Over
+- To interrupt a run, explicitly press **Take Over**. Saved workflows can be recorded and launched from Automations; predefined Python
+  scripts still use the terminal runner. Take Over
   can request cancellation without calibration or a live camera, since it sends
   no Android input. Actual manual input retains all existing health/calibration
   checks.
@@ -341,9 +452,12 @@ delegate to the existing Android controller; `send_key` retains its single ASCII
 character/fixed keyevent limits. Use fixed diagnostic labels and never log typed
 values or credentials in custom scripts.
 
-Triggers, runner, and controller are separate. Cron, webhooks, database/event
-triggers, banking/payment/transfer workflows, credentials, transaction confirmation,
-biometrics, and security-warning acknowledgement are not implemented.
+Triggers, runner, and controller remain separate. The local workflow execution API
+is documented in [WORKFLOWS.md](WORKFLOWS.md). Authentication and final financial
+authorization belong in manual checkpoints. Pi workflow input is available with
+`PHONE_INPUT_BACKEND=raspberry_pi`; screen handling remains separately configured.
+See [Pi workflow playback](WORKFLOWS.md#pi-workflow-playback). External/public
+webhooks, scheduling, ESP32 input and visual automation are not implemented.
 
 ## How clicks are mapped
 
@@ -400,11 +514,11 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
   requests, and requires a per-server token for state changes. All frontend assets
   are local; no analytics or CDN requests occur. This is a trusted-single-user local
   POC, not a multi-user authentication system. Do not tunnel it or expose it to a LAN.
-- OpenCV is used only to capture/encode frames from the external camera. No ADB
-  screenshots, screen mirroring, Appium screenshots, OCR, recordings, PIN/OTP entry,
-  biometric interaction, warning acknowledgement, or banking workflow is implemented.
-  Manual taps are general inputs and cannot determine an app action's meaning;
-  use harmless screens, not banking/security flows, for this POC.
+- OpenCV captures/encodes the external camera feed. Workflow recording stores
+  actions, not camera video. On-demand screen capture is available through
+  `context.screen.capture()` as PNG bytes; no screenshots are saved automatically.
+  Use manual checkpoints for authentication and final financial authorization.
+  Coordinate taps cannot determine an app action's meaning.
 
 ## Errors and diagnostics
 
@@ -433,12 +547,22 @@ Manual Control; enable it again only after checking the reported condition.
 From `camera_phone_control` with the virtual environment active:
 
 ```zsh
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -p 'test_workflows.py' -v
+python -m unittest discover -s tests -p 'test_record_first.py' -v
+python -m unittest discover -s tests -p 'test_automation.py' -v
+python -m unittest discover -s tests -p 'test_takeover.py' -v
 node --check static/app.js
+node --check static/workflows.js
+node --test tests/test_workflow_ui.js
 node --test tests/test_keyboard.js
 ```
 
-The restored Python regression suite uses simulated ADB/camera responses. It checks perspective mapping,
+The pre-existing `test_open_mae.py` imports helpers commented out in the current
+MAE script and still assumes the old startup behavior. Unfiltered discovery fails
+on that stale file; the new suite checks current MAE/context compatibility using
+mock detections without changing the script.
+
+The Python regression suites use simulated ADB/camera responses. It checks perspective mapping,
 corner validation, coordinates, size/rotation parsing, single-device selection,
 control gating, stale frames, lease expiry, local-request protection, fixed ADB
 commands, and failure behavior. Automation tests check script discovery, device

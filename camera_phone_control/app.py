@@ -2,33 +2,57 @@
 
 import argparse
 import logging
+import os
 import secrets
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from types import SimpleNamespace
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
 from android_control import AndroidControl, DeviceError, validate_key
-from calibration import Calibration
+from calibration import Calibration, CalibrationStorage
 from camera import Camera
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
+from automation.backends import backend_names, select_device
+from automation.context import AutomationContext
+from automation.workflows.api import register_workflows
+from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
+from hardware.raspberry_pi_input import RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
 
 
 class ControlState:
-    def __init__(self, android, camera, device_locks=None):
+    def __init__(
+        self,
+        android,
+        camera,
+        device_locks=None,
+        *,
+        pi_bridge=None,
+        calibration_storage=None,
+    ):
         self.android, self.camera = android, camera
+        self.pi_bridge = pi_bridge
+        self.pi_connection = {
+            "api": "offline",
+            "phone": "unknown",
+            "message": "Waiting for Pi status.",
+        }
+        self.pi_status_notice = None
         self.lock = threading.RLock()
         self.action_lock = threading.Lock()
         self.device_locks = device_locks or DeviceLocks()
         self.device = None
         self.calibration = None
         self.signature = None
+        self.calibration_storage = calibration_storage
+        self.calibration_restore_key = None
         self.owner = None
         self.manual_claim = None
         self.lease_timer = None
@@ -89,10 +113,26 @@ class ControlState:
         )
         return False
 
+    def refresh_pi_status(self):
+        # Explicit checks only; snapshots, inputs and heartbeats use last-known state.
+        self.pi_connection = self.pi_bridge.connection_state()
+        return self.pi_connection
+
     def refresh(self):
         errors = []
         try:
-            self.device = self.android.device()
+            if self.pi_bridge is not None:
+                if self.pi_connection["phone"] == "connected":
+                    self.device = self.pi_bridge.target
+                else:
+                    self.device = None
+                    errors.append(self.pi_connection["message"])
+            else:
+                self.device = select_device(
+                    self.android,
+                    authorized_only=False,
+                    input_backend="appium",
+                )
         except DeviceError as exc:
             self.device = None
             errors.append(str(exc))
@@ -102,14 +142,54 @@ class ControlState:
         signature = (self.device, camera["width"], camera["height"])
         if errors:
             self.calibration = None
+            self.calibration_restore_key = None
             self.disable(" ".join(errors))
+            if (
+                self.pi_bridge is not None
+                and self.pi_connection["phone"] != "connected"
+            ):
+                # Track the displayed failure, independently of later explicit checks.
+                self.pi_status_notice = self.message
         elif self.calibration and signature != self.signature:
             self.calibration = None
+            self.calibration_restore_key = None
             self.disable(
                 "Phone geometry or camera resolution changed. Recalibrate before enabling input."
             )
-        elif self.owner and time.monotonic() >= self.expires:
+        if (
+            not errors
+            and self.calibration is None
+            and self.calibration_storage is not None
+        ):
+            restore_key = (
+                signature,
+                self.camera.source,
+                self.camera.rotate,
+            )
+            if restore_key != self.calibration_restore_key:
+                self.calibration_restore_key = restore_key
+                restored = self.calibration_storage.load(
+                    self.camera,
+                    camera,
+                    self.device,
+                )
+                if restored is not None:
+                    self.calibration = restored
+                    self.signature = signature
+                    self.message = (
+                        "Saved calibration loaded. Enable Manual Control when ready."
+                    )
+        if not errors and self.owner and time.monotonic() >= self.expires:
             self.disable("Control heartbeat expired. Enable Manual Control again.")
+        if not errors and self.pi_status_notice is not None:
+            if self.message == self.pi_status_notice:
+                self.message = (
+                    "Phone Connected. Enable Manual Control when ready."
+                    if self.calibration
+                    else "Phone Connected. Calibrate the phone display before enabling input."
+                )
+            # Never replace a newer safety or control message with Pi recovery text.
+            self.pi_status_notice = None
         return camera
 
     def require_frame(self, frame_id):
@@ -163,6 +243,13 @@ class ControlState:
             )
         return {
             "device": asdict(self.device) if self.device else None,
+            "manual_backend": (
+                "raspberry_pi" if self.pi_bridge is not None else "appium"
+            ),
+            "pi": self.pi_connection,
+            "supported_actions": (
+                sorted(self.pi_bridge.ACTIONS) if self.pi_bridge is not None else None
+            ),
             "camera": camera,
             "calibrated": self.calibration is not None,
             "corners": self.calibration.corners.tolist() if self.calibration else [],
@@ -177,16 +264,70 @@ class ControlState:
         }
 
 
-def create_app(camera, android=None, device_locks=None):
+def create_app(
+    camera,
+    android=None,
+    device_locks=None,
+    workflow_storage=None,
+    *,
+    manual_backend=None,
+    pi_client=None,
+    calibration_storage=None,
+):
+    # Manual and workflow input are independent: explicit argument, env, default.
+    manual_backend = (
+        manual_backend or os.environ.get("PHONE_MANUAL_INPUT_BACKEND") or "raspberry_pi"
+    )
+    if manual_backend not in {"raspberry_pi", "appium"}:
+        raise ValueError("PHONE_MANUAL_INPUT_BACKEND must be raspberry_pi or appium.")
+    pi_bridge = (
+        RaspberryPiInputBridge(pi_client) if manual_backend == "raspberry_pi" else None
+    )
     app = Flask(__name__)
-    app.config.update(MAX_CONTENT_LENGTH=8192, TRUSTED_HOSTS=["localhost", "127.0.0.1"])
+    app.config.update(
+        MAX_CONTENT_LENGTH=1024 * 1024, TRUSTED_HOSTS=["localhost", "127.0.0.1"]
+    )
+    preview_debug = os.environ.get("CAMERA_PREVIEW_DEBUG", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    app.config["CAMERA_PREVIEW_DEBUG"] = preview_debug
+    request_metrics = {
+        "lock": threading.Lock(),
+        "active": 0,
+        "window_started": time.monotonic(),
+        "frames": 0,
+        "first_sequence": None,
+        "last_sequence": None,
+        "last_response": None,
+        "interval_total": 0.0,
+        "interval_max": 0.0,
+        "route_total": 0.0,
+    }
+    app.extensions["preview_request_metrics"] = request_metrics
     token = secrets.token_urlsafe(32)
-    state = ControlState(android or AndroidControl(), camera, device_locks)
+    if calibration_storage is None and all(
+        hasattr(camera, field) for field in ("source", "rotate")
+    ):
+        calibration_storage = CalibrationStorage()
+    state = ControlState(
+        android or AndroidControl(),
+        camera,
+        device_locks,
+        pi_bridge=pi_bridge,
+        calibration_storage=calibration_storage,
+    )
     app.extensions["control_state"] = state
     app.config["CONTROL_TOKEN"] = token
 
     @app.before_request
     def protect_local_requests():
+        if preview_debug:
+            g.preview_request_started = time.monotonic()
+            with request_metrics["lock"]:
+                request_metrics["active"] += 1
         # Reject cross-site fetches/embeds, including camera requests. No CORS enabled.
         if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
             return jsonify(error="Only same-origin local requests are accepted."), 403
@@ -206,14 +347,18 @@ def create_app(camera, android=None, device_locks=None):
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+            "img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         )
+        if preview_debug and hasattr(g, "preview_request_started"):
+            with request_metrics["lock"]:
+                request_metrics["active"] -= 1
         return response
 
     @app.errorhandler(ValueError)
     def invalid_input(exc):
         return jsonify(error=str(exc)), 400
 
+    @app.errorhandler(PiApiError)
     @app.errorhandler(DeviceError)
     def device_error(exc):
         with state.lock:
@@ -263,21 +408,97 @@ def create_app(camera, android=None, device_locks=None):
 
     @app.get("/")
     def index():
-        return render_template("index.html", control_token=token)
+        return render_template(
+            "index.html",
+            control_token=token,
+            preview_debug=preview_debug,
+        )
 
     @app.get("/api/status")
     def status():
         with state.lock:
             return jsonify(state.snapshot(client_id()))
 
+    @app.get("/api/pi/status")
+    def pi_status():
+        if state.pi_bridge is None:
+            return jsonify(
+                api="not_selected",
+                phone="unknown",
+                message="Pi manual control is not selected.",
+            )
+        with state.lock:
+            return jsonify(state.refresh_pi_status())
+
     @app.get("/api/frame")
     def frame():
-        if not camera.status()["ready"]:
-            return jsonify(error=camera.status()["error"]), 503
+        camera_status = camera.status()
+        if not camera_status["ready"]:
+            return jsonify(error=camera_status["error"]), 503
         latest = camera.frame()
         if latest is None:
             return jsonify(error="Camera frame unavailable."), 503
         jpeg, number, _, _ = latest
+        if preview_debug:
+            now = time.monotonic()
+            report = None
+            with request_metrics["lock"]:
+                previous = request_metrics["last_response"]
+                if previous is not None:
+                    interval = now - previous
+                    request_metrics["interval_total"] += interval
+                    request_metrics["interval_max"] = max(
+                        request_metrics["interval_max"], interval
+                    )
+                request_metrics["last_response"] = now
+                request_metrics["frames"] += 1
+                request_metrics["first_sequence"] = (
+                    number
+                    if request_metrics["first_sequence"] is None
+                    else request_metrics["first_sequence"]
+                )
+                request_metrics["last_sequence"] = number
+                request_metrics["route_total"] += now - getattr(
+                    g, "preview_request_started", now
+                )
+                elapsed = now - request_metrics["window_started"]
+                if elapsed >= 1:
+                    count = request_metrics["frames"]
+                    report = (
+                        count / elapsed,
+                        (
+                            request_metrics["last_sequence"]
+                            - request_metrics["first_sequence"]
+                        )
+                        / elapsed,
+                        (request_metrics["interval_total"] / max(1, count - 1)),
+                        request_metrics["interval_max"],
+                        request_metrics["route_total"] / count,
+                        request_metrics["active"],
+                    )
+                    request_metrics.update(
+                        window_started=now,
+                        frames=0,
+                        first_sequence=None,
+                        last_sequence=None,
+                        last_response=None,
+                        interval_total=0.0,
+                        interval_max=0.0,
+                        route_total=0.0,
+                    )
+            if report is not None:
+                LOG.info(
+                    "Preview response FPS=%.1f camera-sequence FPS=%.1f "
+                    "yield interval avg=%.1fms max=%.1fms route=%.1fms "
+                    "active_requests=%d threads=%d",
+                    report[0],
+                    report[1],
+                    report[2] * 1000,
+                    report[3] * 1000,
+                    report[4] * 1000,
+                    report[5],
+                    threading.active_count(),
+                )
         return Response(
             jpeg, mimetype="image/jpeg", headers={"X-Frame-Id": str(number)}
         )
@@ -291,6 +512,8 @@ def create_app(camera, android=None, device_locks=None):
             if not data["enabled"]:
                 state.disable()
             else:
+                if state.pi_bridge is not None:
+                    state.refresh_pi_status()
                 state.require_ready()
                 state.require_frame(data.get("frame_id"))
                 if state.calibration is None:
@@ -383,19 +606,48 @@ def create_app(camera, android=None, device_locks=None):
         with state.lock:
             state.disable("Calibration changed. Input disabled.")
             state.calibration = None
+            state.calibration_restore_key = None
 
             if request.method == "DELETE":
+                if state.calibration_storage is not None:
+                    try:
+                        state.calibration_storage.clear()
+                    except OSError as exc:
+                        LOG.error("Could not clear saved camera calibration: %s", exc)
+                        raise ValueError(
+                            "Calibration could not be cleared from local storage."
+                        ) from exc
                 return jsonify(calibrated=False)
 
             camera_info = state.require_ready()
             state.require_frame(data.get("frame_id"))
             calibration = Calibration(data.get("corners"))
-            state.calibration = calibration
-            state.signature = (
+            signature = (
                 state.device,
                 camera_info["width"],
                 camera_info["height"],
             )
+            if state.calibration_storage is not None:
+                try:
+                    state.calibration_storage.save(
+                        calibration,
+                        state.camera,
+                        camera_info,
+                        state.device,
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    LOG.error("Could not save camera calibration: %s", exc)
+                    raise ValueError(
+                        "Calibration could not be saved to local storage."
+                    ) from exc
+            state.calibration = calibration
+            state.signature = signature
+            if state.calibration_storage is not None:
+                state.calibration_restore_key = (
+                    signature,
+                    state.camera.source,
+                    state.camera.rotate,
+                )
             state.message = "Calibration saved. You can enable Manual Control."
             LOG.info("Four-corner calibration saved for %s", state.device.serial)
             return jsonify(calibrated=True, corners=calibration.corners.tolist())
@@ -412,12 +664,69 @@ def create_app(camera, android=None, device_locks=None):
             return jsonify(error="Controller busy. No action sent."), 409
         try:
             with state.lock, state.input_control(client, data["frame_id"]):
+                recorded = None
                 try:
-                    state.android.send_key(state.device, data["type"], data["value"])
-                except DeviceError as exc:
+                    if state.pi_bridge is not None:
+                        if data["type"] == "text":
+                            step = {
+                                "type": "input",
+                                "source": "fixed",
+                                "value": data["value"],
+                            }
+                            perform = lambda: state.pi_bridge.type_text(data["value"])
+                        else:
+                            key_name = (
+                                "MOVE_HOME"
+                                if data["value"] == "home"
+                                else data["value"].upper()
+                            )
+                            step = {"type": "key", "key": key_name}
+                            perform = lambda: state.pi_bridge.key(data["value"])
+                        recorded = app.extensions["record_manual"](step, perform)
+                    else:
+                        context = AutomationContext(
+                            state.device,
+                            state.android,
+                            threading.Event(),
+                            LOG,
+                            SimpleNamespace(),
+                            input_backend="appium",
+                        )
+                        context.send_key(data["type"], data["value"])
+                except (DeviceError, PiApiError) as exc:
                     state.disable(str(exc))
                     raise
-                return jsonify(sent=True)
+                return jsonify(sent=True, recording=recorded)
+        finally:
+            state.action_lock.release()
+
+    @app.post("/api/text")
+    def text_input():
+        data, client = payload(), client_id()
+        if set(data) != {"text", "frame_id"}:
+            raise ValueError("Expected text and frame_id only.")
+        validate_pi_text(data["text"])
+        if not state.action_lock.acquire(blocking=False):
+            return jsonify(error="Controller busy. No action sent."), 409
+        try:
+            with state.lock, state.input_control(client, data["frame_id"]):
+                recorded = None
+                if state.pi_bridge is not None:
+                    recorded = app.extensions["record_manual"](
+                        {"type": "input", "source": "fixed", "value": data["text"]},
+                        lambda: state.pi_bridge.type_text(data["text"]),
+                    )
+                else:
+                    context = AutomationContext(
+                        state.device,
+                        state.android,
+                        threading.Event(),
+                        LOG,
+                        SimpleNamespace(),
+                        input_backend="appium",
+                    )
+                    context.input.type_text(data["text"])
+                return jsonify(sent=True, recording=recorded)
         finally:
             state.action_lock.release()
 
@@ -448,22 +757,63 @@ def create_app(camera, android=None, device_locks=None):
                 pixel, normalized = None, None
 
                 if name == "tap":
-                    pixel, normalized = state.calibration.pixel(
-                        [data.get("x"), data.get("y")],
-                        state.device.width,
-                        state.device.height,
-                    )
+                    if state.pi_bridge is not None:
+                        normalized = state.calibration.map(
+                            [data.get("x"), data.get("y")]
+                        )
+                    else:
+                        pixel, normalized = state.calibration.pixel(
+                            [data.get("x"), data.get("y")],
+                            state.device.width,
+                            state.device.height,
+                        )
 
+                recorded = None
                 try:
-                    state.android.send(state.device, name, pixel)
-                except DeviceError as exc:
+                    if state.pi_bridge is not None:
+                        if name not in state.pi_bridge.ACTIONS:
+                            raise ValueError(
+                                "This action is not supported; no input sent."
+                            )
+                        if name == "tap":
+                            step = {
+                                "type": "tap",
+                                "x": normalized[0],
+                                "y": normalized[1],
+                            }
+                        elif name in state.pi_bridge.SWIPES:
+                            points = state.pi_bridge.SWIPES[name]
+                            step = {
+                                "type": "swipe",
+                                "start": list(points[:2]),
+                                "end": list(points[2:]),
+                            }
+                        else:
+                            step = {"type": "key", "key": name.upper()}
+                        recorded = app.extensions["record_manual"](
+                            step, lambda: state.pi_bridge.action(name, normalized)
+                        )
+                    else:
+                        context = AutomationContext(
+                            state.device,
+                            state.android,
+                            threading.Event(),
+                            LOG,
+                            SimpleNamespace(),
+                            input_backend="appium",
+                        )
+                        context.send(name, pixel)
+                except (DeviceError, PiApiError) as exc:
                     state.disable(str(exc))
                     raise
 
-                return jsonify(action=name, pixel=pixel, normalized=normalized)
+                return jsonify(
+                    action=name, pixel=pixel, normalized=normalized, recording=recorded
+                )
         finally:
             state.action_lock.release()
 
+    register_workflows(app, state, payload, client_id, workflow_storage)
     return app
 
 
@@ -556,6 +906,10 @@ def main():
         )
 
     finally:
+        screen_provider = app.extensions.get("workflow_screen_state_provider")
+        close_provider = getattr(screen_provider, "close", None)
+        if close_provider is not None:
+            close_provider()
         with app.extensions["control_state"].lock:
             app.extensions["control_state"].disable()
         camera.close()

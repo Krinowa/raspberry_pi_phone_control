@@ -1,6 +1,7 @@
 """External camera capture only. No Android screen capture or image analysis."""
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -34,6 +35,19 @@ class Camera:
         self.timestamps = deque(maxlen=90)
 
         self.error = "Camera is starting..."
+        self.preview_debug = os.environ.get(
+            "CAMERA_PREVIEW_DEBUG", ""
+        ).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._debug_started = time.monotonic()
+        self._debug_captures = 0
+        self._debug_updates = 0
+        self._debug_read_seconds = 0.0
+        self._debug_encode_seconds = 0.0
 
     def start(self):
         self.thread = threading.Thread(
@@ -117,7 +131,9 @@ class Camera:
 
                 started = time.monotonic()
 
+                read_started = time.monotonic()
                 ok, frame = cap.read()
+                read_seconds = time.monotonic() - read_started
 
                 if not ok or frame is None:
                     raise RuntimeError(
@@ -144,6 +160,7 @@ class Camera:
                         cv2.ROTATE_90_COUNTERCLOCKWISE,
                     )
 
+                encode_started = time.monotonic()
                 ok, encoded = cv2.imencode(
                     ".jpg",
                     frame,
@@ -152,6 +169,7 @@ class Camera:
                         80,
                     ],
                 )
+                encode_seconds = time.monotonic() - encode_started
 
                 if not ok:
                     raise RuntimeError("Unable to encode the camera frame.")
@@ -180,6 +198,30 @@ class Camera:
                     )
 
                     self.error = ""
+
+                if self.preview_debug:
+                    self._debug_captures += 1
+                    self._debug_updates += 1
+                    self._debug_read_seconds += read_seconds
+                    self._debug_encode_seconds += encode_seconds
+                    debug_now = time.monotonic()
+                    debug_elapsed = debug_now - self._debug_started
+                    if debug_elapsed >= 1:
+                        LOG.info(
+                            "Camera capture FPS=%.1f latest-frame update FPS=%.1f "
+                            "read=%.1fms encode=%.1fms sequence=%d threads=%d",
+                            self._debug_captures / debug_elapsed,
+                            self._debug_updates / debug_elapsed,
+                            self._debug_read_seconds * 1000 / self._debug_captures,
+                            self._debug_encode_seconds * 1000 / self._debug_captures,
+                            self.sequence,
+                            threading.active_count(),
+                        )
+                        self._debug_started = debug_now
+                        self._debug_captures = 0
+                        self._debug_updates = 0
+                        self._debug_read_seconds = 0.0
+                        self._debug_encode_seconds = 0.0
 
                 elapsed = time.monotonic() - started
 
@@ -229,6 +271,13 @@ class Camera:
     def frame(self):
         with self.lock:
             return self.latest
+
+    def observation(self):
+        """Atomically pair the latest JPEG/sequence/geometry with capture time."""
+        with self.lock:
+            if self.latest is None or not self.timestamps or self.stop_event.is_set():
+                return None
+            return (*self.latest, self.timestamps[-1][1])
 
     def validate_frame(self, frame_id):
         with self.lock:
