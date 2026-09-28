@@ -17,6 +17,10 @@
     stopping = false;
   let externalPhysicalBusy = false,
     reconnectRefreshInFlight = false;
+  let runPollTimer = null,
+    runPollInFlight = false,
+    workflowPollingStopped = false,
+    runStateSignature = "";
   let textBuffer = "",
     textTimer = null,
     captureQueue = Promise.resolve(),
@@ -48,22 +52,28 @@
   function describe(step, index = 0) {
     const suffix = step.label;
     if (step.type === "tap") return `Tap${suffix ? " — " + suffix : ""}`;
+
     if (step.type === "swipe") {
       const dx = step.end[0] - step.start[0],
         dy = step.end[1] - step.start[1];
       return `Swipe ${Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "Right" : "Left") : dy > 0 ? "Down" : "Up"}${step.label ? " — " + step.label : ""}`;
     }
+
     if (step.type === "input") {
       const variable = recording.workflow?.variables.find(
         (v) => v.name === step.variable,
       );
       return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}`;
     }
+
     if (step.type === "wait_until_stable")
       return `Wait for Screen to Settle — Stable for ${step.stable_ms} ms · Max ${step.timeout_seconds} sec`;
+
     if (step.type === "wait_for_text")
       return `Wait for Text — “${step.text}” · Max ${step.timeout_seconds} sec`;
+
     if (step.type === "wait") return `Wait ${step.seconds} seconds`;
+
     if (step.type === "key")
       return (
         step.label ||
@@ -112,8 +122,10 @@
           keyboard.id,
         ),
     );
+
     if (captureOption)
       options.push(new Option("+ Capture New Keyboard", "__capture__"));
+
     select.replaceChildren(...options);
     return keyboards;
   }
@@ -143,12 +155,14 @@
       if ($("keyboard-numeric-backspace").checked) keys.push("BACKSPACE");
       return keys;
     }
+
     if (kind === "alphabetic") {
       const keys = Array.from("abcdefghijklmnopqrstuvwxyz");
       if ($("keyboard-include-space").checked) keys.push(" ");
       if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
       return keys;
     }
+
     return $("keyboard-custom-keys")
       .value.split(",")
       .map((label) => label.trim());
@@ -185,11 +199,13 @@
         "/api/recorder/text-suggestions",
         mode === "current" ? { current: true } : { step_id: step.id },
       );
+
       if (
         expectedMode !== targetMode ||
         expectedActionId !== (step?.id || null)
       )
         return;
+
       const choices = (result.suggestions || []).slice(0, 5);
       $("expected-suggestions").replaceChildren(
         ...choices.map((text) => {
@@ -257,6 +273,7 @@
       closeExpectedText();
     });
   });
+
   $("expected-text-cancel").addEventListener("click", () =>
     task(async () => {
       if (expectedMode && expectedMode !== "review")
@@ -264,6 +281,7 @@
       closeExpectedText();
     }),
   );
+
   $("expected-text-manual").addEventListener("click", () => {
     for (const radio of $("expected-suggestions").querySelectorAll("input"))
       radio.checked = false;
@@ -303,6 +321,7 @@
         detail.textContent = `X ${Math.round(step.x * 100)}% • Y ${Math.round(step.y * 100)}%`;
         row.append(detail);
       }
+
       if (step.preview) {
         const image = document.createElement("img");
         image.src = "data:image/png;base64," + step.preview;
@@ -311,9 +330,11 @@
         image.height = 96;
         row.append(image);
       }
+
       const actions = document.createElement("div");
       actions.className = "flow-buttons";
       actions.append(button("Edit", () => openEditor(step)));
+
       if (step.type === "input") {
         const value = document.createElement("p");
         value.textContent =
@@ -329,18 +350,21 @@
           review({ operation: "delete", step_id: step.id }),
         ),
       );
+
       if (index > 0)
         actions.append(
           button("Move Up", () =>
             review({ operation: "move", step_id: step.id, index: index - 1 }),
           ),
         );
+
       if (index < draft.steps.length - 1)
         actions.append(
           button("Move Down", () =>
             review({ operation: "move", step_id: step.id, index: index + 1 }),
           ),
         );
+
       if (!recording.active && canExpectText(step)) {
         const next = draft.steps[index + 1];
         const wait = next?.type === "wait_for_text" ? next : null;
@@ -352,6 +376,7 @@
             openExpectedText(step, wait),
           ),
         );
+
         if (wait)
           actions.append(
             button("Remove", () =>
@@ -362,6 +387,7 @@
             ),
           );
       }
+
       if (!recording.active) row.append(actions);
       positions.push(
         new Option(
@@ -387,12 +413,14 @@
 
   function renderCapturedKeyboards() {
     const keyboards = Object.values(recording.workflow?.keyboards || {});
+
     $("captured-keyboards").hidden = !recording.workflow || !keyboards.length;
     const referenced = new Set(
       (recording.workflow?.steps || [])
         .filter((step) => step.input_method === "screen_keyboard")
         .map((step) => step.keyboard_id),
     );
+
     $("captured-keyboard-list").replaceChildren(
       ...keyboards.map((keyboard) => {
         const row = document.createElement("li"),
@@ -438,6 +466,15 @@
         return row;
       }),
     );
+  }
+
+  function renderDeviceAvailability() {
+    $("flow-run").disabled =
+      working ||
+      !selected ||
+      !!recording.workflow ||
+      (piManual() && !window.selectedPiDeviceConnected?.()) ||
+      (running && !terminal.has(running.status));
   }
 
   function renderRecording() {
@@ -504,8 +541,10 @@
     $("review-capture-keyboard").disabled = annotationBusy();
     $("record-input-variable").disabled = stopping || annotationBusy();
     $("record-variable-input").hidden = !variableInputOpen;
+
     const sharedPhysicalBusy =
       externalPhysicalBusy || !!window.phoneConnection?.isPhysicalBusy?.();
+
     $("record-variable-type").disabled =
       working ||
       sharedPhysicalBusy ||
@@ -515,16 +554,20 @@
       : "Add & Type Sample";
     $("keyboard-capture").hidden =
       !keyboardSetupOpen && !recording.keyboard_capture;
+
     const keyboardCaptureSlot = live ? $("record-live") : $("review-flow");
     if ($("keyboard-capture").parentElement !== keyboardCaptureSlot)
       keyboardCaptureSlot.append($("keyboard-capture"));
+
     const captureKey = currentKeyboardKey();
     if (recording.keyboard_capture) {
       const done = Object.keys(recording.keyboard_capture.keys || {});
+
       $("keyboard-capture-instruction").textContent = captureKey
         ? `Currently capturing “${displayKeyboardKey(captureKey)}”. Click that key on the phone preview. Captured: ${done.map(displayKeyboardKey).join(", ") || "none"}.`
         : "All selected keys are captured. Save the keyboard or cancel.";
     }
+
     $("keyboard-capture-start").hidden = !!recording.keyboard_capture;
     $("keyboard-capture-save").hidden =
       !recording.keyboard_capture || !!captureKey;
@@ -546,12 +589,7 @@
       ? "Cancel Editing"
       : "Discard Recording";
 
-    $("flow-run").disabled =
-      working ||
-      !selected ||
-      !!draft ||
-      (piManual() && !window.selectedPiDeviceConnected?.()) ||
-      (running && !terminal.has(running.status));
+    renderDeviceAvailability();
 
     $("mock-recording-preview").hidden =
       piManual() || backend !== "mock" || !live;
@@ -667,6 +705,7 @@
     $("variable-default").value = definition?.default ?? "";
     $("variable-ask").checked = definition?.ask_when_running ?? true;
     $("input-method").value = step.input_method || "hid";
+
     const keyboards = keyboardOptions($("input-keyboard"));
     $("input-keyboard").value = step.keyboard_id || keyboards[0]?.id || "";
 
@@ -1616,7 +1655,22 @@
     },
     ownerId: recorderOwner,
     action: naturalAction,
-    deviceStateChanged: renderRecording,
+    deviceStateChanged: renderDeviceAvailability,
+    pausePolling: () => {
+      workflowPollingStopped = true;
+      clearTimeout(runPollTimer);
+      runPollTimer = null;
+    },
+    resumePolling: () => {
+      workflowPollingStopped = false;
+      scheduleRunPoll(0);
+    },
+    shutdown: () => {
+      workflowPollingStopped = true;
+      clearTimeout(runPollTimer);
+      runPollTimer = null;
+      clearTimeout(textTimer);
+    },
     deviceManagementBlocked: () =>
       recording.active || (running && !terminal.has(running.status)),
   };
@@ -1727,6 +1781,7 @@
       render();
       renderRun();
       localStorage.setItem("phone-workflow-run", running.run_id);
+      scheduleRunPoll(0);
     });
   });
 
@@ -1742,6 +1797,7 @@
           render();
         }
         renderRun();
+        scheduleRunPoll();
       }),
     );
 
@@ -1798,6 +1854,11 @@
 
   function renderRun() {
     if (!running) return;
+    const nextRunStateSignature = `${running.run_id}:${running.status}`;
+    if (nextRunStateSignature !== runStateSignature) {
+      runStateSignature = nextRunStateSignature;
+      window.phoneRuntimeStateChanged?.();
+    }
     $("flow-run-state").textContent =
       `${running.status} · Step ${running.step_index || 0}/${running.step_count || 0} · ${running.preview ? describe(running.preview, (running.step_index || 1) - 1) : "Starting"}${running.checkpoint_message ? " — " + running.checkpoint_message : ""}${terminal.has(running.status) ? " — " + (running.message || "") : ""}`;
     $("flow-resume").hidden = running.status !== "waiting_manual";
@@ -1807,20 +1868,39 @@
     renderRecording();
   }
 
+  function scheduleRunPoll(delay = 500) {
+    if (
+      workflowPollingStopped ||
+      runPollTimer !== null ||
+      !running ||
+      terminal.has(running.status)
+    )
+      return;
+    runPollTimer = setTimeout(pollRun, delay);
+  }
+
   async function pollRun() {
+    runPollTimer = null;
+    if (
+      workflowPollingStopped ||
+      runPollInFlight ||
+      !running ||
+      terminal.has(running.status)
+    )
+      return;
+    runPollInFlight = true;
     try {
-      if (running && !terminal.has(running.status)) {
-        running = await api(
-          `/api/workflow-runs/${running.run_id}`,
-          undefined,
-          "GET",
-        );
-        renderRun();
-      }
+      running = await api(
+        `/api/workflow-runs/${running.run_id}`,
+        undefined,
+        "GET",
+      );
+      renderRun();
     } catch (error) {
       show(error.message, true);
     } finally {
-      setTimeout(pollRun, 500);
+      runPollInFlight = false;
+      scheduleRunPoll();
     }
   }
 
@@ -1833,11 +1913,11 @@
       try {
         running = await api(`/api/workflow-runs/${id}`, undefined, "GET");
         renderRun();
+        scheduleRunPoll();
       } catch {
         localStorage.removeItem("phone-workflow-run");
       }
     }
     drawPreview(running?.preview);
   });
-  pollRun();
 })();

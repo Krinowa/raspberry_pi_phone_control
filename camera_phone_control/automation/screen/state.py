@@ -8,6 +8,8 @@ or recognition implementation.
 import time
 from typing import Protocol, runtime_checkable
 
+from ..workflows.timing import record_timing
+
 
 class ScreenStateError(RuntimeError):
     """Safe, user-facing semantic screen-state failure."""
@@ -61,20 +63,27 @@ def wait_for_text(
     if provider is None:
         provider = UnavailableScreenStateProvider()
 
+    wait_started = time.monotonic()
     deadline = clock() + timeout_seconds
 
-    while True:
-        context.check_cancelled()
+    try:
+        while True:
+            context.check_cancelled()
 
-        if provider.contains_text(expected_text):
-            return
+            record_timing("polling_wait", 0.0, count=1)
+            if provider.contains_text(expected_text):
+                return
 
-        remaining = deadline - clock()
+            remaining = deadline - clock()
 
-        if remaining <= 0:
-            raise ScreenStateError(
-                f'Text "{expected_text}" was not detected within '
-                f"{timeout_seconds:g} seconds."
-            )
+            if remaining <= 0:
+                raise ScreenStateError(
+                    f'Text "{expected_text}" was not detected within '
+                    f"{timeout_seconds:g} seconds."
+                )
 
-        context.cancel_event.wait(min(interval, remaining))
+            sleep_started = time.monotonic()
+            context.cancel_event.wait(min(interval, remaining))
+            record_timing("polling_wait", time.monotonic() - sleep_started)
+    finally:
+        record_timing("wait_for_condition", time.monotonic() - wait_started)

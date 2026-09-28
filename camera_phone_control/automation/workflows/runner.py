@@ -5,6 +5,7 @@ from ..context import Cancelled
 from ..input.base import UnsupportedOperation
 from ..screen.state import UnavailableScreenStateProvider, wait_for_text
 from ..screen.stability import wait_until_stable
+from .timing import WorkflowTiming
 
 SCREEN_KEYBOARD_KEY_DELAY = 0.08
 
@@ -37,7 +38,13 @@ def type_with_screen_keyboard(input_bridge, wait, keyboard, value):
 
 
 class WorkflowRunner:
-    def __init__(self, context, external_screen=None, screen_state_provider=None):
+    def __init__(
+        self,
+        context,
+        external_screen=None,
+        screen_state_provider=None,
+        timing=None,
+    ):
         self.context = context
         self.external_screen = external_screen
         self.screen_state_provider = (
@@ -45,6 +52,7 @@ class WorkflowRunner:
             if screen_state_provider is None
             else screen_state_provider
         )
+        self.timing = timing or WorkflowTiming()
 
     def run(self, workflow, variables=None):
         workflow = validate_workflow(workflow)
@@ -52,6 +60,7 @@ class WorkflowRunner:
         ctx = self.context
         ctx.state.step_count = len(workflow["steps"])
         ctx.logger.info("Workflow started.")
+        self.timing.start()
         try:
             for index, step in enumerate(workflow["steps"], 1):
                 ctx.check_cancelled()
@@ -63,26 +72,73 @@ class WorkflowRunner:
                     len(workflow["steps"]),
                     step["type"],
                 )
+                self.timing.begin_step(index, step["type"])
                 try:
                     self.execute_step(step, values, workflow.get("keyboards", {}))
                     ctx.check_cancelled()
                 except Cancelled:
+                    self.timing.end_step("cancelled")
+                    self._log_step_timing(ctx, index)
                     ctx.logger.info("Workflow step %s cancelled.", index)
                     raise
                 except Exception:
+                    self.timing.end_step("failed")
+                    self._log_step_timing(ctx, index)
                     ctx.logger.info(
                         "Workflow step %s failed; no retry attempted.", index
                     )
                     raise
+                self.timing.end_step("completed")
+                self._log_step_timing(ctx, index)
                 ctx.logger.info("Workflow step %s completed.", index)
         finally:
             values.clear()
+            self.timing.finish()
+            summary = self.timing.snapshot()["summary"]
+            ctx.logger.info(
+                "Workflow timing total=%.3fs hid_api=%.3fs fixed_sleep=%.3fs "
+                "visual_app_wait=%.3fs camera=%.3fs ocr=%.3fs other=%.3fs "
+                "polls=%d retries=%d",
+                summary["total_seconds"],
+                summary["hid_api_seconds"],
+                summary["fixed_sleep_seconds"],
+                summary["visual_app_wait_seconds"],
+                summary["camera_frame_seconds"],
+                summary["ocr_wall_seconds"],
+                summary["other_seconds"],
+                summary["poll_count"],
+                summary["retry_count"],
+            )
             ctx.logger.info("Workflow execution finished.")
+
+    def _log_step_timing(self, ctx, index):
+        step = self.timing.snapshot()["steps"][-1]
+        ctx.logger.info(
+            "Workflow step timing index=%d name=%s total=%.3fs hid_api=%.3fs "
+            "fixed_sleep=%.3fs condition_wait=%.3fs polling_sleep=%.3fs "
+            "camera=%.3fs ocr=%.3fs matching=%.3fs polls=%d retries=%d",
+            index,
+            step["name"],
+            step["total_seconds"],
+            step["hid_api_seconds"],
+            step["fixed_sleep_seconds"],
+            step["wait_for_condition_seconds"],
+            step["polling_wait_seconds"],
+            step["camera_frame_seconds"],
+            step["ocr_preprocessing_seconds"]
+            + step["ocr_queue_seconds"]
+            + step["ocr_ipc_seconds"]
+            + step["ocr_postprocessing_seconds"],
+            step["ocr_matching_seconds"],
+            step["poll_count"],
+            step["retry_count"],
+        )
 
     def execute_step(self, step, values=None, keyboards=None):
         ctx = self.context
         ctx.check_cancelled()
         kind = step["type"]
+        
         if kind == "tap":
             ctx.input.tap(step["x"], step["y"])
         elif kind == "swipe":

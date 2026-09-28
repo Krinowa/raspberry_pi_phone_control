@@ -304,6 +304,40 @@ button.primary:hover:not(:disabled) {
   color: #687870;
   overflow-wrap: anywhere;
 }
+.account-summary {
+  margin: 10px 0;
+  padding: 10px;
+  border-radius: 7px;
+  background: #eef3f0;
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.account-summary strong,
+.account-summary span {
+  display: block;
+}
+.jobs-list {
+  display: grid;
+  gap: 8px;
+}
+.job-item {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.2fr) repeat(3, minmax(100px, 1fr));
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid #dfe5e2;
+  border-radius: 8px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.job-item strong {
+  font-family: ui-monospace, monospace;
+}
+.job-error {
+  color: #8a3d3d;
+  grid-column: 1 / -1;
+}
 .device-preview {
   position: relative;
   display: grid;
@@ -491,6 +525,12 @@ footer {
   }
   .device-list {
     grid-template-columns: 1fr;
+  }
+  .job-item {
+    grid-template-columns: 1fr;
+  }
+  .job-error {
+    grid-column: auto;
   }
   .metrics div {
     padding: 12px 16px;

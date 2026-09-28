@@ -96,6 +96,85 @@
         </div>
         <p id="device-error" class="device-error" role="alert" hidden></p>
       </section>
+      <section id="jobs" class="card jobs-card" hidden>
+        <div class="section-heading">
+          <div>
+            <h2>External Jobs</h2>
+            <p class="small">Persistent account-routed queue state.</p>
+          </div>
+        </div>
+        <p id="jobs-state" role="status" aria-live="polite">Loading jobs…</p>
+        <div id="jobs-list" class="jobs-list"></div>
+      </section>
+      <div
+        id="account-settings-dialog"
+        class="modal-backdrop"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="account-settings-title"
+        hidden
+      >
+        <form id="account-settings-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">ACCOUNT ROUTING</p>
+              <h2 id="account-settings-title">Assigned Account</h2>
+            </div>
+            <button
+              id="account-settings-close"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <label>
+            Account ID
+            <input
+              id="account-settings-id"
+              maxlength="80"
+              pattern="[A-Za-z][A-Za-z0-9_-]{0,79}"
+              required
+            />
+          </label>
+          <label>
+            Display name
+            <input id="account-settings-name" maxlength="160" required />
+          </label>
+          <label>
+            Provider / bank
+            <input id="account-settings-provider" maxlength="80" />
+          </label>
+          <label>
+            Assigned phone
+            <select id="account-settings-device"></select>
+          </label>
+          <label class="check">
+            <input id="account-settings-enabled" type="checkbox" checked />
+            Enabled
+          </label>
+          <p
+            id="account-settings-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+          <div class="flow-buttons">
+            <button id="account-settings-save" class="primary" type="submit">
+              Save Assignment
+            </button>
+            <button
+              id="account-settings-remove"
+              class="stop"
+              type="button"
+              hidden
+            >
+              Remove Assignment
+            </button>
+            <button id="account-settings-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
       <div
         id="camera-settings-dialog"
         class="modal-backdrop"

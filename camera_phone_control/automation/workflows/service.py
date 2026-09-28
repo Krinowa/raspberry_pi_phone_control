@@ -10,6 +10,7 @@ from dataclasses import asdict
 from ..backends import backend_names
 from ..runner import Runner
 from .runner import WorkflowRunner
+from .timing import WorkflowTiming
 from .validation import validate_workflow, resolve_variables
 
 
@@ -40,15 +41,20 @@ class WorkflowService:
         self.lock = threading.RLock()
         self.runs = {}
 
-    def has_active_run(self):
+    def has_active_run(self, device_id=None):
         with self.lock:
-            return any(item["thread"].is_alive() for item in self.runs.values())
+            return any(
+                item["thread"].is_alive()
+                and (device_id is None or item.get("device_id") == device_id)
+                for item in self.runs.values()
+            )
 
-    def start(self, workflow, variables=None):
+    def start(self, workflow, variables=None, *, device_id=None):
         workflow = validate_workflow(workflow)
         variables = deepcopy(variables)
         resolve_variables(workflow, variables)
         backend_names()
+        target_device_id = self.device_id if device_id is None else device_id
         with self.lock:
             if self.has_active_run():
                 raise ValueError(
@@ -69,9 +75,11 @@ class WorkflowService:
                 "cancel": cancel,
                 "resume": resume,
                 "workflow_id": workflow["id"],
+                "device_id": target_device_id,
                 "logs": handler,
                 "backend": backend_names()[0],
                 "steps": self.preview_steps(workflow),
+                "timing": WorkflowTiming(),
             }
 
             def execute():
@@ -79,11 +87,14 @@ class WorkflowService:
                     runner.run_task(
                         workflow["id"],
                         lambda ctx: WorkflowRunner(
-                            ctx, self.external_screen, self.screen_state_provider
+                            ctx,
+                            self.external_screen,
+                            self.screen_state_provider,
+                            timing=item["timing"],
                         ).run(workflow, variables),
                         cancel_event=cancel,
                         resume_event=resume,
-                        device_id=self.device_id,
+                        device_id=target_device_id,
                     )
                 finally:
                     if isinstance(variables, dict):
@@ -96,6 +107,12 @@ class WorkflowService:
             self.runs[run_id] = item
             thread.start()
             return self.snapshot(run_id)
+
+    def start_for_job(self, job, workflow):
+        """Future worker entry point with a device fixed at job creation."""
+        if workflow.get("id") != job.workflow:
+            raise ValueError("Job workflow does not match the loaded workflow.")
+        return self.start(workflow, job.payload, device_id=job.device_id)
 
     @staticmethod
     def preview_steps(workflow):
@@ -164,8 +181,10 @@ class WorkflowService:
             result.update(
                 run_id=run_id,
                 workflow_id=item["workflow_id"],
+                device_id=item["device_id"],
                 input_backend=item["backend"],
                 logs=logs,
+                timing=item["timing"].snapshot(),
             )
             index = result.get("step_index", 0)
             result["preview"] = deepcopy(item["steps"][index - 1]) if index else None

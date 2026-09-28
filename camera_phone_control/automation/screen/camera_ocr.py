@@ -8,6 +8,7 @@ import math
 import multiprocessing
 import os
 from pathlib import Path
+import resource
 import threading
 import time
 import uuid
@@ -16,11 +17,17 @@ import cv2
 import numpy as np
 
 from .state import ScreenStateError, TextDetectionUnavailable
+from ..workflows.timing import measure_timing, record_timing
 
 LOG = logging.getLogger("camera_ocr")
 
 
-def _build_paddle_engine(language, textline_orientation, cpu_threads):
+def _build_paddle_engine(
+    language,
+    textline_orientation,
+    cpu_threads,
+    recognition_batch_size=None,
+):
     """Construct Paddle only in the OCR child process."""
     try:
         from paddleocr import PaddleOCR
@@ -37,6 +44,8 @@ def _build_paddle_engine(language, textline_orientation, cpu_threads):
         use_textline_orientation=textline_orientation,
         cpu_threads=cpu_threads,
     )
+    if recognition_batch_size is not None:
+        options["text_recognition_batch_size"] = recognition_batch_size
     if language == "en":
         options.update(
             text_detection_model_name="PP-OCRv5_mobile_det",
@@ -89,6 +98,7 @@ def _paddle_worker(connection, config):
             config["language"],
             config["textline_orientation"],
             config["cpu_threads"],
+            config.get("recognition_batch_size"),
         )
         connection.send(("ready", worker_pid, time.monotonic() - started))
     except BaseException as exc:
@@ -115,15 +125,31 @@ def _paddle_worker(connection, config):
                 continue
             _, request_id, image = message
             try:
+                usage_before = resource.getrusage(resource.RUSAGE_SELF)
+                try:
+                    import psutil
+
+                    native_threads = psutil.Process().num_threads()
+                except (ImportError, OSError):
+                    native_threads = None
                 started = time.monotonic()
                 results = [_plain_result(item) for item in engine.predict(input=image)]
+                inference = time.monotonic() - started
+                usage_after = resource.getrusage(resource.RUSAGE_SELF)
                 connection.send(
                     (
                         "result",
                         request_id,
                         results,
-                        time.monotonic() - started,
+                        inference,
                         worker_pid,
+                        {
+                            "cpu_user": usage_after.ru_utime - usage_before.ru_utime,
+                            "cpu_system": usage_after.ru_stime - usage_before.ru_stime,
+                            "native_threads": native_threads,
+                            "input_width": image.shape[1],
+                            "input_height": image.shape[0],
+                        },
                     )
                 )
             except BaseException as exc:
@@ -231,18 +257,21 @@ class _PaddleWorkerClient:
         _, pid, self.initialization_seconds = message
         LOG.info(
             "PaddleOCR worker ready pid=%d main_pid=%d model_init=%.2fs "
-            "language=%s textline_orientation=%s cpu_threads=%d",
+            "language=%s textline_orientation=%s cpu_threads=%d rec_batch=%s",
             pid,
             os.getpid(),
             self.initialization_seconds,
             self.config["language"],
             self.config["textline_orientation"],
             self.config["cpu_threads"],
+            self.config.get("recognition_batch_size"),
         )
         return time.monotonic() - started
 
     def request(self, image):
+        queued_at = time.monotonic()
         with self._lock:
+            queue_wait = time.monotonic() - queued_at
             startup = self._start()
             request_id = uuid.uuid4().hex
             send_started = time.monotonic()
@@ -270,14 +299,22 @@ class _PaddleWorkerClient:
             if message[0] != "result":
                 self._stop(force=True)
                 raise ScreenStateError("PaddleOCR worker returned an invalid response.")
-            _, _, results, inference, pid = message
+            _, _, results, inference, pid, *extra = message
+            diagnostics = extra[0] if extra and isinstance(extra[0], dict) else {}
             return results, {
+                "queue_wait": queue_wait,
                 "worker_start": startup,
                 "ipc_send": send_seconds,
                 "ipc_wait": wait_seconds,
                 "inference": inference,
                 "worker_pid": pid,
+                **diagnostics,
             }
+
+    def start(self):
+        """Initialize the persistent model process without running inference."""
+        with self._lock:
+            return self._start()
 
     def _stop(self, *, force):
         process, connection = self._process, self._connection
@@ -330,6 +367,7 @@ class CameraOCRScreenStateProvider:
         )
         self.scale = self._configured_scale()
         self.cpu_threads = self._configured_cpu_threads()
+        self.recognition_batch_size = self._configured_recognition_batch_size()
         self.cache_threshold = self._configured_cache_threshold()
         self._debug_sequence = itertools.count(1)
         self._cache_signature = self._cache_candidates = None
@@ -338,6 +376,7 @@ class CameraOCRScreenStateProvider:
                 "language": self.language,
                 "textline_orientation": self.textline_orientation,
                 "cpu_threads": self.cpu_threads,
+                "recognition_batch_size": self.recognition_batch_size,
             },
             self.timeout,
         )
@@ -365,15 +404,30 @@ class CameraOCRScreenStateProvider:
 
     @staticmethod
     def _configured_cpu_threads():
-        value = os.environ.get("CAMERA_OCR_CPU_THREADS", "4").strip()
+        value = os.environ.get("CAMERA_OCR_CPU_THREADS", "1").strip()
         try:
             threads = int(value)
         except ValueError:
-            threads = 4
+            threads = 1
         if not 1 <= threads <= 16:
-            LOG.warning("Unsupported CAMERA_OCR_CPU_THREADS=%r; using 4.", value)
-            return 4
+            LOG.warning("Unsupported CAMERA_OCR_CPU_THREADS=%r; using 1.", value)
+            return 1
         return threads
+
+    @staticmethod
+    def _configured_recognition_batch_size():
+        value = os.environ.get("CAMERA_OCR_RECOGNITION_BATCH_SIZE", "1").strip()
+        try:
+            batch_size = int(value)
+        except ValueError:
+            batch_size = 1
+        if not 1 <= batch_size <= 32:
+            LOG.warning(
+                "Unsupported CAMERA_OCR_RECOGNITION_BATCH_SIZE=%r; using 1.",
+                value,
+            )
+            return 1
+        return batch_size
 
     @staticmethod
     def _configured_cache_threshold():
@@ -543,31 +597,44 @@ class CameraOCRScreenStateProvider:
         if self.debug_logging:
             LOG.info(
                 "OCR timing capture=%s decode=%s warp=%s copy=%s preprocess=%s "
-                "worker_start=%s ipc_send=%s ipc_wait=%s child_inference=%s "
+                "queue_wait=%s worker_start=%s ipc_send=%s ipc_wait=%s "
+                "child_inference=%s child_cpu_user=%s child_cpu_system=%s "
                 "total=%s cache=%s cache_mean=%s cache_changed=%s "
-                "worker_pid=%s main_pid=%d regions=%d image=%dx%d detections=%r",
+                "worker_pid=%s main_pid=%d native_threads=%s regions=%d "
+                "original=%sx%s camera=%sx%s warped=%sx%s calibrated=%sx%s "
+                "input=%dx%d "
+                "confidences=%r",
                 self._timing(timings, "capture"),
                 self._timing(timings, "decode"),
                 self._timing(timings, "warp"),
                 self._timing(timings, "copy"),
                 self._timing(timings, "preprocess"),
+                self._timing(timings, "queue_wait"),
                 self._timing(timings, "worker_start"),
                 self._timing(timings, "ipc_send"),
                 self._timing(timings, "ipc_wait"),
                 self._timing(timings, "inference"),
+                self._timing(timings, "cpu_user"),
+                self._timing(timings, "cpu_system"),
                 self._timing(timings, "total"),
                 cache_hit,
                 "n/a" if mean is None else f"{mean:.5f}",
                 "n/a" if changed is None else f"{changed:.5f}",
                 timings.get("worker_pid"),
                 os.getpid(),
+                timings.get("native_threads"),
                 len(candidates),
+                timings.get("original_frame_width", "n/a"),
+                timings.get("original_frame_height", "n/a"),
+                timings.get("camera_frame_width", "n/a"),
+                timings.get("camera_frame_height", "n/a"),
+                timings.get("warped_width", "n/a"),
+                timings.get("warped_height", "n/a"),
+                timings.get("calibrated_width", "n/a"),
+                timings.get("calibrated_height", "n/a"),
                 prepared.shape[1],
                 prepared.shape[0],
-                [
-                    {"text": item["text"], "confidence": round(item["confidence"], 1)}
-                    for item in candidates
-                ],
+                [round(item["confidence"], 1) for item in candidates],
             )
         else:
             LOG.debug(
@@ -579,18 +646,74 @@ class CameraOCRScreenStateProvider:
                 len(candidates),
             )
 
-    def _recognize_candidates(self, image, *, timings=None, total_started=None):
+    @staticmethod
+    def _record_workflow_timings(timings, frame_id, cache_hit, *, failed=False):
+        camera_seconds = sum(
+            timings.get(name, 0.0) for name in ("capture", "decode", "warp", "copy")
+        )
+        record_timing("camera_frame", camera_seconds, count=int(frame_id is not None))
+        record_timing("ocr_preprocessing", timings.get("preprocess", 0.0))
+        record_timing("ocr_queue", timings.get("queue_wait", 0.0))
+        record_timing(
+            "ocr_ipc",
+            sum(
+                timings.get(name, 0.0)
+                for name in ("worker_start", "ipc_send", "ipc_wait")
+            ),
+        )
+        record_timing("ocr_inference", timings.get("inference", 0.0))
+        record_timing("ocr_postprocessing", timings.get("postprocess", 0.0))
+        record_timing(
+            "ocr_call",
+            0.0,
+            event={
+                "frame_id": (
+                    int(frame_id) if isinstance(frame_id, np.integer) else frame_id
+                ),
+                "cache_hit": cache_hit,
+                "failed": failed,
+                "worker_pid": timings.get("worker_pid"),
+                "total_seconds": timings.get("total", 0.0),
+                "preprocessing_seconds": timings.get("preprocess", 0.0),
+                "queue_wait_seconds": timings.get("queue_wait", 0.0),
+                "ipc_send_seconds": timings.get("ipc_send", 0.0),
+                "ipc_wait_seconds": timings.get("ipc_wait", 0.0),
+                "inference_seconds": timings.get("inference", 0.0),
+                "postprocessing_seconds": timings.get("postprocess", 0.0),
+                "original_frame_width": timings.get("original_frame_width"),
+                "original_frame_height": timings.get("original_frame_height"),
+                "camera_frame_width": timings.get("camera_frame_width"),
+                "camera_frame_height": timings.get("camera_frame_height"),
+                "warped_width": timings.get("warped_width"),
+                "warped_height": timings.get("warped_height"),
+                "calibrated_width": timings.get("calibrated_width"),
+                "calibrated_height": timings.get("calibrated_height"),
+                "ocr_input_width": timings.get("input_width"),
+                "ocr_input_height": timings.get("input_height"),
+                "region_count": timings.get("region_count"),
+                "cpu_user_seconds": timings.get("cpu_user"),
+                "cpu_system_seconds": timings.get("cpu_system"),
+                "native_thread_count": timings.get("native_threads"),
+            },
+        )
+
+    def _recognize_candidates(
+        self, image, *, timings=None, total_started=None, frame_id=None
+    ):
         timings = {} if timings is None else timings
         total_started = time.monotonic() if total_started is None else total_started
         preprocess_started = time.monotonic()
         signature = self._screen_signature(image)
         timings["signature"] = time.monotonic() - preprocess_started
+        inference_queued = time.monotonic()
         with self._inference_lock:
+            provider_queue_wait = time.monotonic() - inference_queued
             cache_hit, mean_difference, changed_ratio = self._cache_match(signature)
             if cache_hit:
                 candidates = copy.deepcopy(self._cache_candidates)
                 timings.update(
-                    preprocess=time.monotonic() - preprocess_started,
+                    preprocess=timings["signature"],
+                    queue_wait=provider_queue_wait,
                     worker_start=0.0,
                     ipc_send=0.0,
                     ipc_wait=0.0,
@@ -599,20 +722,38 @@ class CameraOCRScreenStateProvider:
                 )
                 prepared = self._grayscale(image)
             else:
+                prepare_started = time.monotonic()
                 prepared = self._prepare_image(image)
-                timings["preprocess"] = time.monotonic() - preprocess_started
+                timings["preprocess"] = (
+                    timings["signature"] + time.monotonic() - prepare_started
+                )
+                timings["input_width"] = prepared.shape[1]
+                timings["input_height"] = prepared.shape[0]
                 self._save_debug_image(prepared)
+                request_started = time.monotonic()
                 try:
                     results, worker_timings = self._worker.request(prepared)
                 except Exception:
                     # A failed recognition invalidates even an older successful
                     # screen result; the next request must ask Paddle again.
                     self._cache_signature = self._cache_candidates = None
+                    timings["queue_wait"] = provider_queue_wait
+                    timings["ipc_wait"] = time.monotonic() - request_started
+                    timings["total"] = time.monotonic() - total_started
+                    self._record_workflow_timings(timings, frame_id, False, failed=True)
                     raise
+                worker_queue_wait = worker_timings.pop("queue_wait", 0.0)
                 timings.update(worker_timings)
+                timings["queue_wait"] = provider_queue_wait + worker_queue_wait
+                postprocess_started = time.monotonic()
                 candidates = self._candidates_from_results(results)
+                timings["postprocess"] = time.monotonic() - postprocess_started
                 self._cache_signature = signature.copy()
                 self._cache_candidates = copy.deepcopy(candidates)
+        timings["input_width"] = prepared.shape[1]
+        timings["input_height"] = prepared.shape[0]
+        timings["region_count"] = len(candidates)
+        timings.setdefault("postprocess", 0.0)
         timings["total"] = time.monotonic() - total_started
         self._log_result(
             timings,
@@ -622,10 +763,14 @@ class CameraOCRScreenStateProvider:
             mean_difference,
             changed_ratio,
         )
+        self._record_workflow_timings(timings, frame_id, cache_hit)
         return candidates
 
     def close(self):
         self._worker.close()
+
+    def start_worker(self):
+        return self._worker.start()
 
     def visible_text_candidates_from_image(self, image):
         return self._recognize_candidates(image)
@@ -635,11 +780,12 @@ class CameraOCRScreenStateProvider:
 
     def visible_text_candidates(self):
         total_started = time.monotonic()
-        image, _, timings = self._capture_snapshot_with_timings()
+        image, sequence, timings = self._capture_snapshot_with_timings()
         return self._recognize_candidates(
             image,
             timings=timings,
             total_started=total_started,
+            frame_id=sequence,
         )
 
     def visible_texts(self):
@@ -651,16 +797,18 @@ class CameraOCRScreenStateProvider:
             return False
         if image is None:
             total_started = time.monotonic()
-            snapshot, _, timings = self._capture_snapshot_with_timings()
+            snapshot, sequence, timings = self._capture_snapshot_with_timings()
             candidates = self._recognize_candidates(
                 snapshot,
                 timings=timings,
                 total_started=total_started,
+                frame_id=sequence,
             )
         else:
             candidates = self.visible_text_candidates_from_image(image)
-        complete_text = " ".join(item["text"] for item in candidates).casefold()
-        return expected in complete_text
+        with measure_timing("ocr_matching"):
+            complete_text = " ".join(item["text"] for item in candidates).casefold()
+            return expected in complete_text
 
 
 PaddleOCRScreenStateProvider = CameraOCRScreenStateProvider

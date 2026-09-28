@@ -1,0 +1,204 @@
+"""Validated records for account routing and persistent workflow jobs."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+
+from hardware.device_config import validate_device_id
+from automation.workflows.models import now
+from automation.workflows.validation import identifier
+
+JOB_STATES = {
+    "QUEUED",
+    "WAITING_FOR_DEVICE",
+    "RUNNING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+}
+PENDING_JOB_STATES = {"QUEUED", "WAITING_FOR_DEVICE"}
+TERMINAL_JOB_STATES = {"COMPLETED", "FAILED", "CANCELLED"}
+
+
+def _plain_text(value, label, maximum, *, required=True):
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be text.")
+    value = value.strip()
+    if (
+        (required and not value)
+        or len(value) > maximum
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"{label} must be valid text of at most {maximum} characters.")
+    return value or None
+
+
+@dataclass(frozen=True)
+class AccountBinding:
+    account_id: str
+    display_name: str
+    device_id: str
+    enabled: bool
+    created_at: str
+    updated_at: str
+    provider: str | None = None
+
+    @classmethod
+    def create(cls, data, existing=None):
+        if not isinstance(data, dict):
+            raise ValueError("Account binding must be a JSON object.")
+        allowed = {"account_id", "display_name", "provider", "device_id", "enabled"}
+        if set(data) - allowed:
+            raise ValueError("Unsupported account binding field.")
+        account_id = identifier(
+            data.get("account_id", existing.account_id if existing else None)
+        )
+        if existing is not None and account_id != existing.account_id:
+            raise ValueError("account_id is stable and cannot be changed.")
+        display_name = _plain_text(
+            data.get("display_name", existing.display_name if existing else None),
+            "display_name",
+            160,
+        )
+        provider = _plain_text(
+            data.get("provider", existing.provider if existing else None),
+            "provider",
+            80,
+            required=False,
+        )
+        device_id = data.get("device_id", existing.device_id if existing else None)
+        validate_device_id(device_id)
+        enabled = data.get("enabled", existing.enabled if existing else True)
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be true or false.")
+        timestamp = now()
+        return cls(
+            account_id=account_id,
+            display_name=display_name,
+            provider=provider,
+            device_id=device_id,
+            enabled=enabled,
+            created_at=existing.created_at if existing else timestamp,
+            updated_at=timestamp,
+        )
+
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict) or set(data) != set(cls.__dataclass_fields__):
+            raise ValueError("Stored account binding is invalid.")
+        binding = cls.create(
+            {
+                key: data.get(key)
+                for key in (
+                    "account_id",
+                    "display_name",
+                    "provider",
+                    "device_id",
+                    "enabled",
+                )
+            }
+        )
+        return cls(
+            **{
+                **asdict(binding),
+                "created_at": _plain_text(data.get("created_at"), "created_at", 80),
+                "updated_at": _plain_text(data.get("updated_at"), "updated_at", 80),
+            }
+        )
+
+    def public(self):
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class Job:
+    job_id: str
+    account_id: str
+    device_id: str
+    workflow: str
+    payload: dict
+    status: str
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    error: str | None = None
+    result: str | None = None
+    cancel_requested: bool = False
+
+    @classmethod
+    def create(cls, account_id, device_id, workflow, payload, status):
+        account_id = identifier(account_id)
+        validate_device_id(device_id)
+        workflow = identifier(workflow)
+        if status not in PENDING_JOB_STATES:
+            raise ValueError("New jobs must start queued or waiting for their device.")
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a JSON object.")
+        try:
+            encoded = json.dumps(payload, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("payload must contain valid JSON values.") from exc
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            raise ValueError("payload is too large.")
+        return cls(
+            job_id="job_" + uuid.uuid4().hex,
+            account_id=account_id,
+            device_id=device_id,
+            workflow=workflow,
+            payload=deepcopy(payload),
+            status=status,
+            created_at=now(),
+        )
+
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict) or set(data) != set(cls.__dataclass_fields__):
+            raise ValueError("Stored job record is invalid.")
+        identifier(data.get("job_id"))
+        identifier(data.get("account_id"))
+        validate_device_id(data.get("device_id"))
+        identifier(data.get("workflow"))
+        if data.get("status") not in JOB_STATES:
+            raise ValueError("Stored job status is invalid.")
+        if not isinstance(data.get("payload"), dict):
+            raise ValueError("Stored job payload is invalid.")
+        try:
+            encoded = json.dumps(data["payload"], allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Stored job payload is invalid.") from exc
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            raise ValueError("Stored job payload is too large.")
+        if type(data.get("cancel_requested")) is not bool:
+            raise ValueError("Stored cancellation state is invalid.")
+        _plain_text(data.get("created_at"), "created_at", 80)
+        for field in ("started_at", "finished_at"):
+            _plain_text(data.get(field), field, 80, required=False)
+        for field in ("error", "result"):
+            _plain_text(data.get(field), field, 500, required=False)
+        return cls(**deepcopy(data))
+
+    def stored(self):
+        return asdict(self)
+
+    def public(self, queue_position=None):
+        # Payload is intentionally excluded: status/debug endpoints must not
+        # echo future banking values or credentials.
+        return {
+            "job_id": self.job_id,
+            "account_id": self.account_id,
+            "device_id": self.device_id,
+            "workflow": self.workflow,
+            "status": self.status,
+            "queue_position": queue_position,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "error": self.error,
+            "result": self.result,
+            "cancel_requested": self.cancel_requested,
+        }

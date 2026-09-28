@@ -27,6 +27,7 @@ from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
 from automation.context import AutomationContext
 from automation.workflows.api import register_workflows
+from automation.jobs.api import register_jobs
 from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
 from hardware.raspberry_pi_input import RaspberryPiInputBridge
 
@@ -167,6 +168,17 @@ class ControlState:
                 for item in devices
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             }
+            selected = self.pi_devices.get(self.pi_bridge.device_id)
+            connected = (
+                selected.get("connected") if isinstance(selected, dict) else False
+            )
+            self.pi_connection = {
+                "api": "online",
+                "phone": "connected" if connected else "waiting",
+                "message": (
+                    "Phone Connected" if connected else "Pi Online / Phone Waiting"
+                ),
+            }
 
     def selected_pi_connected(self):
         if self.pi_bridge is None:
@@ -195,10 +207,13 @@ class ControlState:
         except DeviceError as exc:
             self.device = None
             errors.append(str(exc))
+
         camera = self.camera.status()
         if not camera["ready"]:
             errors.append(camera["error"])
+
         signature = (self.device, camera["width"], camera["height"])
+
         if errors:
             self.calibration = None
             self.calibration_restore_key = None
@@ -240,6 +255,7 @@ class ControlState:
                     )
         if not errors and self.owner and time.monotonic() >= self.expires:
             self.disable("Control heartbeat expired. Enable Manual Control again.")
+
         if not errors and self.pi_status_notice is not None:
             if self.message == self.pi_status_notice:
                 self.message = (
@@ -269,7 +285,7 @@ class ControlState:
         if self.device is None:
             self.require_ready()
         if self.pending:
-            raise DeviceBusy("automation")  # Drop the input; never replay it later.
+            raise DeviceBusy("automation")
         serial = self.device.serial
         with self.device_locks.hold(serial, "manual"):
             self.require_ready()
@@ -334,6 +350,8 @@ def create_app(
     calibration_storage=None,
     device_id=None,
     camera_manager=None,
+    account_store=None,
+    job_store=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -619,7 +637,9 @@ def create_app(
                     "Stop the active workflow or recording before changing cameras."
                 )
             previous_config = camera_manager.config(device_id)
-            config = camera_manager.update(
+            selected_device_id = selected_camera_device_id()
+            previous_selected_config = camera_manager.config(selected_device_id)
+            config, affected_devices = camera_manager.reassign(
                 device_id,
                 camera_source=data["camera_source"],
                 rotation=data["rotation"],
@@ -631,20 +651,32 @@ def create_app(
                 config.camera_source != previous_config.camera_source
                 or config.rotation != previous_config.rotation
             )
-            selected = device_id == selected_camera_device_id()
-            if selected and changed:
+            selected = device_id == selected_device_id
+            selected_config = camera_manager.config(selected_device_id)
+            selected_changed = (
+                selected_device_id in affected_devices
+                and selected_config != previous_selected_config
+            )
+            selected_calibration_revalidation = selected_changed and (
+                selected_config.camera_source != previous_selected_config.camera_source
+                or selected_config.rotation != previous_selected_config.rotation
+            )
+            if selected_changed:
                 state.disable("Camera assignment changed. Recalibrate before input.")
-                if calibration_revalidation:
+                if selected_calibration_revalidation:
                     state.calibration = None
                     state.signature = None
                     state.calibration_restore_key = None
-                state.camera = camera_manager.activate(device_id)
+                state.camera = camera_manager.activate(selected_device_id)
             details = camera_manager.status(device_id, open_camera=selected)
         return jsonify(
             ok=True,
             selected=selected,
             changed=changed,
+            affected_devices=sorted(affected_devices),
+            selected_camera_changed=selected_changed,
             calibration_revalidation_required=calibration_revalidation,
+            selected_calibration_revalidation_required=selected_calibration_revalidation,
             **details,
         )
 
@@ -660,7 +692,6 @@ def create_app(
         result = dict(bridge.devices())
         devices = result.get("devices")
         with state.lock:
-            first_catalog = not state.pi_catalog_initialized
             state.pi_catalog_initialized = True
             state.update_pi_devices(result)
             registered = (
@@ -677,7 +708,7 @@ def create_app(
             active_work = (
                 workflow_service is not None and workflow_service.has_active_run()
             ) or (recorder is not None and recorder.active)
-            if first_catalog and bridge.device_id not in registered and not active_work:
+            if bridge.device_id not in registered and not active_work:
                 fallback = (
                     "phone_A"
                     if "phone_A" in registered
@@ -824,33 +855,33 @@ def create_app(
     @app.get("/api/devices/<device_id>/camera/frame")
     def frame(device_id=None):
         with state.lock:
-            selected = selected_camera_device_id()
-            requested_device = device_id or selected
-            if requested_device is None:
-                return (
-                    jsonify(error="Select a phone before requesting a camera frame."),
-                    409,
+            with camera_manager.lock:
+                selected = selected_camera_device_id()
+                requested_device = device_id or selected
+                if requested_device is None:
+                    return (
+                        jsonify(
+                            error="Select a phone before requesting a camera frame."
+                        ),
+                        409,
+                    )
+                camera_manager.config(requested_device)
+                active_camera = (
+                    state.camera
+                    if requested_device == selected
+                    else camera_manager.get_camera(requested_device)
                 )
-            camera_manager.config(requested_device)
-            active_camera = (
-                state.camera
-                if requested_device == selected
-                else camera_manager.get_camera(requested_device)
-            )
-        camera_status = active_camera.status()
-        if not camera_status["ready"]:
-            return jsonify(error=camera_status["error"]), 503
-        latest = active_camera.frame()
-        if latest is None:
-            return jsonify(error="Camera frame unavailable."), 503
-        with state.lock:
-            if not camera_manager.is_current(requested_device, active_camera) or (
-                requested_device == selected and selected != selected_camera_device_id()
-            ):
-                return (
-                    jsonify(error="Camera selection changed; request a new frame."),
-                    409,
-                )
+                camera_status = active_camera.status()
+                if not camera_status["ready"]:
+                    return jsonify(error=camera_status["error"]), 503
+                latest = active_camera.frame()
+                if latest is None:
+                    return jsonify(error="Camera frame unavailable."), 503
+                if not camera_manager.is_current(requested_device, active_camera):
+                    return (
+                        jsonify(error="Camera selection changed; request a new frame."),
+                        409,
+                    )
         jpeg, number, _, _ = latest
         if preview_debug:
             now = time.monotonic()
@@ -1237,6 +1268,13 @@ def create_app(
         workflow_storage,
         device_id=device_id,
     )
+    register_jobs(
+        app,
+        state,
+        payload,
+        account_store=account_store,
+        job_store=job_store,
+    )
     return app
 
 
@@ -1311,6 +1349,22 @@ def main():
     )
     camera = camera_manager.activate("phone_A")
     app = create_app(camera, camera_manager=camera_manager)
+
+    screen_provider = app.extensions.get("workflow_screen_state_provider")
+    start_ocr_worker = getattr(screen_provider, "start_worker", None)
+    if start_ocr_worker is not None:
+
+        def warm_ocr_worker():
+            try:
+                start_ocr_worker()
+            except Exception as exc:
+                LOG.warning("PaddleOCR worker warmup failed: %s", exc)
+
+        threading.Thread(
+            target=warm_ocr_worker,
+            name="camera-ocr-warmup",
+            daemon=True,
+        ).start()
 
     LOG.info(
         "Open http://127.0.0.1:%d — input starts disabled",

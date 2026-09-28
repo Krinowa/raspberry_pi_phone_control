@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -21,6 +22,8 @@ DEFAULT_CAMERA_CONFIG_PATH = (
     Path(__file__).resolve().parent / "automation" / "camera_data" / "cameras.json"
 )
 ROTATIONS = {0, 90, 180, 270}
+CAMERA_REOPEN_DELAY_SECONDS = 0.05
+LOG = logging.getLogger("camera-manager")
 
 
 class CameraManagerError(RuntimeError):
@@ -195,6 +198,7 @@ class CameraManager:
             self.configs[DEFAULT_DEVICE_ID] = CameraConfig(
                 DEFAULT_DEVICE_ID, default_source, default_rotation, True
             )
+        self.source_owners = self._source_owners_for(self.configs, strict=False)
         if default_camera is not None:
             default_config = self.configs[DEFAULT_DEVICE_ID]
             camera_matches_config = (
@@ -219,20 +223,38 @@ class CameraManager:
         with self.lock:
             return {key: value.public() for key, value in self.configs.items()}
 
+    @staticmethod
+    def _source_owners_for(configs, *, strict=True):
+        owners = {}
+        for device_id, config in configs.items():
+            if not config.enabled or config.camera_source is None:
+                continue
+            previous = owners.get(config.camera_source)
+            if previous is not None and previous != device_id:
+                message = (
+                    f"Camera source {config.camera_source!r} is already assigned "
+                    f"to {previous}."
+                )
+                if strict:
+                    raise ValueError(message)
+                LOG.warning(
+                    "Ignoring duplicate persisted camera assignment: %s", message
+                )
+                continue
+            owners[config.camera_source] = device_id
+        return owners
+
     def _new_camera(self, config, device_id):
         if not config.enabled:
             return UnavailableCamera(config, "No camera is enabled for this phone.")
         if config.camera_source is None:
             return UnavailableCamera(config, "No camera is assigned to this phone.")
-        for other_id, other_camera in self.cameras.items():
-            if (
-                other_id != device_id
-                and getattr(other_camera, "source", None) == config.camera_source
-            ):
-                return UnavailableCamera(
-                    config,
-                    f"Camera source {config.camera_source!r} is already in use by {other_id}.",
-                )
+        owner = self.source_owners.get(config.camera_source)
+        if owner is not None and owner != device_id:
+            return UnavailableCamera(
+                config,
+                f"Camera source {config.camera_source!r} is already in use by {owner}.",
+            )
         camera = self.camera_factory(
             config.camera_source,
             self.width,
@@ -286,45 +308,177 @@ class CameraManager:
                 camera.fps = self.active_fps
             return camera
 
-    def update(self, device_id, *, camera_source, rotation, enabled, display_name=None):
+    def reassign(
+        self, device_id, *, camera_source, rotation, enabled, display_name=None
+    ):
+        """Apply one assignment, atomically swapping with its current owner.
+
+        A swap is possible when the edited device already owns another source. An
+        unassigned device still cannot take an occupied source because there is no
+        safe destination for the existing owner.
+        """
         config = CameraConfig(device_id, camera_source, rotation, enabled, display_name)
         with self.lock:
-            previous = self.configs.get(device_id)
-            if previous != config:
-                if config.enabled and config.camera_source is not None:
-                    duplicate = next(
-                        (
-                            other_id
-                            for other_id, other in self.configs.items()
-                            if other_id != device_id
-                            and other.enabled
-                            and other.camera_source == config.camera_source
-                        ),
-                        None,
+            previous = self.configs.get(
+                device_id, CameraConfig(device_id, None, 0, False)
+            )
+            if previous == config:
+                return config, set()
+
+            updated = dict(self.configs)
+            affected = {device_id}
+            target_owner = (
+                self.source_owners.get(config.camera_source)
+                if config.enabled and config.camera_source is not None
+                else None
+            )
+            LOG.info(
+                "Camera reassignment device_id=%s old_source=%r new_source=%r "
+                "target_owner=%s",
+                device_id,
+                previous.camera_source,
+                config.camera_source,
+                target_owner,
+            )
+            if target_owner is not None and target_owner != device_id:
+                if (
+                    not previous.enabled
+                    or previous.camera_source is None
+                    or self.source_owners.get(previous.camera_source) != device_id
+                ):
+                    raise ValueError(
+                        f"Camera source {config.camera_source!r} is already assigned "
+                        f"to {target_owner}."
                     )
-                    if duplicate is not None:
-                        raise ValueError(
-                            f"Camera source {config.camera_source!r} is already assigned to {duplicate}."
-                        )
-                updated = dict(self.configs)
-                updated[device_id] = config
+                owner_config = updated[target_owner]
+                updated[target_owner] = replace(
+                    owner_config, camera_source=previous.camera_source
+                )
+                affected.add(target_owner)
+                LOG.info(
+                    "Camera swap device_id=%s source=%r other_device_id=%s source=%r",
+                    device_id,
+                    config.camera_source,
+                    target_owner,
+                    previous.camera_source,
+                )
+            updated[device_id] = config
+            new_owners = self._source_owners_for(updated)
+
+            old_configs = self.configs
+            old_owners = self.source_owners
+            reopen = {
+                item
+                for item in affected
+                if item in self.cameras or item == self.active_device_id
+            }
+            released = False
+            for affected_id in sorted(affected):
+                released = self._release_locked(affected_id) or released
+            if released:
+                # AVFoundation can retain an exclusive device handle very briefly
+                # after release. Keep the pause bounded and inside this transaction.
+                time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
+
+            self.configs = updated
+            self.source_owners = new_owners
+            try:
+                self._open_devices_locked(reopen)
+                self.storage.save(updated)
+            except Exception as exc:
+                LOG.exception(
+                    "Camera reassignment failed; restoring previous assignments "
+                    "device_id=%s old_source=%r new_source=%r",
+                    device_id,
+                    previous.camera_source,
+                    config.camera_source,
+                )
+                rollback_released = False
+                for affected_id in sorted(affected):
+                    rollback_released = (
+                        self._release_locked(affected_id) or rollback_released
+                    )
+                self.configs = old_configs
+                self.source_owners = old_owners
+                if rollback_released:
+                    time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
                 try:
-                    self.storage.save(updated)
-                except (OSError, TypeError, ValueError) as exc:
+                    self._open_devices_locked(reopen)
+                except Exception:
+                    LOG.exception("Failed to reopen a camera while rolling back")
+                if isinstance(exc, (OSError, TypeError, ValueError)):
                     raise CameraManagerError(
-                        "Camera settings could not be saved to local storage."
+                        "Camera settings could not be applied; previous assignments were restored."
                     ) from exc
-                self._release_locked(device_id)
-                self.configs[device_id] = config
-            return config
+                raise CameraManagerError(
+                    "Camera could not be reopened; previous assignments were restored."
+                ) from exc
+
+            LOG.info(
+                "Camera reassignment complete device_id=%s old_source=%r "
+                "new_source=%r affected=%s owners=%s",
+                device_id,
+                previous.camera_source,
+                config.camera_source,
+                sorted(affected),
+                self.source_owners,
+            )
+            return self.configs[device_id], affected
+
+    def update(self, device_id, *, camera_source, rotation, enabled, display_name=None):
+        config, _ = self.reassign(
+            device_id,
+            camera_source=camera_source,
+            rotation=rotation,
+            enabled=enabled,
+            display_name=display_name,
+        )
+        return config
+
+    def _open_devices_locked(self, device_ids):
+        for device_id in sorted(device_ids):
+            config = self.configs.get(device_id)
+            if config is None:
+                continue
+            LOG.info(
+                "Reopening camera device_id=%s source=%r",
+                device_id,
+                config.camera_source,
+            )
+            camera = self._new_camera(config, device_id)
+            self.cameras[device_id] = camera
+            wait_until_opened = getattr(camera, "wait_until_opened", None)
+            if wait_until_opened is not None:
+                opened = wait_until_opened()
+                if opened is not True:
+                    error = camera.status().get("error")
+                    if opened is None:
+                        error = error or "Timed out while opening the camera source."
+                    raise CameraManagerError(
+                        error or f"Cannot open camera source {config.camera_source!r}."
+                    )
+            LOG.info(
+                "Camera reopen result device_id=%s source=%r ready=%s error=%s",
+                device_id,
+                config.camera_source,
+                camera.status().get("ready"),
+                camera.status().get("error"),
+            )
 
     def _release_locked(self, device_id):
         camera = self.cameras.pop(device_id, None)
         self.last_opened.pop(device_id, None)
         if camera is not None and camera not in self.cameras.values():
+            LOG.info(
+                "Releasing camera device_id=%s source=%r",
+                device_id,
+                getattr(camera, "source", None),
+            )
             close = getattr(camera, "close", None)
             if close is not None:
                 close()
+            return True
+        return False
 
     def release_device(self, device_id):
         with self.lock:
@@ -341,22 +495,25 @@ class CameraManager:
                     close()
 
     def status(self, device_id, *, open_camera=True):
-        config = self.config(device_id)
-        camera = self.get_camera(device_id, open_camera=open_camera)
-        status = (
-            camera.status()
-            if camera is not None
-            else {
-                "ready": False,
-                "source": (
-                    None if config.camera_source is None else str(config.camera_source)
-                ),
-                "width": None,
-                "height": None,
-                "error": "Camera has not been opened.",
-            }
-        )
-        return {"config": config.public(), "status": status}
+        with self.lock:
+            config = self.config(device_id)
+            camera = self.get_camera(device_id, open_camera=open_camera)
+            status = (
+                camera.status()
+                if camera is not None
+                else {
+                    "ready": False,
+                    "source": (
+                        None
+                        if config.camera_source is None
+                        else str(config.camera_source)
+                    ),
+                    "width": None,
+                    "height": None,
+                    "error": "Camera has not been opened.",
+                }
+            )
+            return {"config": config.public(), "status": status}
 
     def is_current(self, device_id, camera):
         with self.lock:
@@ -460,33 +617,35 @@ class CameraManager:
             ):
                 return [dict(item) for item in self.discovery_cache]
 
-            cameras = []
-            backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
             with self.lock:
+                cameras = []
+                backend = (
+                    cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
+                )
                 opened = {
                     camera.source: camera.status()["ready"]
                     for camera in self.cameras.values()
                     if type(getattr(camera, "source", None)) is int
                 }
-            for source in range(first, last + 1):
-                if source in opened:
-                    if opened[source]:
-                        cameras.append({"source": source, "available": True})
-                    continue
-                capture = None
-                try:
-                    capture = cv2.VideoCapture(source, backend)
-                    if capture.isOpened():
-                        readable, frame = capture.read()
-                        if readable and frame is not None:
+                for source in range(first, last + 1):
+                    if source in opened:
+                        if opened[source]:
                             cameras.append({"source": source, "available": True})
-                except Exception:
-                    # An invalid index is omitted from discovery. A configured
-                    # source is still returned by the per-device camera route.
-                    pass
-                finally:
-                    if capture is not None:
-                        capture.release()
-            self.discovery_cache = [dict(item) for item in cameras]
-            self.discovery_cached_at = time.monotonic()
-            return cameras
+                        continue
+                    capture = None
+                    try:
+                        capture = cv2.VideoCapture(source, backend)
+                        if capture.isOpened():
+                            readable, frame = capture.read()
+                            if readable and frame is not None:
+                                cameras.append({"source": source, "available": True})
+                    except Exception:
+                        # An invalid index is omitted from discovery. A configured
+                        # source is still returned by the per-device camera route.
+                        pass
+                    finally:
+                        if capture is not None:
+                            capture.release()
+                self.discovery_cache = [dict(item) for item in cameras]
+                self.discovery_cached_at = time.monotonic()
+                return cameras

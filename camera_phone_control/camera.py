@@ -43,7 +43,12 @@ class Camera:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = None
+        self.capture = None
+        self.opened_event = threading.Event()
+        self.open_succeeded = None
         self.latest = None
+        self.raw_frame_width = None
+        self.raw_frame_height = None
         self.sequence = 0
         self.timestamps = deque(maxlen=90)
 
@@ -65,6 +70,8 @@ class Camera:
     def start(self):
         if self.thread is not None and self.thread.is_alive():
             return
+        self.opened_event.clear()
+        self.open_succeeded = None
         self.thread = threading.Thread(
             target=self._capture,
             daemon=True,
@@ -116,6 +123,9 @@ class Camera:
         try:
             cap = self._open_capture()
 
+            with self.lock:
+                self.capture = cap
+
             if not cap.isOpened():
                 raise RuntimeError(
                     f"Cannot open camera source {self.source!r}. "
@@ -156,6 +166,8 @@ class Camera:
                         "Check the camera stream/network and restart the server."
                     )
 
+                raw_frame_height, raw_frame_width = frame.shape[:2]
+
                 # Rotate exactly once, before the shared JPEG is stored. Preview,
                 # calibration, OCR, stability checks, and frame APIs all consume
                 # this same encoded frame and its rotated dimensions.
@@ -180,6 +192,12 @@ class Camera:
 
                 with self.lock:
 
+                    if self.open_succeeded is None:
+                        # Reassignment is successful only after this source has
+                        # delivered and encoded a real frame.
+                        self.open_succeeded = True
+                        self.opened_event.set()
+
                     self.sequence += 1
 
                     self.latest = (
@@ -188,6 +206,8 @@ class Camera:
                         frame_width,
                         frame_height,
                     )
+                    self.raw_frame_width = raw_frame_width
+                    self.raw_frame_height = raw_frame_height
 
                     self.timestamps.append(
                         (
@@ -241,13 +261,30 @@ class Camera:
             )
 
             with self.lock:
+                if self.open_succeeded is None:
+                    self.open_succeeded = False
+                    self.opened_event.set()
                 self.error = str(exc)
                 self.latest = None
 
         finally:
 
-            if cap is not None:
+            should_release = False
+            with self.lock:
+                if self.capture is cap:
+                    self.capture = None
+                    should_release = True
+                if self.open_succeeded is None:
+                    self.open_succeeded = False
+                    self.opened_event.set()
+            if cap is not None and should_release:
                 cap.release()
+
+    def wait_until_opened(self, timeout=1.5):
+        if not self.opened_event.wait(timeout):
+            return None
+        with self.lock:
+            return self.open_succeeded
 
     def status(self):
         with self.lock:
@@ -308,6 +345,15 @@ class Camera:
 
     def close(self):
         self.stop_event.set()
+
+        # Releasing from the controlling thread also unblocks a backend read
+        # that has not returned yet. This ensures a reassignment does not open
+        # the same physical source while the old AVFoundation handle survives.
+        with self.lock:
+            capture = self.capture
+            self.capture = None
+        if capture is not None:
+            capture.release()
 
         if self.thread:
             self.thread.join(timeout=2)

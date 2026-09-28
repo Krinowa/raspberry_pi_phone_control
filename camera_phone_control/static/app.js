@@ -18,6 +18,7 @@ let calibrating = false,
   busy = false;
 let statusRefreshInFlight = false;
 let legacyStatusTimer = null;
+let runtimeStatusTimer = null;
 let controlVersion = 0;
 let keyboardArmed = false;
 let heartbeatInFlight = false;
@@ -46,7 +47,19 @@ const deviceDeletesInFlight = new Set();
 const devicePreviewTimers = new Map();
 let devicePreviewGeneration = 0;
 let cameraSettingsDeviceId = null;
+let deviceRefreshLastSuccessAt = null;
+let deviceRefreshError = "";
+let deviceStatusStale = false;
+let addPhonePanelOpen = false;
+let addPhoneEnrollmentTarget = null;
+let addPhoneInitialDeviceIds = new Set();
+let accountBindings = [];
+let jobCatalog = [];
+let accountSettingsDeviceId = null;
+let accountSettingsAccountId = null;
 const DEVICE_REFRESH_MS = 1000;
+const DEVICE_STATUS_STALE_MS = 5000;
+const RUNTIME_STATUS_MS = 2000;
 const PREVIEW_INTERVAL_MS = 65;
 const PREVIEW_ERROR_RETRY_MS = 600;
 const PREVIEW_BACKGROUND_MS = 1000;
@@ -201,6 +214,19 @@ const deviceService = {
     ),
 };
 
+const accountService = {
+  list: () => api("/api/accounts", undefined, "GET", { monitor: false }),
+  create: (binding) => api("/api/accounts", binding),
+  update: (accountId, changes) =>
+    api(`/api/accounts/${encodeURIComponent(accountId)}`, changes, "PATCH"),
+  remove: (accountId) =>
+    api(`/api/accounts/${encodeURIComponent(accountId)}`, {}, "DELETE"),
+};
+
+const jobService = {
+  list: () => api("/api/jobs", undefined, "GET", { monitor: false }),
+};
+
 function setDeviceError(message = "") {
   const node = $("device-error");
   node.textContent = message;
@@ -225,6 +251,22 @@ function scheduleDeviceRefresh(active = true) {
   deviceRefreshTimer = setTimeout(() => loadDevices(), DEVICE_REFRESH_MS);
 }
 
+function scheduleRuntimeStatusRefresh(delay = RUNTIME_STATUS_MS) {
+  clearTimeout(runtimeStatusTimer);
+  runtimeStatusTimer = null;
+  if (
+    devicePollingStopped ||
+    document.hidden ||
+    state?.manual_backend !== "raspberry_pi"
+  )
+    return;
+  runtimeStatusTimer = setTimeout(async () => {
+    runtimeStatusTimer = null;
+    await refreshStatus();
+    scheduleRuntimeStatusRefresh();
+  }, delay);
+}
+
 function selectedPiDevice() {
   const selected = deviceCatalog?.selected_device;
   return Array.isArray(deviceCatalog?.devices)
@@ -234,6 +276,7 @@ function selectedPiDevice() {
 
 function selectedPiDeviceConnected() {
   if (state?.manual_backend !== "raspberry_pi") return true;
+  if (deviceStatusStale) return false;
   return selectedPiDevice()?.connected === true;
 }
 
@@ -256,6 +299,8 @@ function cameraState(details) {
   )
     return { label: "Unassigned", className: "" };
   if (!config.enabled) return { label: "Disabled", className: "" };
+  if (details?.status?.poll_failed)
+    return { label: "Status unavailable", className: "" };
   return details?.status?.ready
     ? { label: "Available", className: "connected" }
     : { label: "Unavailable", className: "" };
@@ -322,9 +367,11 @@ function renderDevices() {
     : [];
   const enrollment = deviceCatalog?.enrollment || { active: false };
   const selected = deviceCatalog?.selected_device;
-  $("device-state").textContent = devices.length
-    ? `${devices.length} registered phone${devices.length === 1 ? "" : "s"}. All cameras remain visible; one phone receives control.`
-    : "No phones are registered with this Pi yet.";
+  $("device-state").textContent = deviceStatusStale
+    ? "Device status unavailable. Retrying automatically."
+    : devices.length
+      ? `${devices.length} registered phone${devices.length === 1 ? "" : "s"}. All cameras remain visible; one phone receives control.`
+      : "No phones are registered with this Pi yet.";
 
   const cards = devices.map((device) => {
     const details = deviceCameraDetails?.[device.id] || {};
@@ -358,11 +405,16 @@ function renderDevices() {
     states.className = "device-states";
     const bluetooth = document.createElement("span");
     bluetooth.className =
-      "device-status" + (device.connected ? " connected" : "");
-    bluetooth.textContent = `Bluetooth: ● ${device.connected ? "Connected" : "Disconnected"}`;
+      "device-status" +
+      (!deviceStatusStale && device.connected ? " connected" : "");
+    bluetooth.textContent = deviceStatusStale
+      ? "Bluetooth: ? Status unavailable"
+      : `Bluetooth: ● ${device.connected ? "Connected" : "Disconnected"}`;
     const cameraStatus = document.createElement("span");
     cameraStatus.className = "device-status " + status.className;
-    cameraStatus.textContent = `Camera: ● ${status.label}`;
+    cameraStatus.textContent = deviceStatusStale
+      ? "Camera: ? Status unavailable"
+      : `Camera: ● ${status.label}`;
     states.append(bluetooth, cameraStatus);
 
     const mac = document.createElement("p");
@@ -406,6 +458,23 @@ function renderDevices() {
         ? "No camera assigned"
         : `Camera ${camera.camera_source} · ${camera.rotation ?? 0}°`;
 
+    const binding = accountBindings.find(
+      (account) => account.device_id === device.id,
+    );
+    const accountSummary = document.createElement("div");
+    accountSummary.className = "account-summary";
+    const accountHeading = document.createElement("strong");
+    accountHeading.textContent = "Assigned Account";
+    const accountName = document.createElement("span");
+    accountName.textContent = binding
+      ? `${binding.provider ? `${binding.provider} · ` : ""}${binding.display_name}${
+          binding.enabled ? "" : " · Disabled"
+        }`
+      : "No account assigned";
+    const accountId = document.createElement("span");
+    accountId.textContent = binding?.account_id || "—";
+    accountSummary.append(accountHeading, accountName, accountId);
+
     const actions = document.createElement("div");
     actions.className = "device-item-actions";
     const select = document.createElement("button");
@@ -418,6 +487,13 @@ function renderDevices() {
     settings.textContent = "Camera Settings";
     settings.disabled = deviceManagementBlocked();
     settings.addEventListener("click", () => openCameraSettings(device));
+    const account = document.createElement("button");
+    account.type = "button";
+    account.textContent = binding ? "Account Settings" : "Assign Account";
+    account.disabled = deviceManagementBlocked();
+    account.addEventListener("click", () =>
+      openAccountSettings(device, binding),
+    );
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "stop";
@@ -427,14 +503,23 @@ function renderDevices() {
     remove.disabled =
       deviceDeletesInFlight.has(device.id) || deviceManagementBlocked();
     remove.addEventListener("click", () => deleteDevice(device, remove));
-    actions.append(select, settings, remove);
-    card.append(heading, states, mac, preview, summary, actions);
+    actions.append(select, settings, account, remove);
+    card.append(
+      heading,
+      states,
+      mac,
+      preview,
+      summary,
+      accountSummary,
+      actions,
+    );
     return card;
   });
   $("device-list").replaceChildren(...cards);
 
   $("device-enrollment-active").hidden = !enrollment.active;
-  $("device-enrollment-form").hidden = true;
+  $("device-enrollment-form").hidden =
+    !addPhonePanelOpen || !!enrollment.active;
   $("device-add").disabled = !!enrollment.active || deviceManagementBlocked();
   if (enrollment.active) {
     $("device-enrollment-target").textContent = enrollment.target_device_id
@@ -446,50 +531,260 @@ function renderDevices() {
       ? `${Math.max(0, Math.ceil(enrollment.remaining_seconds))} seconds remaining`
       : "Enrollment window active";
   }
+  renderJobs();
+}
+
+function renderJobs() {
+  const jobs = Array.isArray(jobCatalog) ? jobCatalog : [];
+  $("jobs-state").textContent = jobs.length
+    ? `${jobs.length} persistent job${jobs.length === 1 ? "" : "s"}.`
+    : "No external jobs have been submitted.";
+
+  const cards = [...jobs]
+    .reverse()
+    .slice(0, 50)
+    .map((job) => {
+      const item = document.createElement("article");
+      item.className = "job-item";
+      const id = document.createElement("strong");
+      id.textContent = job.job_id;
+      const account = document.createElement("span");
+      account.textContent = `Account: ${job.account_id}`;
+      const device = document.createElement("span");
+      device.textContent = `Device: ${job.device_id}`;
+      const workflow = document.createElement("span");
+      workflow.textContent = `Workflow: ${job.workflow}`;
+      const status = document.createElement("span");
+      status.textContent = job.queue_position
+        ? `${job.status} · queue ${job.queue_position}`
+        : job.status;
+
+      const created = document.createElement("span");
+      created.textContent = `Queued: ${job.created_at || "—"}`;
+      const activity = document.createElement("span");
+      activity.textContent = job.finished_at
+        ? `Finished: ${job.finished_at}`
+        : job.started_at
+          ? `Started: ${job.started_at}`
+          : "Not started";
+
+      item.append(id, account, device, workflow, status, created, activity);
+
+      if (job.error) {
+        const error = document.createElement("span");
+        error.className = "job-error";
+        error.textContent = job.error;
+        item.append(error);
+      }
+      return item;
+    });
+
+  $("jobs-list").replaceChildren(...cards);
+}
+
+function setAccountSettingsError(message = "") {
+  $("account-settings-error").textContent = message;
+  $("account-settings-error").hidden = !message;
+}
+
+function closeAccountSettings() {
+  accountSettingsDeviceId = null;
+  accountSettingsAccountId = null;
+  $("account-settings-dialog").hidden = true;
+  setAccountSettingsError();
+}
+
+function openAccountSettings(device, binding = null) {
+  accountSettingsDeviceId = device.id;
+  accountSettingsAccountId = binding?.account_id || null;
+  $("account-settings-title").textContent =
+    `Assigned Account · ${device.name || device.id}`;
+  $("account-settings-id").value = binding?.account_id || "";
+  $("account-settings-id").readOnly = !!binding;
+  $("account-settings-name").value = binding?.display_name || "";
+  $("account-settings-provider").value = binding?.provider || "";
+  $("account-settings-enabled").checked = binding?.enabled ?? true;
+  const options = (deviceCatalog?.devices || []).map((candidate) => {
+    const option = document.createElement("option");
+    option.value = candidate.id;
+    option.textContent = candidate.name || candidate.id;
+    return option;
+  });
+  $("account-settings-device").replaceChildren(...options);
+  $("account-settings-device").value = binding?.device_id || device.id;
+  $("account-settings-remove").hidden = !binding;
+  $("account-settings-dialog").hidden = false;
+  setAccountSettingsError();
+  $(binding ? "account-settings-name" : "account-settings-id").focus();
+}
+
+async function saveAccountSettings(event) {
+  event.preventDefault();
+  const binding = {
+    display_name: $("account-settings-name").value.trim(),
+    provider: $("account-settings-provider").value.trim() || null,
+    device_id: $("account-settings-device").value,
+    enabled: $("account-settings-enabled").checked,
+  };
+  const button = $("account-settings-save");
+  button.disabled = true;
+  setAccountSettingsError();
+  try {
+    if (accountSettingsAccountId) {
+      await accountService.update(accountSettingsAccountId, binding);
+    } else {
+      await accountService.create({
+        account_id: $("account-settings-id").value.trim(),
+        ...binding,
+      });
+    }
+    closeAccountSettings();
+    deviceRenderSignature = null;
+    await loadDevices();
+    notice("Account assignment saved.");
+  } catch (error) {
+    setAccountSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function removeAccountSettings() {
+  if (!accountSettingsAccountId) return;
+  const button = $("account-settings-remove");
+  button.disabled = true;
+  setAccountSettingsError();
+  try {
+    await accountService.remove(accountSettingsAccountId);
+    closeAccountSettings();
+    deviceRenderSignature = null;
+    await loadDevices();
+    notice("Account assignment removed.");
+  } catch (error) {
+    setAccountSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function reconcileAddPhonePanel(devices, enrollment) {
+  const registered = new Set(devices.map((device) => device.id));
+  const typedDeviceId = String($("device-enrollment-id").value || "").trim();
+  const completedTarget = addPhoneEnrollmentTarget || typedDeviceId;
+  const targetWasAdded =
+    completedTarget &&
+    registered.has(completedTarget) &&
+    (addPhoneEnrollmentTarget !== null ||
+      !addPhoneInitialDeviceIds.has(completedTarget));
+  if (targetWasAdded) {
+    addPhonePanelOpen = false;
+    addPhoneEnrollmentTarget = null;
+    addPhoneInitialDeviceIds = new Set();
+    $("device-enrollment-id").value = "";
+    setDeviceError();
+    return;
+  }
+  if (enrollment?.active) addPhonePanelOpen = false;
+  if (
+    addPhoneEnrollmentTarget &&
+    !enrollment?.active &&
+    !registered.has(addPhoneEnrollmentTarget)
+  ) {
+    // Enrollment ended without registering the requested phone. Keep the
+    // typed ID available for a deliberate retry when the user reopens Add Phone.
+    addPhoneEnrollmentTarget = null;
+  }
 }
 
 async function loadDevices() {
   if (deviceRefreshInFlight || state?.manual_backend !== "raspberry_pi") return;
   deviceRefreshInFlight = true;
   try {
+    const wasStale = deviceStatusStale;
+    const previousPiState = JSON.stringify(state?.pi || null);
     const nextCatalog = await deviceService.list();
     deviceCatalog = nextCatalog;
     const devices = Array.isArray(nextCatalog.devices)
       ? nextCatalog.devices
       : [];
-    const cameraEntries = await Promise.all(
-      devices.map(async (device) => {
-        try {
-          return [device.id, await deviceService.camera(device.id)];
-        } catch (error) {
-          return [
-            device.id,
-            {
-              config: null,
-              status: { ready: false, error: error.message },
-            },
-          ];
-        }
-      }),
-    );
+    reconcileAddPhonePanel(devices, nextCatalog.enrollment);
+    const [cameraEntries, accountResult, jobResult] = await Promise.all([
+      Promise.all(
+        devices.map(async (device) => {
+          try {
+            return [device.id, await deviceService.camera(device.id)];
+          } catch (error) {
+            const previous = deviceCameraDetails?.[device.id] || {};
+            return [
+              device.id,
+              {
+                config: previous.config || null,
+                status: {
+                  ...(previous.status || {}),
+                  poll_failed: true,
+                  error: error.message,
+                },
+              },
+            ];
+          }
+        }),
+      ),
+      accountService.list().catch(() => ({ accounts: accountBindings })),
+      jobService.list().catch(() => ({ jobs: jobCatalog })),
+    ]);
     const nextCameras = Object.fromEntries(cameraEntries);
+    accountBindings = Array.isArray(accountResult.accounts)
+      ? accountResult.accounts
+      : accountBindings;
+    jobCatalog = Array.isArray(jobResult.jobs) ? jobResult.jobs : jobCatalog;
     const nextSignature = JSON.stringify({
       devices: nextCatalog.devices,
       enrollment: nextCatalog.enrollment,
       default_device: nextCatalog.default_device,
       selected_device: nextCatalog.selected_device,
       cameras: nextCameras,
+      accounts: accountBindings,
+      jobs: jobCatalog,
+      status_unavailable: false,
     });
     deviceCameraDetails = nextCameras;
-    setDeviceError();
-    if (nextSignature !== deviceRenderSignature) {
+    deviceRefreshLastSuccessAt = Date.now();
+    deviceRefreshError = "";
+    deviceStatusStale = false;
+    if (state) {
+      const selected = devices.find(
+        (device) => device.id === nextCatalog.selected_device,
+      );
+      state.pi = {
+        api: "online",
+        phone: selected?.connected ? "connected" : "waiting",
+        message: selected?.connected
+          ? "Phone Connected"
+          : "Pi Online / Phone Waiting",
+      };
+    }
+    if (!addPhonePanelOpen) setDeviceError();
+    if (
+      nextSignature !== deviceRenderSignature ||
+      wasStale ||
+      previousPiState !== JSON.stringify(state?.pi || null)
+    ) {
       deviceRenderSignature = nextSignature;
       renderDevices();
       render();
       window.phoneRecorder?.deviceStateChanged?.();
     }
   } catch (error) {
-    setDeviceError(error.message);
+    deviceRefreshError = error.message;
+    const stale =
+      deviceRefreshLastSuccessAt === null ||
+      Date.now() - deviceRefreshLastSuccessAt >= DEVICE_STATUS_STALE_MS;
+    if (stale !== deviceStatusStale) {
+      deviceStatusStale = stale;
+      renderDevices();
+      render();
+      window.phoneRecorder?.deviceStateChanged?.();
+    }
   } finally {
     deviceRefreshInFlight = false;
     scheduleDeviceRefresh(
@@ -646,7 +941,9 @@ async function saveDeviceCamera(event) {
       enabled: $("camera-settings-enabled").checked,
     });
     const selected = deviceId === deviceCatalog?.selected_device;
-    if (selected) {
+    const selectedCameraChanged =
+      result.selected_camera_changed === true || selected;
+    if (selectedCameraChanged) {
       manual = false;
       calibrating = false;
       corners = [];
@@ -656,11 +953,14 @@ async function saveDeviceCamera(event) {
     deviceRenderSignature = null;
     await refreshStatus();
     await loadDevices();
-    if (result.calibration_revalidation_required) {
+    if (
+      result.calibration_revalidation_required ||
+      result.selected_calibration_revalidation_required
+    ) {
       notice(
         "Camera configuration changed. Existing screen calibration may no longer match. Recalibrate before control.",
       );
-      if (selected) $("calibrate").textContent = "Recalibrate";
+      if (selectedCameraChanged) $("calibrate").textContent = "Recalibrate";
     } else {
       notice(`Camera settings saved for ${deviceId}.`);
     }
@@ -700,6 +1000,7 @@ async function deleteDevice(device, button) {
   try {
     const result = await deviceService.remove(device.id);
     if (Array.isArray(result.devices)) deviceCatalog = result;
+    if (deviceCameraDetails) delete deviceCameraDetails[device.id];
     notice(`Deleted ${device.id} from the Raspberry Pi.`);
     deviceRenderSignature = null;
     renderDevices();
@@ -777,6 +1078,7 @@ function render() {
   const piMode = state?.manual_backend === "raspberry_pi";
   const selectedDevice = selectedPiDevice();
   $("devices").hidden = !piMode;
+  $("jobs").hidden = !piMode;
   $("serial").textContent =
     (piMode && selectedDevice
       ? `Controlling: ${selectedDevice.name || selectedDevice.id}`
@@ -784,14 +1086,16 @@ function render() {
     state?.device?.serial ||
     (piMode ? "Bluetooth phone unavailable" : "No authorized USB phone");
   $("pi-connection").hidden = !piMode;
-  $("pi-api-state").textContent =
-    connectionState === "reconnecting"
+  $("pi-api-state").textContent = deviceStatusStale
+    ? "Status unavailable"
+    : connectionState === "reconnecting"
       ? "Pi Reconnecting..."
       : state?.pi?.api === "online"
         ? "Online"
         : "Pi Offline";
-  $("pi-phone-state").textContent =
-    state?.pi?.phone === "connected"
+  $("pi-phone-state").textContent = deviceStatusStale
+    ? "Status unavailable"
+    : state?.pi?.phone === "connected"
       ? "Connected"
       : state?.pi?.api === "online"
         ? "Phone Waiting"
@@ -1054,6 +1358,8 @@ window.phoneConnection = {
   isPhysicalBusy: () => physicalBusy,
   runPhysical,
 };
+
+window.phoneRuntimeStateChanged = () => refreshStatus();
 
 async function refreshStatus() {
   if (statusRefreshInFlight) return;
@@ -1479,19 +1785,30 @@ setInterval(async () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && manual) disable().catch(() => {});
+  if (document.hidden) window.phoneRecorder?.pausePolling?.();
+  else window.phoneRecorder?.resumePolling?.();
   // Background tabs are intentionally low-rate. Restore the normal cadence
   // immediately when Chrome makes the page visible again.
   schedulePreview(document.hidden ? PREVIEW_BACKGROUND_MS : 0);
-  if (document.hidden) scheduleDeviceRefresh(false);
-  else if (state?.manual_backend === "raspberry_pi") loadDevices();
+  if (document.hidden) {
+    scheduleDeviceRefresh(false);
+    clearTimeout(runtimeStatusTimer);
+    runtimeStatusTimer = null;
+  } else if (state?.manual_backend === "raspberry_pi") {
+    loadDevices();
+    scheduleRuntimeStatusRefresh(0);
+  }
 });
 
 window.addEventListener("pagehide", () => {
   stopDevicePreviews();
+  window.phoneRecorder?.shutdown?.();
   clearInterval(legacyStatusTimer);
   legacyStatusTimer = null;
   clearTimeout(deviceRefreshTimer);
   deviceRefreshTimer = null;
+  clearTimeout(runtimeStatusTimer);
+  runtimeStatusTimer = null;
   devicePollingStopped = true;
   // Best effort on close; the server's six-second lease is the fallback.
   if (manual)
@@ -1527,6 +1844,7 @@ async function loadStatus() {
   }
   await refreshStatus();
   if (state?.manual_backend === "raspberry_pi") await loadDevices();
+  scheduleRuntimeStatusRefresh();
   startLegacyStatusPolling();
 }
 
@@ -1534,21 +1852,28 @@ $("device-add").addEventListener("click", () => {
   const devices = Array.isArray(deviceCatalog?.devices)
     ? deviceCatalog.devices
     : [];
+  addPhoneInitialDeviceIds = new Set(devices.map((device) => device.id));
   $("device-enrollment-id").value = nextDeviceId(devices);
-  $("device-enrollment-form").hidden = false;
+  addPhonePanelOpen = true;
+  renderDevices();
   $("device-enrollment-id").focus();
   setDeviceError();
 });
 
 $("device-enrollment-cancel").addEventListener("click", () => {
-  $("device-enrollment-form").hidden = true;
+  addPhonePanelOpen = false;
+  addPhoneInitialDeviceIds = new Set();
+  renderDevices();
 });
 
 $("device-enrollment-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   setDeviceError();
   try {
-    await deviceService.startEnrollment($("device-enrollment-id").value.trim());
+    const target = $("device-enrollment-id").value.trim();
+    await deviceService.startEnrollment(target);
+    addPhoneEnrollmentTarget = target;
+    addPhonePanelOpen = false;
     await loadDevices();
   } catch (error) {
     setDeviceError(error.message);
@@ -1564,6 +1889,13 @@ $("device-enrollment-stop").addEventListener("click", async () => {
     setDeviceError(error.message);
   }
 });
+$("account-settings-form").addEventListener("submit", saveAccountSettings);
+$("account-settings-remove").addEventListener("click", removeAccountSettings);
+$("account-settings-cancel").addEventListener("click", closeAccountSettings);
+$("account-settings-close").addEventListener("click", closeAccountSettings);
+$("account-settings-dialog").addEventListener("click", (event) => {
+  if (event.target === $("account-settings-dialog")) closeAccountSettings();
+});
 $("camera-settings-form").addEventListener("submit", saveDeviceCamera);
 $("camera-settings-test").addEventListener("click", testCameraSettings);
 $("camera-settings-refresh").addEventListener("click", () =>
@@ -1577,8 +1909,10 @@ $("camera-settings-dialog").addEventListener("click", (event) => {
 window.addEventListener("pageshow", (event) => {
   if (event.persisted) {
     devicePollingStopped = false;
+    window.phoneRecorder?.resumePolling?.();
     refreshStatus();
     loadDevices();
+    scheduleRuntimeStatusRefresh();
     startLegacyStatusPolling();
   }
 });

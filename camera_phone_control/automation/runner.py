@@ -16,6 +16,7 @@ from .backends import select_device, backend_names
 from .input.base import UnsupportedOperation
 from .screen.state import ScreenStateError
 from .screen.stability import ScreenStabilityError
+from .workflows.timing import measure_timing
 from .scripts import SCRIPTS, available_scripts
 
 LOG = logging.getLogger("automation")
@@ -165,8 +166,9 @@ class Runner:
                     self.logger.info(
                         "Manual checkpoint entered; device ownership released."
                     )
-                    while not resume_event.wait(0.05):
-                        context.check_cancelled()
+                    with measure_timing("manual_wait"):
+                        while not resume_event.wait(0.05):
+                            context.check_cancelled()
                     context.check_cancelled()
                     ownership = stack.enter_context(
                         self.device_locks.hold(device.serial, "automation")

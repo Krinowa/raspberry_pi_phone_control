@@ -100,11 +100,12 @@ For a standalone copy, Python 3.10+ is required. Create an environment with
 Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector and its
 English-specific PP-OCRv5 mobile recognizer on the CPU. The document-orientation
 and document-unwarping models are disabled; text line orientation is also
-disabled by default. Paddle and its models are created lazily, exactly once in a
-persistent spawned worker process, then reused for the life of the server. This
+disabled by default. Paddle and its models are created exactly once in a
+persistent spawned worker process, then reused for the life of the server. A
+background warmup starts the worker before Flask begins serving so model
+initialization normally finishes before the first workflow OCR request. This
 keeps Paddle's native inference work and Python-runtime contention out of the
-camera/Flask process. The first request can take longer while the models are
-downloaded and initialized.
+camera/Flask process.
 
 On an Apple Silicon Mac (`uname -m` prints `arm64`), install the CPU build in the
 active virtual environment with:
@@ -130,11 +131,21 @@ orientation only for screens that regularly rotate individual lines:
 CAMERA_OCR_TEXTLINE_ORIENTATION=1 python app.py --camera 0
 ```
 
-OCR uses four CPU inference threads in the worker by default. Tune this between
-1 and 16 only after measuring on the target machine:
+OCR uses one CPU inference thread in the worker by default. On the current Mac,
+one and four configured threads had effectively identical medians while one
+thread had the tighter p95. Tune this between 1 and 16 only after measuring on
+the target machine:
 
 ```zsh
 CAMERA_OCR_CPU_THREADS=2 python app.py --camera 0
+```
+
+Text regions are recognized one at a time by default. On the current Apple
+Silicon/Paddle 3.3 setup this is faster than PaddleOCR's implicit batch default
+for phone screens with many differently sized lines. It remains configurable:
+
+```zsh
+CAMERA_OCR_RECOGNITION_BATCH_SIZE=1 python app.py --camera 0
 ```
 
 Successful OCR results are reused only when a downsampled screen signature is
@@ -147,15 +158,27 @@ CAMERA_OCR_CACHE_THRESHOLD=0.002 python app.py --camera 0
 ```
 
 For one-request diagnostics, save the exact NumPy image passed to PaddleOCR and
-log its dimensions, detected text, region count, confidence, and separate
-capture, decode, warp, copy, preprocessing, worker startup, IPC send/wait,
-child-process inference, total timing, cache status, worker PID, and main PID:
+log its dimensions, region count, confidence, queue wait, child CPU/thread data,
+and separate capture, decode, warp, copy, preprocessing, worker startup, IPC
+send/wait, child-process inference, total timing, cache status, worker PID, and
+main PID. Logs deliberately omit recognized text:
 
 ```zsh
 CAMERA_OCR_DEBUG=1 \
 CAMERA_OCR_DEBUG_DIR=/tmp/camera-ocr-debug \
 python app.py --camera 0
 curl http://127.0.0.1:8765/api/ocr/texts
+```
+
+Benchmark a saved real OCR input at the production size, 75%, 50%, and 960/720
+long-side caps. The report checks only the expected strings and does not print
+recognized screen text:
+
+```zsh
+python -m automation.screen.benchmark_paddle \
+  /tmp/camera-ocr-debug/paddle-ocr-0001.png \
+  --iterations 5 --recognition-batch-size 1 \
+  --output /tmp/camera-ocr-benchmark.json
 ```
 
 To profile camera delivery around an OCR request, restart with preview debugging
@@ -543,6 +566,76 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
   `context.screen.capture()` as PNG bytes; no screenshots are saved automatically.
   Use manual checkpoints for authentication and final financial authorization.
   Coordinate taps cannot determine an app action's meaning.
+
+## Account-routed external jobs
+
+External jobs use a persistent account binding rather than the dashboard's current
+phone selection. Each account has a stable `account_id`, display name, optional
+provider, one `device_id`, and an enabled flag. The current model permits one account
+per device. It stores routing metadata only; credentials, passwords, PINs, OTPs, and
+other banking secrets do not belong in account bindings.
+
+Account routes:
+
+```text
+GET    /api/accounts
+POST   /api/accounts
+GET    /api/accounts/<account_id>
+PATCH  /api/accounts/<account_id>
+DELETE /api/accounts/<account_id>
+GET    /api/accounts/<account_id>/device
+```
+
+Create a passive queued job with:
+
+```json
+POST /api/jobs
+{
+  "account_id": "uob_account_1",
+  "workflow": "flow_example",
+  "payload": {}
+}
+```
+
+The server validates the enabled account and saved workflow, resolves the account's
+device once, persists that `device_id`, and returns `202 Accepted`. Changing the
+dashboard control target later does not move the job. `GET /api/jobs` and
+`GET /api/jobs/<job_id>` expose safe status metadata without echoing the stored
+payload. `POST /api/jobs/<job_id>/cancel` immediately cancels queued jobs. Running
+jobs record `cancel_requested`; a future worker will connect that flag to the active
+workflow run.
+
+Job states are `QUEUED`, `WAITING_FOR_DEVICE`, `RUNNING`, `COMPLETED`, `FAILED`, and
+`CANCELLED`. Queues are ordered independently per device. A scheduler reservation is
+atomic, permits at most one running job for a device, and never substitutes another
+phone. On restart, an interrupted `RUNNING` job becomes `FAILED`; physical HID input
+is never replayed automatically.
+
+Bindings and jobs are stored as private, atomically replaced JSON files under
+`automation/job_data/`. The dashboard shows the account assigned to each device and
+a read-only view of recent jobs. These local APIs currently retain the dashboard's
+same-origin and control-token protections; a production external service needs a
+separate authenticated ingress policy before network exposure. The JSON stores and
+scheduler serialize threads in the current single Flask process. A future
+multi-process or multi-host deployment must move reservation and queue transitions
+to a transactional database or another shared locking system.
+
+The intended worker flow is:
+
+```text
+POST /api/jobs -> persistent job -> per-device scheduler -> background worker
+-> CameraManager frame -> OCR / visual state -> workflow -> Pi HID
+-> persist result -> release device
+```
+
+The background worker is intentionally deferred. Two existing lifecycle constraints
+must be addressed with it: cameras for inactive devices are generally opened by
+dashboard/status access, `WorkflowService` currently enforces one active run for the
+whole process, and its calibrated OCR provider follows the dashboard's selected
+camera state. The prepared `start_for_job()` entry point fixes a job's HID target at
+creation, but it is not called automatically. A future worker must also load the
+captured device's camera and per-device calibration context; after that, execution
+will not require the browser to remain open.
 
 ## Errors and diagnostics
 

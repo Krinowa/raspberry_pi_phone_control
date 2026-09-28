@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .stability import ScreenStabilityError
+from ..workflows.timing import record_timing
 
 
 class CalibratedCamera:
@@ -85,58 +86,61 @@ class _DisplaySession:
 
     def capture(self):
         """Return a tiny normalized frame for screen-stability detection."""
+        started = time.monotonic()
+        try:
+            jpeg, sequence, _, _, timestamp = self._sample()
 
-        jpeg, sequence, _, _, timestamp = self._sample()
+            if sequence != self.last_id:
+                # Stability detection intentionally uses a very small image.
+                # This is cheap and ignores tiny text/pixel changes.
+                try:
+                    image = cv2.imdecode(
+                        np.frombuffer(jpeg, np.uint8),
+                        cv2.IMREAD_REDUCED_GRAYSCALE_4,
+                    )
+                except cv2.error:
+                    raise ScreenStabilityError(
+                        "External camera frame could not be decoded."
+                    ) from None
 
-        if sequence != self.last_id:
-            # Stability detection intentionally uses a very small image.
-            # This is cheap and ignores tiny text/pixel changes.
-            try:
-                image = cv2.imdecode(
-                    np.frombuffer(jpeg, np.uint8),
-                    cv2.IMREAD_REDUCED_GRAYSCALE_4,
+                if image is None:
+                    raise ScreenStabilityError(
+                        "External camera frame could not be decoded."
+                    )
+
+                height, width = image.shape
+
+                matrix = (
+                    np.diag([95.0, 159.0, 1.0])
+                    @ self.calibration.transform
+                    @ np.diag(
+                        [
+                            1.0 / width,
+                            1.0 / height,
+                            1.0,
+                        ]
+                    )
                 )
-            except cv2.error:
-                raise ScreenStabilityError(
-                    "External camera frame could not be decoded."
-                ) from None
 
-            if image is None:
-                raise ScreenStabilityError(
-                    "External camera frame could not be decoded."
+                crop = cv2.warpPerspective(
+                    image,
+                    matrix,
+                    (96, 160),
                 )
 
-            height, width = image.shape
-
-            matrix = (
-                np.diag([95.0, 159.0, 1.0])
-                @ self.calibration.transform
-                @ np.diag(
-                    [
-                        1.0 / width,
-                        1.0 / height,
-                        1.0,
-                    ]
+                # Exclude outer display borders where phone edges may mix
+                # with the desk/background.
+                self.image = cv2.GaussianBlur(
+                    crop[2:-2, 2:-2],
+                    (3, 3),
+                    0,
                 )
-            )
 
-            crop = cv2.warpPerspective(
-                image,
-                matrix,
-                (96, 160),
-            )
+                self.last_id = sequence
 
-            # Exclude outer display borders where phone edges may mix
-            # with the desk/background.
-            self.image = cv2.GaussianBlur(
-                crop[2:-2, 2:-2],
-                (3, 3),
-                0,
-            )
-
-            self.last_id = sequence
-
-        return self.image, sequence, timestamp
+            return self.image, sequence, timestamp
+        finally:
+            record_timing("camera_frame", time.monotonic() - started, count=1)
 
     def capture_for_ocr(
         self,
@@ -152,6 +156,17 @@ class _DisplaySession:
         """
 
         jpeg, sequence, frame_width, frame_height, timestamp = self._sample(timings)
+        if timings is not None:
+            timings.update(
+                original_frame_width=getattr(
+                    self.state.camera, "raw_frame_width", None
+                ),
+                original_frame_height=getattr(
+                    self.state.camera, "raw_frame_height", None
+                ),
+                camera_frame_width=frame_width,
+                camera_frame_height=frame_height,
+            )
 
         if sequence != self.last_ocr_id:
             decode_started = time.monotonic()
@@ -203,6 +218,12 @@ class _DisplaySession:
                     aspect = horizontal / vertical
                 output_width = round(output_height * float(np.clip(aspect, 0.3, 2.5)))
 
+            if timings is not None:
+                timings.update(
+                    warped_width=output_width,
+                    warped_height=output_height,
+                )
+
             matrix = (
                 np.diag(
                     [
@@ -243,5 +264,11 @@ class _DisplaySession:
 
             self.ocr_image = crop
             self.last_ocr_id = sequence
+
+        if timings is not None and self.ocr_image is not None:
+            timings.update(
+                calibrated_width=self.ocr_image.shape[1],
+                calibrated_height=self.ocr_image.shape[0],
+            )
 
         return self.ocr_image, sequence, timestamp

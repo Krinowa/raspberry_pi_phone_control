@@ -8,6 +8,7 @@ from .input.raspberry_pi import RaspberryPiWorkflowInput
 from hardware.raspberry_pi_input import RaspberryPiInputBridge
 from .screen.appium import AppiumScreenProvider, DeferredAppiumScreenProvider
 from .screen.base import ScreenProvider
+from .workflows.timing import measure_timing
 
 
 class BackendConfigurationError(ValueError):
@@ -64,7 +65,8 @@ class GuardedInput:
         }.get(name, "input " + name)
         with self._context._step(label):
             self._context._check_device()
-            return getattr(self._backend, name)(*args)
+            with measure_timing("hid_api"):
+                return getattr(self._backend, name)(*args)
 
     def tap(self, x, y):
         return self._call("tap", x, y)
