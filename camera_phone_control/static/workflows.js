@@ -11,6 +11,7 @@
     running = null,
     working = false,
     gesture = null;
+  let availableFlows = [];
   let editingId = null,
     timelineSignature = "",
     timelineWasLive = false,
@@ -71,6 +72,11 @@
 
     if (step.type === "wait_for_text")
       return `Wait for Text — “${step.text}” · Max ${step.timeout_seconds} sec`;
+
+    if (step.type === "capture_screen") {
+      const label = typeof suffix === "string" ? suffix.trim() : "";
+      return `Capture Screenshot${label && label.toLocaleLowerCase() !== "screenshot" ? " — " + label : ""}`;
+    }
 
     if (step.type === "wait") return `Wait ${step.seconds} seconds`;
 
@@ -314,6 +320,7 @@
 
     $("flow-name").value = draft.name;
     $("flow-financial").checked = !!draft.financial;
+    renderRecoveryWorkflowOptions(draft.recovery_workflow_id || "");
     const positions = [new Option("At the beginning", "0")];
     const rows = draft.steps.map((step, index) => {
       const row = document.createElement("li"),
@@ -545,6 +552,8 @@
     $("record-capture-keyboard").disabled = stopping || annotationBusy();
     $("review-capture-keyboard").disabled = annotationBusy();
     $("record-input-variable").disabled = stopping || annotationBusy();
+    $("record-screenshot-here").disabled =
+      working || stopping || annotationBusy();
     $("record-variable-input").hidden = !variableInputOpen;
 
     const sharedPhysicalBusy =
@@ -926,6 +935,17 @@
     ),
   );
 
+  $("flow-recovery-workflow").addEventListener("change", () =>
+    task(() =>
+      review({
+        operation: "rename_flow",
+        name: $("flow-name").value,
+        financial: $("flow-financial").checked,
+        recovery_workflow_id: $("flow-recovery-workflow").value || null,
+      }),
+    ),
+  );
+
   function stabilityFields(prefix) {
     const stable_ms = Number($(`${prefix}-stable-ms`).value);
     const timeout_seconds = Number($(`${prefix}-stable-timeout`).value);
@@ -1170,6 +1190,16 @@
     ),
   );
 
+  $("record-screenshot").addEventListener("click", () =>
+    task(() =>
+      review({
+        operation: "insert",
+        index: Number($("insert-position").value),
+        step: { type: "capture_screen", label: "Screenshot" },
+      }),
+    ),
+  );
+
   $("record-checkpoint").addEventListener("click", () =>
     task(() =>
       review({
@@ -1219,7 +1249,7 @@
     renderRecording();
   }
 
-  function enqueue(step, extra = {}) {
+  function enqueueRecording(operation) {
     if (!recording.active || annotationBusy()) return captureQueue;
     if (queued >= 32) {
       textBuffer = "";
@@ -1244,15 +1274,20 @@
       return captureQueue;
     }
     queued++;
-    captureQueue = captureQueue.then(async () => {
+    const queuedOperation = captureQueue.then(async () => {
       try {
-        if (recording.active) await capture(step, extra);
+        if (recording.active) await operation();
       } finally {
         queued--;
         renderRecording();
       }
     });
-    return captureQueue;
+    captureQueue = queuedOperation.catch(() => {});
+    return queuedOperation;
+  }
+
+  function enqueue(step, extra = {}) {
+    return enqueueRecording(() => capture(step, extra));
   }
 
   function flushText() {
@@ -1320,6 +1355,21 @@
       await pendingManual;
       await flushText();
       await openExpectedText(null, null, "current");
+    }),
+  );
+
+  $("record-screenshot-here").addEventListener("click", () =>
+    task(async () => {
+      if (!recording.active || stopping || annotationBusy()) return;
+      await pendingManual;
+      flushText();
+      await enqueueRecording(async () => {
+        recording = await api("/api/recorder/step", {
+          capture: false,
+          step: { type: "capture_screen", label: "Screenshot" },
+        });
+        show("Screenshot marker added. Recording continues.");
+      });
     }),
   );
 
@@ -1586,6 +1636,7 @@
         operation: "rename_flow",
         name: $("flow-name").value.trim(),
         financial: $("flow-financial").checked,
+        recovery_workflow_id: $("flow-recovery-workflow").value || null,
       });
 
       const saved = await api("/api/recorder/save", {});
@@ -1876,23 +1927,48 @@
 
   async function loadFlows() {
     const result = await api("/api/workflows", undefined, "GET");
+
     backend = result.input_backend;
+    availableFlows = result.workflows;
+
+    renderRecoveryWorkflowOptions(
+      recording.workflow?.recovery_workflow_id || "",
+    );
 
     $("workflow-backend").textContent =
       `Input: ${backend} · Screen: ${result.screen_backend}`;
 
     const rows = result.workflows.map((flow) => {
-      const row = document.createElement("li"),
-        label = document.createElement("span");
+      const row = document.createElement("li");
+      const label = document.createElement("span");
 
-      label.textContent = `${flow.name} · ${flow.step_count} steps · ${flow.variable_count} variables · Created ${flow.created_at ? new Date(flow.created_at).toLocaleString() : "—"} · Updated ${flow.updated_at ? new Date(flow.updated_at).toLocaleString() : "—"}`;
+      label.textContent =
+        `${flow.name} · ` +
+        `${flow.step_count} steps · ` +
+        `${flow.variable_count} variables · ` +
+        `Created ${
+          flow.created_at ? new Date(flow.created_at).toLocaleString() : "—"
+        } · ` +
+        `Updated ${
+          flow.updated_at ? new Date(flow.updated_at).toLocaleString() : "—"
+        }`;
 
+      // Run workflow
+      // Visible in BOTH Operate and Admin.
+      // Reuses the existing workflow selection / execution flow.
       const select = document.createElement("button");
+      select.type = "button";
       select.textContent = "Run…";
+
       select.addEventListener("click", () => task(() => selectFlow(flow.id)));
 
+      // Edit workflow
+      // Admin only.
       const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "admin-only";
       edit.textContent = "Edit";
+
       edit.addEventListener("click", () =>
         task(async () => {
           recording = await api("/api/recorder/edit", {
@@ -1914,25 +1990,56 @@
         }),
       );
 
+      // Delete workflow
+      // Admin only.
       const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "admin-only stop";
       remove.textContent = "Delete";
+
       remove.addEventListener("click", () =>
         task(async () => {
-          if (!window.confirm(`Delete workflow “${flow.name}”?`)) return;
+          if (!window.confirm(`Delete workflow “${flow.name}”?`)) {
+            return;
+          }
+
           await api("/api/workflows/" + flow.id, {}, "DELETE");
+
+          // If the deleted workflow is currently selected for running,
+          // clear the run panel.
           if (selected?.id === flow.id) {
             selected = null;
+
             $("run-variables").replaceChildren();
             $("run-title").textContent = "Run Flow";
           }
+
           await loadFlows();
         }),
       );
 
       row.append(label, select, edit, remove);
+
       return row;
     });
+
     $("saved-flows").replaceChildren(...rows);
+  }
+
+  function renderRecoveryWorkflowOptions(selectedId) {
+    const select = $("flow-recovery-workflow");
+    if (!select) return;
+    const currentId = recording.workflow?.id;
+    const options = [new Option("None", "")];
+    for (const flow of availableFlows) {
+      if (flow.id === currentId) continue;
+      options.push(new Option(flow.name, flow.id));
+    }
+    if (selectedId && !availableFlows.some((flow) => flow.id === selectedId)) {
+      options.push(new Option(`Missing workflow (${selectedId})`, selectedId));
+    }
+    select.replaceChildren(...options);
+    select.value = selectedId;
   }
 
   async function selectFlow(id) {
@@ -2056,13 +2163,16 @@
     const nextRunStateSignature = `${running.run_id}:${running.status}`;
     if (nextRunStateSignature !== runStateSignature) {
       runStateSignature = nextRunStateSignature;
-      window.phoneRuntimeStateChanged?.();
+      window.phoneRuntimeStateChanged?.(running);
     }
     $("flow-run-state").textContent =
       `${running.status} · Step ${running.step_index || 0}/${running.step_count || 0} · ${running.preview ? describe(running.preview, (running.step_index || 1) - 1) : "Starting"}${running.checkpoint_message ? " — " + running.checkpoint_message : ""}${terminal.has(running.status) ? " — " + (running.message || "") : ""}`;
     $("flow-resume").hidden = running.status !== "waiting_manual";
     $("flow-cancel").disabled = terminal.has(running.status);
     $("workflow-logs").textContent = (running.logs || []).join("\n");
+    $("operate-workflow-log").textContent = (running.logs || [])
+      .slice(-6)
+      .join("\n");
     drawPreview(running.preview);
     renderRecording();
   }

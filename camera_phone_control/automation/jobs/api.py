@@ -123,7 +123,12 @@ def register_jobs(
             raise RecordConflict("Account binding is disabled.")
         workflow = workflow_storage.read(data["workflow"])
         resolve_variables(workflow, data["payload"])
-        job = scheduler.enqueue(binding, workflow["id"], data["payload"])
+        job = scheduler.enqueue(
+            binding,
+            workflow["id"],
+            data["payload"],
+            recovery_workflow_id=workflow.get("recovery_workflow_id"),
+        )
         return jsonify(scheduler.public(job)), 202
 
     @app.get("/api/jobs/<job_id>")
@@ -135,5 +140,20 @@ def register_jobs(
         if payload():
             raise ValueError("Cancel Job expects an empty JSON object.")
         return jsonify(scheduler.public(executor.cancel(job_id)))
+
+    @app.post("/api/jobs/<job_id>/recover")
+    def recover_job_phone(job_id):
+        if payload():
+            raise ValueError("Recover Phone expects an empty JSON object.")
+        return jsonify(scheduler.public(executor.recover(job_id))), 202
+
+    @app.post("/api/jobs/<job_id>/verify-ready")
+    def verify_job_phone_ready(job_id):
+        if payload():
+            raise ValueError("Ready-state verification expects an empty JSON object.")
+        return (
+            jsonify(scheduler.public(executor.recover(job_id, verify_only=True))),
+            202,
+        )
 
     return scheduler

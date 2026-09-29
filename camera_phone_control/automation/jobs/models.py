@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import uuid
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from pathlib import PurePosixPath
 
 from hardware.device_config import validate_device_id
 from automation.workflows.models import now
@@ -47,6 +48,43 @@ def _plain_text(value, label, maximum, *, required=True):
     ):
         raise ValueError(f"{label} must be valid text of at most {maximum} characters.")
     return value or None
+
+
+def _screenshot_metadata(values):
+    if not isinstance(values, list) or len(values) > 1000:
+        raise ValueError("Job screenshots must be a list of at most 1000 items.")
+    result = []
+    for item in values:
+        if not isinstance(item, dict) or set(item) != {
+            "step_id",
+            "label",
+            "captured_at",
+            "relative_path",
+        }:
+            raise ValueError("Stored screenshot metadata is invalid.")
+        step_id = identifier(item.get("step_id"))
+        label = _plain_text(item.get("label"), "screenshot label", 160, required=False)
+        captured_at = _plain_text(item.get("captured_at"), "captured_at", 80)
+        relative_path = _plain_text(item.get("relative_path"), "relative_path", 240)
+        path = PurePosixPath(relative_path)
+        if (
+            path.is_absolute()
+            or len(path.parts) != 2
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path.suffix.casefold() != ".jpg"
+        ):
+            raise ValueError(
+                "Stored screenshot path must be a relative daily JPEG path."
+            )
+        result.append(
+            {
+                "step_id": step_id,
+                "label": label,
+                "captured_at": captured_at,
+                "relative_path": relative_path,
+            }
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -148,6 +186,12 @@ class Job:
     external_ref: str | None = None
     bank: str | None = None
     action: str | None = None
+    recovery_workflow_id: str | None = None
+    recovery_status: str | None = None
+    recovery_run_id: str | None = None
+    recovery_error: str | None = None
+    recovered_at: str | None = None
+    screenshots: list = field(default_factory=list)
 
     @classmethod
     def create(
@@ -161,6 +205,7 @@ class Job:
         external_ref=None,
         bank=None,
         action=None,
+        recovery_workflow_id=None,
     ):
         account_id = identifier(account_id)
         validate_device_id(device_id)
@@ -182,6 +227,8 @@ class Job:
         external_ref = _plain_text(external_ref, "external_ref", 256, required=False)
         bank = _plain_text(bank, "bank", 80, required=False)
         action = _plain_text(action, "action", 80, required=False)
+        if recovery_workflow_id is not None:
+            recovery_workflow_id = identifier(recovery_workflow_id)
 
         return cls(
             job_id="job_" + uuid.uuid4().hex,
@@ -194,6 +241,7 @@ class Job:
             external_ref=external_ref,
             bank=bank,
             action=action,
+            recovery_workflow_id=recovery_workflow_id,
         )
 
     @classmethod
@@ -202,12 +250,25 @@ class Job:
             raise ValueError("Stored job record is invalid.")
 
         fields = set(cls.__dataclass_fields__)
-        legacy_fields = fields - {"external_ref", "bank", "action"}
-
-        if set(data) == legacy_fields:
-            data = {**data, "external_ref": None, "bank": None, "action": None}
-        elif set(data) != fields:
+        optional_fields = {
+            "external_ref",
+            "bank",
+            "action",
+            "recovery_workflow_id",
+            "recovery_status",
+            "recovery_run_id",
+            "recovery_error",
+            "recovered_at",
+            "screenshots",
+        }
+        required_fields = fields - optional_fields
+        if set(data) - fields or not required_fields.issubset(data):
             raise ValueError("Stored job record is invalid.")
+        data = {
+            **{field: None for field in optional_fields - {"screenshots"}},
+            "screenshots": [],
+            **data,
+        }
 
         identifier(data.get("job_id"))
         identifier(data.get("account_id"))
@@ -237,6 +298,22 @@ class Job:
         _plain_text(data.get("external_ref"), "external_ref", 256, required=False)
         _plain_text(data.get("bank"), "bank", 80, required=False)
         _plain_text(data.get("action"), "action", 80, required=False)
+        recovery_workflow_id = data.get("recovery_workflow_id")
+        if recovery_workflow_id is not None:
+            identifier(recovery_workflow_id)
+        if data.get("recovery_status") not in {
+            None,
+            "RECOVERING",
+            "READY",
+            "NEEDS_ATTENTION",
+        }:
+            raise ValueError("Stored recovery status is invalid.")
+        recovery_run_id = data.get("recovery_run_id")
+        if recovery_run_id is not None:
+            identifier(recovery_run_id)
+        _plain_text(data.get("recovery_error"), "recovery_error", 500, required=False)
+        _plain_text(data.get("recovered_at"), "recovered_at", 80, required=False)
+        data["screenshots"] = _screenshot_metadata(data.get("screenshots"))
         return cls(**deepcopy(data))
 
     def stored(self):
@@ -261,4 +338,10 @@ class Job:
             "error": self.error,
             "result": self.result,
             "cancel_requested": self.cancel_requested,
+            "recovery_workflow_id": self.recovery_workflow_id,
+            "recovery_status": self.recovery_status,
+            "recovery_run_id": self.recovery_run_id,
+            "recovery_error": self.recovery_error,
+            "recovered_at": self.recovered_at,
+            "screenshots": deepcopy(self.screenshots),
         }

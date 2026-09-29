@@ -16,7 +16,7 @@
       src="{{ url_for('static', filename='workflows.js') }}"
     ></script>
   </head>
-  <body>
+  <body data-dashboard-mode="operate">
     <main>
       <header>
         <div>
@@ -25,7 +25,93 @@
         </div>
         <span class="local-tag">● On this Mac only</span>
       </header>
-      <section class="metrics" aria-label="Connection details">
+      <nav class="dashboard-tabs" aria-label="Dashboard mode">
+        <button id="dashboard-operate" type="button" aria-selected="true">
+          Operate
+        </button>
+        <button id="dashboard-admin" type="button" aria-selected="false">
+          Admin
+        </button>
+      </nav>
+      <section
+        class="card operate-only operate-health"
+        aria-labelledby="operate-health-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">SYSTEM STATUS</p>
+            <h2 id="operate-health-title">Operational health</h2>
+          </div>
+        </div>
+        <div class="health-grid">
+          <div>
+            <span>Controller</span
+            ><strong id="operate-controller-state">Checking…</strong>
+          </div>
+          <div>
+            <span>Raspberry Pi</span
+            ><strong id="operate-pi-state">Checking…</strong>
+          </div>
+          <div>
+            <span>HID</span><strong id="operate-hid-state">Checking…</strong>
+          </div>
+          <div>
+            <span>Camera</span
+            ><strong id="operate-camera-state">Checking…</strong>
+          </div>
+          <div>
+            <span>OCR</span><strong id="operate-ocr-state">Checking…</strong>
+          </div>
+        </div>
+        <div id="operate-attention" class="operate-attention" hidden>
+          <strong id="operate-attention-message">Calibration required</strong>
+          <button id="operate-resolve-issue" class="primary" type="button">
+            Resolve Issue
+          </button>
+        </div>
+      </section>
+      <section
+        id="operate-recovery"
+        class="card operate-only recovery-panel"
+        aria-labelledby="operate-recovery-title"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">NEEDS ATTENTION</p>
+            <h2 id="operate-recovery-title">Resolve Issue</h2>
+          </div>
+          <span id="operate-recovery-state" class="badge">Needs Attention</span>
+        </div>
+        <dl class="recovery-summary">
+          <div>
+            <dt>Issue</dt>
+            <dd id="operate-recovery-issue">Checking device status…</dd>
+          </div>
+          <div>
+            <dt>Recommended action</dt>
+            <dd id="operate-recovery-recommendation">
+              Review the available recovery options.
+            </dd>
+          </div>
+        </dl>
+        <p id="operate-recovery-result" role="status" aria-live="polite"></p>
+        <div class="flow-buttons">
+          <button
+            id="operate-recover-phone"
+            class="primary"
+            type="button"
+            hidden
+          >
+            Recover Phone
+          </button>
+          <button id="operate-view-details" type="button">View Details</button>
+          <button id="operate-open-assistance" type="button" hidden>
+            Open Manual Assistance
+          </button>
+        </div>
+      </section>
+      <section class="metrics admin-only" aria-label="Connection details">
         <div>
           <span>Phone control</span
           ><strong id="serial">Checking connection…</strong>
@@ -38,7 +124,7 @@
       </section>
       <section
         id="pi-connection"
-        class="metrics pi-metrics"
+        class="metrics pi-metrics admin-only"
         aria-label="Pi connection status"
       >
         <div>
@@ -56,13 +142,19 @@
               Monitor every phone camera and choose one control target.
             </p>
           </div>
-          <button id="device-add" type="button">Add Phone</button>
+          <button id="device-add" class="admin-only" type="button">
+            Add Phone
+          </button>
         </div>
         <p id="device-state" role="status" aria-live="polite">
           Loading registered phones…
         </p>
         <div id="device-list" class="device-list" aria-live="polite"></div>
-        <form id="device-enrollment-form" class="device-enrollment" hidden>
+        <form
+          id="device-enrollment-form"
+          class="device-enrollment admin-only"
+          hidden
+        >
           <label>
             Logical device ID
             <input
@@ -82,7 +174,7 @@
         </form>
         <div
           id="device-enrollment-active"
-          class="device-enrollment-active"
+          class="device-enrollment-active admin-only"
           hidden
         >
           <div>
@@ -96,7 +188,7 @@
         </div>
         <p id="device-error" class="device-error" role="alert" hidden></p>
       </section>
-      <section id="jobs" class="card jobs-card" hidden>
+      <section id="jobs" class="card jobs-card operate-only" hidden>
         <div class="section-heading">
           <div>
             <h2>Jobs</h2>
@@ -106,7 +198,7 @@
         <p id="jobs-state" role="status" aria-live="polite">Loading jobs…</p>
         <div id="jobs-list" class="jobs-list"></div>
       </section>
-      <section id="ocr-settings" class="card ocr-settings-card">
+      <section id="ocr-settings" class="card ocr-settings-card admin-only">
         <div class="section-heading">
           <div>
             <h2>OCR Worker Pool</h2>
@@ -195,7 +287,7 @@
       </section>
       <div
         id="account-settings-dialog"
-        class="modal-backdrop"
+        class="modal-backdrop admin-only"
         role="dialog"
         aria-modal="true"
         aria-labelledby="account-settings-title"
@@ -264,7 +356,7 @@
       </div>
       <div
         id="camera-settings-dialog"
-        class="modal-backdrop"
+        class="modal-backdrop admin-only"
         role="dialog"
         aria-modal="true"
         aria-labelledby="camera-settings-title"
@@ -334,8 +426,8 @@
           </div>
         </form>
       </div>
-      <div class="workspace">
-        <section class="viewer">
+      <div class="workspace control-workspace">
+        <section class="viewer manual-control-surface">
           <div class="section-heading">
             <h2>Camera view</h2>
             <span id="frame-state">Waiting for live video</span>
@@ -354,11 +446,11 @@
           <div class="viewer-footer">
             <span id="instruction"
               >Input is disabled. Calibrate the display to begin.</span
-            ><output id="coordinates">—</output>
+            ><output id="coordinates" class="admin-only">—</output>
           </div>
         </section>
         <aside>
-          <section id="record-card" class="card">
+          <section id="record-card" class="card admin-only">
             <div class="section-heading"><h2>Record</h2></div>
             <button id="record-new" class="primary">● Start Recording</button>
             <p id="record-guidance" class="small">
@@ -392,6 +484,9 @@
                   <button id="record-input-variable">Input Variable</button>
                   <button id="record-expect-current">
                     Expect Current Screen
+                  </button>
+                  <button id="record-screenshot-here" type="button">
+                    Mark Screenshot Here
                   </button>
                 </div>
                 <div class="record-action-group">
@@ -535,11 +630,16 @@
               <ul id="captured-keyboard-list"></ul>
             </div>
           </section>
-          <section class="card">
+          <section id="manual-control-card" class="card manual-control-surface">
             <div class="section-heading">
-              <h2>Input</h2>
+              <h2 class="admin-only">Input</h2>
+              <h2 class="operate-only">Manual Assistance</h2>
               <span id="mode" class="badge">Disabled</span>
             </div>
+            <p class="operate-only manual-assistance-help">
+              Use this only when automatic recovery cannot return the phone to a
+              ready state.
+            </p>
             <p id="control-help">
               Enable control when you are ready. Each click sends one tap to the
               phone.
@@ -547,7 +647,7 @@
             <button id="enable" class="primary" disabled>
               Enable Manual Control
             </button>
-            <button id="takeover" class="stop" hidden disabled>
+            <button id="takeover" class="stop admin-only" hidden disabled>
               Take Over
             </button>
             <button id="disable" class="stop">Disable input</button>
@@ -573,8 +673,20 @@
               <button data-action="screen_on" disabled>☀ Wake screen</button>
               <button data-action="screen_off" disabled>⏻ Screen off</button>
             </div>
+            <div class="operate-only manual-assistance-finish">
+              <button id="operate-phone-ready" type="button">
+                Phone is Ready
+              </button>
+              <button id="operate-close-assistance" type="button">
+                Close Manual Assistance
+              </button>
+              <p class="small">
+                This verifies the configured ready-screen condition. It never
+                resumes or retries the failed workflow.
+              </p>
+            </div>
           </section>
-          <section class="card">
+          <section class="card admin-only">
             <div class="section-heading">
               <h2>Calibration</h2>
               <span id="cal-state">Required</span>
@@ -615,19 +727,20 @@
         <div class="section-heading">
           <h2>Automations</h2>
         </div>
-        <div id="mock-recording-preview" hidden>
+        <div id="mock-recording-preview" class="admin-only" hidden>
           <p>
             Interact with this phone preview to try recording without hardware.
           </p>
         </div>
         <canvas
           id="workflow-preview"
+          class="admin-only"
           width="270"
           height="480"
           aria-label="Phone preview. Click, drag and type to record in mock mode."
           tabindex="0"
         ></canvas>
-        <div id="review-flow" hidden>
+        <div id="review-flow" class="admin-only" hidden>
           <h3>Review Recording</h3>
           <label>Workflow name <input id="flow-name" maxlength="160" /></label>
           <button id="flow-rename">Rename</button>
@@ -942,6 +1055,10 @@
             </label>
             <div id="record-roi-picker"></div>
             <button id="record-text">Insert Wait for Text</button>
+            <h4>Screenshot</h4>
+            <button id="record-screenshot" type="button">
+              Insert Screenshot
+            </button>
             <h4>Fixed Wait</h4>
             <div class="flow-buttons">
               <input
@@ -967,8 +1084,19 @@
             ><input id="flow-financial" type="checkbox" /> Financial preparation
             flow — end with manual authorization</label
           >
+          <label>
+            Recovery workflow
+            <select id="flow-recovery-workflow">
+              <option value="">None</option>
+            </select>
+          </label>
+          <p class="small">
+            Optional. Recovery runs separately after a failed or interrupted
+            job. The selected workflow must end with Wait for Text so the ready
+            screen is verified.
+          </p>
         </div>
-        <form id="expected-text-editor" hidden>
+        <form id="expected-text-editor" class="admin-only" hidden>
           <h3 id="expected-text-title">Choose expected text</h3>
           <p id="expected-text-status" role="status"></p>
           <div id="expected-suggestions"></div>
@@ -1065,19 +1193,27 @@
           <button id="flows-refresh">Refresh Flows</button>
           <ul id="saved-flows" class="saved-flows"></ul>
           <h3 id="run-title">Run Flow</h3>
+
           <form id="flow-run-form">
             <div id="run-variables"></div>
             <button id="flow-run" class="primary" disabled>Start Run</button>
           </form>
+
           <div class="flow-buttons">
-            <button id="flow-resume" hidden>Resume after manual action</button
-            ><button id="flow-cancel" disabled>Stop Run</button>
+            <button id="flow-resume" hidden>Resume Checkpoint</button>
+            <button id="flow-cancel" disabled>Stop Run</button>
           </div>
+
           <p id="flow-run-state" role="status" aria-live="polite">
             No active run
           </p>
+          <pre
+            id="operate-workflow-log"
+            class="operate-only operate-workflow-log"
+            aria-label="Recent workflow activity"
+          ></pre>
         </div>
-        <details id="workflow-debug">
+        <details id="workflow-debug" class="admin-only">
           <summary>Advanced / Debug</summary>
           <p id="workflow-backend"></p>
           <pre id="workflow-debug-data"></pre>

@@ -114,7 +114,7 @@ class ExternalIntegrationService:
         account = self.account_store.get(route.account_id)
         if not account.enabled:
             raise RecordConflict("Account binding is disabled.")
-        
+
         workflow = self.workflow_storage.read(route.workflow)
         resolve_variables(workflow, request.payload)
         return self.scheduler.enqueue(
@@ -124,4 +124,5 @@ class ExternalIntegrationService:
             external_ref=request.external_ref,
             bank=request.bank,
             action=request.action,
+            recovery_workflow_id=workflow.get("recovery_workflow_id"),
         )

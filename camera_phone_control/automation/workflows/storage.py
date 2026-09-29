@@ -6,7 +6,7 @@ import tempfile
 import threading
 from pathlib import Path
 from .models import now
-from .validation import identifier, validate_workflow
+from .validation import identifier, validate_recovery_workflow, validate_workflow
 
 
 class WorkflowStorage:
@@ -37,6 +37,15 @@ class WorkflowStorage:
         data = validate_workflow(workflow)
 
         with self.lock:
+            recovery_workflow_id = data.get("recovery_workflow_id")
+            if recovery_workflow_id is not None:
+                try:
+                    recovery_workflow = self.read(recovery_workflow_id)
+                except FileNotFoundError:
+                    raise ValueError("Recovery workflow does not exist.") from None
+                validate_recovery_workflow(recovery_workflow)
+            if self._recovery_referrers(data["id"]):
+                validate_recovery_workflow(data)
             self.directory.mkdir(parents=True, exist_ok=True)
             path = self.path(data["id"])
 
@@ -76,7 +85,23 @@ class WorkflowStorage:
 
     def delete(self, workflow_id):
         with self.lock:
+            if self._recovery_referrers(workflow_id):
+                raise ValueError(
+                    "Workflow is assigned as a recovery workflow and cannot be deleted."
+                )
             self.path(workflow_id).unlink()
+
+    def _recovery_referrers(self, workflow_id):
+        if not self.directory.exists():
+            return []
+        result = []
+        for path in self.directory.glob("*.json"):
+            if path.stem == workflow_id or path.is_symlink():
+                continue
+            candidate = self.read(path.stem)
+            if candidate.get("recovery_workflow_id") == workflow_id:
+                result.append(candidate["id"])
+        return result
 
     def list(self):
         with self.lock:
@@ -87,7 +112,13 @@ class WorkflowStorage:
                 result.append(
                     {
                         key: workflow.get(key)
-                        for key in ("id", "name", "created_at", "updated_at")
+                        for key in (
+                            "id",
+                            "name",
+                            "created_at",
+                            "updated_at",
+                            "recovery_workflow_id",
+                        )
                     }
                     | {
                         "step_count": len(workflow["steps"]),

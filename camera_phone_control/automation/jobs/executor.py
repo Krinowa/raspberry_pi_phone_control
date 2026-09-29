@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from copy import deepcopy
+
+from automation.workflows.validation import validate_recovery_workflow
 
 from .models import PENDING_JOB_STATES
 from .storage import RecordConflict, RecordNotFound
@@ -35,6 +38,7 @@ class BackgroundJobExecutor:
         self.poll_interval = poll_interval
         self.lock = threading.RLock()
         self.active = {}
+        self.recoveries = {}
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self.thread = None
@@ -75,7 +79,7 @@ class BackgroundJobExecutor:
 
         for device_id in device_ids:
             with self.lock:
-                if device_id in self.active:
+                if device_id in self.active or device_id in self.recoveries:
                     continue
             claimed = self.scheduler.claim_next_job_for_device(device_id)
             if claimed is None:
@@ -119,15 +123,22 @@ class BackgroundJobExecutor:
             if snapshot is None:
                 raise RuntimeError("Workflow completion could not be observed.")
             status = snapshot.get("status")
+            screenshots = snapshot.get("screenshots", [])
             if status == "passed":
-                self.scheduler.complete_job(job.job_id, "Workflow completed.")
+                self.scheduler.complete_job(
+                    job.job_id, "Workflow completed.", screenshots=screenshots
+                )
             elif status == "cancelled":
-                self.scheduler.finish_cancelled(job.job_id, "Workflow cancelled.")
+                self.scheduler.finish_cancelled(
+                    job.job_id, "Workflow cancelled.", screenshots=screenshots
+                )
             else:
                 message = snapshot.get("message")
                 if not isinstance(message, str) or not message:
                     message = "Workflow failed; physical actions were not retried."
-                self.scheduler.fail_job(job.job_id, message[:500])
+                self.scheduler.fail_job(
+                    job.job_id, message[:500], screenshots=screenshots
+                )
         except (RecordConflict, RecordNotFound):
             LOG.exception(
                 "Persistent job state changed unexpectedly for %s", job.job_id
@@ -167,6 +178,104 @@ class BackgroundJobExecutor:
         self.wake()
         return self.scheduler.store.get(job_id)
 
+    def _recovery_workflow(self, job, *, verify_only=False):
+        recovery_workflow_id = job.recovery_workflow_id
+        if recovery_workflow_id is None:
+            source = self.workflow_storage.read(job.workflow)
+            recovery_workflow_id = source.get("recovery_workflow_id")
+        if recovery_workflow_id is None:
+            raise RecordConflict("No recovery workflow is configured for this job.")
+        try:
+            workflow = self.workflow_storage.read(recovery_workflow_id)
+        except (FileNotFoundError, KeyError):
+            raise RecordConflict(
+                "The configured recovery workflow was not found."
+            ) from None
+        try:
+            workflow = validate_recovery_workflow(workflow)
+        except ValueError as exc:
+            raise RecordConflict(str(exc)) from None
+        if verify_only:
+            workflow = deepcopy(workflow)
+            workflow["name"] += " — ready-state verification"
+            workflow["steps"] = [workflow["steps"][-1]]
+        return recovery_workflow_id, workflow
+
+    def recover(self, job_id, *, verify_only=False):
+        job = self.scheduler.get_job(job_id)
+        recovery_workflow_id, workflow = self._recovery_workflow(
+            job, verify_only=verify_only
+        )
+        with self.lock:
+            if job.device_id in self.active or job.device_id in self.recoveries:
+                raise RecordConflict("Device already has running work.")
+            recovering = self.scheduler.begin_recovery(job_id, recovery_workflow_id)
+            execution = {
+                "job_id": job_id,
+                "run_id": None,
+                "cancel": threading.Event(),
+                "thread": None,
+            }
+            thread = threading.Thread(
+                target=self._execute_recovery,
+                args=(recovering, workflow, execution),
+                name=f"recovery-{recovering.device_id}-{recovering.job_id}",
+                daemon=True,
+            )
+            execution["thread"] = thread
+            self.recoveries[recovering.device_id] = execution
+            thread.start()
+        return recovering
+
+    def _execute_recovery(self, job, workflow, execution):
+        try:
+            started = self.workflow_service.start(
+                workflow,
+                {},
+                device_id=job.device_id,
+                cancel_event=execution["cancel"],
+            )
+            with self.lock:
+                execution["run_id"] = started["run_id"]
+            self.scheduler.attach_recovery_run(job.job_id, started["run_id"])
+            snapshot = self.workflow_service.wait(started["run_id"])
+            if snapshot is None:
+                raise RuntimeError("Recovery completion could not be observed.")
+            if snapshot.get("status") == "passed":
+                self.scheduler.finish_recovery(
+                    job.job_id,
+                    successful=True,
+                    screenshots=snapshot.get("screenshots", []),
+                )
+            else:
+                message = snapshot.get("message")
+                if not isinstance(message, str) or not message:
+                    message = "Automatic recovery failed. Manual assistance required."
+                self.scheduler.finish_recovery(
+                    job.job_id,
+                    successful=False,
+                    error=message[:500],
+                    screenshots=snapshot.get("screenshots", []),
+                )
+        except (RecordConflict, RecordNotFound):
+            LOG.exception("Recovery state changed unexpectedly for %s", job.job_id)
+        except Exception:
+            LOG.exception("Recovery workflow failed for %s", job.job_id)
+            try:
+                self.scheduler.finish_recovery(
+                    job.job_id,
+                    successful=False,
+                    error="Automatic recovery failed. Manual assistance required.",
+                )
+            except (RecordConflict, RecordNotFound):
+                pass
+        finally:
+            with self.lock:
+                current = self.recoveries.get(job.device_id)
+                if current is execution:
+                    del self.recoveries[job.device_id]
+            self.wake()
+
     def close(self, timeout=2.0):
         """Stop dispatching and safely cancel live workflows before shutdown."""
         self.stop_event.set()
@@ -174,14 +283,22 @@ class BackgroundJobExecutor:
 
         with self.lock:
             active = list(self.active.values())
+            recoveries = list(self.recoveries.values())
 
         for execution in active:
             try:
                 self.cancel(execution["job_id"])
             except (RecordConflict, RecordNotFound, KeyError):
                 pass
+        for execution in recoveries:
+            execution["cancel"].set()
+            if execution["run_id"] is not None:
+                try:
+                    self.workflow_service.cancel(execution["run_id"])
+                except KeyError:
+                    pass
         deadline = time.monotonic() + max(0.0, timeout)
-        for execution in active:
+        for execution in active + recoveries:
             remaining = max(0.0, deadline - time.monotonic())
             execution["thread"].join(remaining)
         if self.thread is not None:
@@ -193,7 +310,7 @@ class BackgroundJobExecutor:
 
         while time.monotonic() < deadline:
             with self.lock:
-                active = bool(self.active)
+                active = bool(self.active or self.recoveries)
             pending = any(
                 job.status in PENDING_JOB_STATES for job in self.scheduler.store.list()
             )

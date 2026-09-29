@@ -48,6 +48,7 @@ class WorkflowRunner:
         external_screen=None,
         screen_state_provider=None,
         timing=None,
+        capture_screen=None,
     ):
         self.context = context
         self.external_screen = external_screen
@@ -57,6 +58,7 @@ class WorkflowRunner:
             else screen_state_provider
         )
         self.timing = timing or WorkflowTiming()
+        self.capture_screen = capture_screen
 
     def run(self, workflow, variables=None):
         workflow = validate_workflow(workflow)
@@ -200,6 +202,13 @@ class WorkflowRunner:
                 roi=step.get("roi"),
             )
             ctx.logger.info("Text detected: %s", step["text"])
+        elif kind == "capture_screen":
+            if self.capture_screen is None:
+                raise ScreenStateError(
+                    "Screenshot capture is unavailable for this run."
+                )
+            self.capture_screen(step, ctx.state.step_index)
+            ctx.logger.info("Screenshot saved: %s", step.get("label") or "Screenshot")
         elif kind == "manual_checkpoint":
             ctx.manual_checkpoint(step["message"])
         elif kind == "input":

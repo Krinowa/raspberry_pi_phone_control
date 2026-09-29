@@ -441,6 +441,12 @@ class Recorder:
             candidate["name"] = data.get("name")
             if "financial" in data:
                 candidate["financial"] = data["financial"]
+            if "recovery_workflow_id" in data:
+                recovery_workflow_id = data["recovery_workflow_id"]
+                if recovery_workflow_id in {None, ""}:
+                    candidate.pop("recovery_workflow_id", None)
+                else:
+                    candidate["recovery_workflow_id"] = recovery_workflow_id
 
         elif operation == "insert":
             step = deepcopy(data.get("step"))
@@ -452,6 +458,7 @@ class Recorder:
                 "wait",
                 "wait_until_stable",
                 "wait_for_text",
+                "capture_screen",
                 "manual_checkpoint",
             }:
                 raise ValueError("Choose a supported step type.")
@@ -515,6 +522,7 @@ class Recorder:
                     "wait": {"seconds"},
                     "wait_until_stable": {"stable_ms", "timeout_seconds"},
                     "wait_for_text": {"text", "timeout_seconds", "roi"},
+                    "capture_screen": set(),
                     "manual_checkpoint": {"message"},
                 }.get(old["type"], set())
                 changes = data.get("fields")

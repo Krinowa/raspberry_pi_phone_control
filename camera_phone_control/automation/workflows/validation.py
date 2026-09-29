@@ -204,6 +204,7 @@ def validate_workflow(workflow, *, allow_empty=False):
             "created_at",
             "updated_at",
             "financial",
+            "recovery_workflow_id",
         },
         {"id", "name", "version", "variables", "steps"},
     )
@@ -215,6 +216,11 @@ def validate_workflow(workflow, *, allow_empty=False):
         raise ValueError("Unsupported workflow version.")
     if type(workflow.get("financial", False)) is not bool:
         raise ValueError("financial must be a boolean.")
+    recovery_workflow_id = workflow.get("recovery_workflow_id")
+    if recovery_workflow_id is not None:
+        identifier(recovery_workflow_id)
+        if recovery_workflow_id == workflow["id"]:
+            raise ValueError("A workflow cannot use itself as its recovery workflow.")
 
     for field in ("created_at", "updated_at"):
         if field in workflow:
@@ -312,6 +318,7 @@ def validate_workflow(workflow, *, allow_empty=False):
             "wait": {"seconds"},
             "wait_until_stable": {"stable_ms", "timeout_seconds"},
             "wait_for_text": {"text", "timeout_seconds", "roi"},
+            "capture_screen": set(),
             "manual_checkpoint": {"message"},
         }[kind]
 
@@ -323,6 +330,7 @@ def validate_workflow(workflow, *, allow_empty=False):
                 "label",
                 "preview",
                 "recorded_at",
+                "critical",
             }
             | specific,
             {"id", "type"},
@@ -330,6 +338,8 @@ def validate_workflow(workflow, *, allow_empty=False):
 
         if "label" in step:
             text(step["label"], "Step name", 160)
+        if type(step.get("critical", False)) is not bool:
+            raise ValueError("critical must be a boolean.")
         if "recorded_at" in step:
             text(step["recorded_at"], "Recorded timestamp", 80)
         if "preview" in step:
@@ -482,3 +492,28 @@ def resolve_variables(workflow, supplied=None):
         except ValueError as exc:
             raise ValueError(f"Variable {name!r}: {exc}") from None
     return resolved
+
+
+def validate_recovery_workflow(workflow):
+    """Require an unattended workflow with an OCR-verified final ready state."""
+    workflow = validate_workflow(workflow)
+    if not workflow["steps"] or workflow["steps"][-1]["type"] != "wait_for_text":
+        raise ValueError(
+            "Recovery workflow must end with wait_for_text to verify the ready state."
+        )
+    if any(
+        step.get("critical") is True
+        or step["type"] == "manual_checkpoint"
+        or (step["type"] == "input" and step.get("source") == "manual")
+        for step in workflow["steps"]
+    ):
+        raise ValueError(
+            "Recovery workflow cannot contain critical or manual checkpoint steps."
+        )
+    try:
+        resolve_variables(workflow, {})
+    except ValueError:
+        raise ValueError(
+            "Recovery workflow variables must have configured default values."
+        ) from None
+    return workflow

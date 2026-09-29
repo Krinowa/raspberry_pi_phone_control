@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from copy import deepcopy
 from dataclasses import replace
 
 from automation.workflows.models import now
@@ -139,9 +140,16 @@ class JobScheduler:
 
     def recover_pending_jobs(self):
         # HID commands cannot be safely replayed after a process interruption.
-        return self.store.recover_running(
-            now(), "Interrupted by backend restart; physical actions were not replayed."
+        timestamp = now()
+        jobs = self.store.recover_running(
+            timestamp,
+            "Interrupted by backend restart; physical actions were not replayed.",
         )
+        recoveries = self.store.recover_incomplete_recoveries(
+            timestamp,
+            "Recovery was interrupted by backend restart; it was not replayed.",
+        )
+        return jobs + recoveries
 
     def enqueue(
         self,
@@ -152,6 +160,7 @@ class JobScheduler:
         external_ref=None,
         bank=None,
         action=None,
+        recovery_workflow_id=None,
     ):
         with self.lock:
             ready = self.is_device_ready(account.device_id)["ready"]
@@ -164,6 +173,7 @@ class JobScheduler:
                 external_ref=external_ref,
                 bank=bank,
                 action=action,
+                recovery_workflow_id=recovery_workflow_id,
             )
             return self.store.create(job)
 
@@ -257,7 +267,7 @@ class JobScheduler:
             self.reservations[device_id] = job_id
             return running
 
-    def _finish(self, job_id, status, *, error=None, result=None):
+    def _finish(self, job_id, status, *, error=None, result=None, screenshots=None):
         with self.lock:
             job = self.get_job(job_id)
             if self.reservations.get(job.device_id) != job_id:
@@ -271,18 +281,28 @@ class JobScheduler:
                 error=error,
                 result=result,
                 cancel_requested=job.cancel_requested or status == "CANCELLED",
+                recovery_status=(
+                    "NEEDS_ATTENTION"
+                    if status in {"FAILED", "INTERRUPTED"}
+                    else job.recovery_status
+                ),
+                screenshots=(
+                    deepcopy(screenshots)
+                    if screenshots is not None
+                    else job.screenshots
+                ),
             )
             del self.reservations[job.device_id]
             return finished
 
-    def complete_job(self, job_id, result=None):
-        return self._finish(job_id, "COMPLETED", result=result)
+    def complete_job(self, job_id, result=None, *, screenshots=None):
+        return self._finish(job_id, "COMPLETED", result=result, screenshots=screenshots)
 
-    def fail_job(self, job_id, error):
-        return self._finish(job_id, "FAILED", error=error)
+    def fail_job(self, job_id, error, *, screenshots=None):
+        return self._finish(job_id, "FAILED", error=error, screenshots=screenshots)
 
-    def finish_cancelled(self, job_id, result=None):
-        return self._finish(job_id, "CANCELLED", result=result)
+    def finish_cancelled(self, job_id, result=None, *, screenshots=None):
+        return self._finish(job_id, "CANCELLED", result=result, screenshots=screenshots)
 
     def interrupt_job(self, job_id, error):
         return self._finish(job_id, "INTERRUPTED", error=error)
@@ -312,6 +332,72 @@ class JobScheduler:
             if job.status in TERMINAL_JOB_STATES:
                 return job
             raise RecordConflict("Job cannot be cancelled in its current state.")
+
+    def begin_recovery(self, job_id, recovery_workflow_id):
+        with self.lock:
+            job = self.get_job(job_id)
+            if job.status not in {"FAILED", "INTERRUPTED"}:
+                raise RecordConflict(
+                    "Only failed or interrupted jobs can be recovered."
+                )
+            if job.recovery_status == "RECOVERING":
+                raise RecordConflict("Phone recovery is already running.")
+            if job.device_id in self.reservations or any(
+                item.device_id == job.device_id and item.status == "RUNNING"
+                for item in self.list_jobs()
+            ):
+                raise RecordConflict("Device already has running work.")
+            readiness = self.readiness.inspect(job.device_id, reserved=False)
+            if not readiness["ready"]:
+                raise RecordConflict("Device is not ready to start recovery.")
+            reservation = "recovery:" + job.job_id
+            self.reservations[job.device_id] = reservation
+            try:
+                return self.store.replace(
+                    replace(
+                        job,
+                        recovery_workflow_id=recovery_workflow_id,
+                        recovery_status="RECOVERING",
+                        recovery_run_id=None,
+                        recovery_error=None,
+                        recovered_at=None,
+                    )
+                )
+            except Exception:
+                del self.reservations[job.device_id]
+                raise
+
+    def attach_recovery_run(self, job_id, run_id):
+        with self.lock:
+            job = self.get_job(job_id)
+            if (
+                job.recovery_status != "RECOVERING"
+                or self.reservations.get(job.device_id) != "recovery:" + job_id
+            ):
+                raise RecordConflict("Phone recovery is no longer active.")
+            return self.store.replace(replace(job, recovery_run_id=run_id))
+
+    def finish_recovery(self, job_id, *, successful, error=None, screenshots=None):
+        with self.lock:
+            job = self.get_job(job_id)
+            reservation = "recovery:" + job_id
+            if self.reservations.get(job.device_id) != reservation:
+                raise RecordConflict("Recovery does not own this device reservation.")
+            finished = self.store.replace(
+                replace(
+                    job,
+                    recovery_status="READY" if successful else "NEEDS_ATTENTION",
+                    recovery_error=None if successful else self._summary(error),
+                    recovered_at=now(),
+                    screenshots=(
+                        job.screenshots + deepcopy(screenshots)
+                        if screenshots
+                        else job.screenshots
+                    ),
+                )
+            )
+            del self.reservations[job.device_id]
+            return finished
 
     def queue_position(self, target):
         if target.status not in PENDING_JOB_STATES:

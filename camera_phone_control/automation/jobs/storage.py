@@ -192,6 +192,24 @@ class JobStore(_JsonStore):
                         status="INTERRUPTED",
                         finished_at=timestamp,
                         error=message,
+                        recovery_status="NEEDS_ATTENTION",
+                    )
+                    changed.append(job_id)
+            if changed:
+                self._save_jobs(jobs)
+            return changed
+
+    def recover_incomplete_recoveries(self, timestamp, message):
+        with self.lock:
+            jobs = self._jobs()
+            changed = []
+            for job_id, job in jobs.items():
+                if job.recovery_status == "RECOVERING":
+                    jobs[job_id] = replace(
+                        job,
+                        recovery_status="NEEDS_ATTENTION",
+                        recovery_error=message,
+                        recovered_at=timestamp,
                     )
                     changed.append(job_id)
             if changed:

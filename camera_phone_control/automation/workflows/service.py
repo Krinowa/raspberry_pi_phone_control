@@ -10,6 +10,7 @@ from dataclasses import asdict
 from ..backends import backend_names
 from ..runner import Runner
 from .runner import WorkflowRunner
+from .screenshots import WorkflowScreenshotStore
 from .timing import WorkflowTiming
 from .validation import validate_workflow, resolve_variables
 
@@ -34,12 +35,14 @@ class WorkflowService:
         *,
         device_id=None,
         screen_resolver=None,
+        screenshot_store=None,
     ):
         self.controller, self.locks = controller, locks
         self.external_screen = external_screen
         self.screen_state_provider = screen_state_provider
         self.device_id = device_id
         self.screen_resolver = screen_resolver
+        self.screenshot_store = screenshot_store or WorkflowScreenshotStore()
         self.lock = threading.RLock()
         self.runs = {}
 
@@ -92,6 +95,7 @@ class WorkflowService:
                 "steps": self.preview_steps(workflow),
                 "timing": WorkflowTiming(),
                 "completed": completed,
+                "screenshots": [],
             }
 
             external_screen = self.external_screen
@@ -100,6 +104,17 @@ class WorkflowService:
                 external_screen, screen_state_provider = self.screen_resolver(
                     target_device_id
                 )
+
+            def capture_screen(step, step_index):
+                artifact = self.screenshot_store.capture(
+                    external_screen,
+                    run_id=run_id,
+                    step_id=step.get("id") or f"step_{step_index}",
+                    label=step.get("label"),
+                )
+                with self.lock:
+                    item["screenshots"].append(artifact)
+                return artifact
 
             def execute():
                 try:
@@ -110,6 +125,7 @@ class WorkflowService:
                             external_screen,
                             screen_state_provider,
                             timing=item["timing"],
+                            capture_screen=capture_screen,
                         ).run(workflow, variables),
                         cancel_event=cancel,
                         resume_event=resume,
@@ -167,6 +183,7 @@ class WorkflowService:
                     "text",
                     "roi",
                     "label",
+                    "critical",
                 }
             }
             if step["type"] == "input":
@@ -217,6 +234,7 @@ class WorkflowService:
                 input_backend=item["backend"],
                 logs=logs,
                 timing=item["timing"].snapshot(),
+                screenshots=deepcopy(item["screenshots"]),
             )
             index = result.get("step_index", 0)
             result["preview"] = deepcopy(item["steps"][index - 1]) if index else None
