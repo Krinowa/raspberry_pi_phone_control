@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import replace
 
 from automation.workflows.models import now
 
-from .models import Job, PENDING_JOB_STATES, TERMINAL_JOB_STATES
+from .models import (
+    JOB_TRANSITIONS,
+    Job,
+    PENDING_JOB_STATES,
+    TERMINAL_JOB_STATES,
+)
 from .storage import RecordConflict
 
 
@@ -16,8 +22,41 @@ class DeviceEligibility:
         self.state = state
         self.camera_manager = camera_manager
         self.workflow_service = workflow_service
+        self.catalog_lock = threading.Lock()
+        self.catalog_checked_at = 0.0
+
+    def _refresh_pi_catalog(self):
+        if self.state.pi_bridge is None:
+            return
+        current = time.monotonic()
+        if current - self.catalog_checked_at < 1.0:
+            return
+        if not self.catalog_lock.acquire(blocking=False):
+            return
+        try:
+            current = time.monotonic()
+            if current - self.catalog_checked_at < 1.0:
+                return
+            try:
+                catalog = self.state.pi_bridge.devices()
+            except Exception:
+                with self.state.lock:
+                    self.state.pi_connection = {
+                        "api": "offline",
+                        "phone": "unknown",
+                        "message": "Pi device status is unavailable.",
+                    }
+            else:
+                with self.state.lock:
+                    self.state.update_pi_devices(catalog)
+                    self.state.pi_catalog_initialized = True
+            self.catalog_checked_at = current
+        finally:
+            self.catalog_lock.release()
 
     def inspect(self, device_id, *, reserved=False):
+        # The worker cannot depend on an open dashboard to refresh Pi state.
+        self._refresh_pi_catalog()
         with self.state.lock:
             if self.state.pi_bridge is not None:
                 details = self.state.pi_devices.get(device_id)
@@ -43,7 +82,9 @@ class DeviceEligibility:
             lock_identity is not None
             and self.state.device_locks.owner(lock_identity) is not None
         )
-        camera = self.camera_manager.status(device_id, open_camera=False)
+        # Opening the assigned camera is an eligibility check, not discovery;
+        # CameraManager still centrally owns and reuses the capture.
+        camera = self.camera_manager.status(device_id, open_camera=True)
         configured = bool(
             camera["config"]["enabled"]
             and camera["config"]["camera_source"] is not None
@@ -81,7 +122,13 @@ class DeviceEligibility:
 
 
 class JobScheduler:
-    """Persistent queue contract; it deliberately starts no worker thread."""
+    """Persistent per-device queue and its validated state transitions.
+
+    The process-local lock covers queue inspection, readiness checks, durable
+    state changes, and reservations. The JSON store writes each resulting
+    snapshot atomically. Physical ownership remains guarded by DeviceLocks in
+    WorkflowService/Runner.
+    """
 
     def __init__(self, store, readiness):
         self.store = store
@@ -96,7 +143,16 @@ class JobScheduler:
             now(), "Interrupted by backend restart; physical actions were not replayed."
         )
 
-    def enqueue(self, account, workflow, payload):
+    def enqueue(
+        self,
+        account,
+        workflow,
+        payload,
+        *,
+        external_ref=None,
+        bank=None,
+        action=None,
+    ):
         with self.lock:
             ready = self.is_device_ready(account.device_id)["ready"]
             job = Job.create(
@@ -105,8 +161,17 @@ class JobScheduler:
                 workflow,
                 payload,
                 "QUEUED" if ready else "WAITING_FOR_DEVICE",
+                external_ref=external_ref,
+                bank=bank,
+                action=action,
             )
             return self.store.create(job)
+
+    def get_job(self, job_id):
+        return self.store.get(job_id)
+
+    def list_jobs(self):
+        return self.store.list()
 
     def is_device_ready(self, device_id):
         return self.readiness.inspect(
@@ -118,20 +183,65 @@ class JobScheduler:
             return next(
                 (
                     job
-                    for job in self.store.list()
+                    for job in self.list_jobs()
                     if job.device_id == device_id and job.status in PENDING_JOB_STATES
                 ),
                 None,
             )
 
+    @staticmethod
+    def _summary(value):
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) > 500
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("Job result summaries must be at most 500 characters.")
+        return value
+
+    def _transition(self, job, status, **changes):
+        if status not in JOB_TRANSITIONS[job.status]:
+            raise RecordConflict(
+                f"Job cannot transition from {job.status} to {status}."
+            )
+        return self.store.replace(replace(job, status=status, **changes))
+
+    def claim_next_job_for_device(self, device_id):
+        """Atomically claim the oldest eligible job fixed to ``device_id``."""
+        with self.lock:
+            job = self.next_job_for_device(device_id)
+            if job is None:
+                return None
+            if device_id in self.reservations or any(
+                item.device_id == device_id and item.status == "RUNNING"
+                for item in self.list_jobs()
+            ):
+                return None
+            readiness = self.is_device_ready(device_id)
+            if not readiness["ready"]:
+                if job.status != "WAITING_FOR_DEVICE":
+                    self._transition(job, "WAITING_FOR_DEVICE")
+                return None
+            running = self._transition(
+                job,
+                "RUNNING",
+                started_at=now(),
+                finished_at=None,
+                error=None,
+                result=None,
+            )
+            self.reservations[device_id] = job.job_id
+            return running
+
     def reserve_device(self, device_id, job_id):
+        """Backward-compatible explicit claim used by existing callers/tests."""
         with self.lock:
             if device_id in self.reservations or any(
                 job.device_id == device_id and job.status == "RUNNING"
-                for job in self.store.list()
+                for job in self.list_jobs()
             ):
                 raise RecordConflict("Device already has a running job.")
-            job = self.store.get(job_id)
+            job = self.get_job(job_id)
             if job.device_id != device_id:
                 raise ValueError("A job cannot be moved to another device.")
             if job.status not in PENDING_JOB_STATES:
@@ -141,47 +251,61 @@ class JobScheduler:
                 raise RecordConflict("An earlier job is waiting for this device.")
             if not self.is_device_ready(device_id)["ready"]:
                 if job.status != "WAITING_FOR_DEVICE":
-                    self.store.replace(replace(job, status="WAITING_FOR_DEVICE"))
+                    self._transition(job, "WAITING_FOR_DEVICE")
                 raise RecordConflict("Device is not ready for this job.")
-            running = replace(job, status="RUNNING", started_at=now())
-            self.store.replace(running)
+            running = self._transition(job, "RUNNING", started_at=now())
             self.reservations[device_id] = job_id
             return running
 
-    def release_device(self, device_id, job_id, *, error=None, result=None):
+    def _finish(self, job_id, status, *, error=None, result=None):
         with self.lock:
-            if self.reservations.get(device_id) != job_id:
+            job = self.get_job(job_id)
+            if self.reservations.get(job.device_id) != job_id:
                 raise RecordConflict("Job does not own this device reservation.")
-            job = self.store.get(job_id)
-            summary = error if error is not None else result
-            if summary is not None and (
-                not isinstance(summary, str)
-                or len(summary) > 500
-                or any(ord(character) < 32 for character in summary)
-            ):
-                raise ValueError("Job result summaries must be at most 500 characters.")
-            finished = replace(
+            error = self._summary(error)
+            result = self._summary(result)
+            finished = self._transition(
                 job,
-                status="FAILED" if error is not None else "COMPLETED",
+                status,
                 finished_at=now(),
                 error=error,
                 result=result,
+                cancel_requested=job.cancel_requested or status == "CANCELLED",
             )
-            self.store.replace(finished)
-            del self.reservations[device_id]
+            del self.reservations[job.device_id]
             return finished
+
+    def complete_job(self, job_id, result=None):
+        return self._finish(job_id, "COMPLETED", result=result)
+
+    def fail_job(self, job_id, error):
+        return self._finish(job_id, "FAILED", error=error)
+
+    def finish_cancelled(self, job_id, result=None):
+        return self._finish(job_id, "CANCELLED", result=result)
+
+    def interrupt_job(self, job_id, error):
+        return self._finish(job_id, "INTERRUPTED", error=error)
+
+    def release_device(self, device_id, job_id, *, error=None, result=None):
+        job = self.get_job(job_id)
+        if job.device_id != device_id:
+            raise ValueError("A job cannot be released from another device.")
+        return (
+            self.fail_job(job_id, error)
+            if error is not None
+            else self.complete_job(job_id, result)
+        )
 
     def cancel_job(self, job_id):
         with self.lock:
-            job = self.store.get(job_id)
+            job = self.get_job(job_id)
             if job.status in PENDING_JOB_STATES:
-                return self.store.replace(
-                    replace(
-                        job,
-                        status="CANCELLED",
-                        finished_at=now(),
-                        cancel_requested=True,
-                    )
+                return self._transition(
+                    job,
+                    "CANCELLED",
+                    finished_at=now(),
+                    cancel_requested=True,
                 )
             if job.status == "RUNNING":
                 return self.store.replace(replace(job, cancel_requested=True))
@@ -194,7 +318,7 @@ class JobScheduler:
             return None
         pending = [
             job
-            for job in self.store.list()
+            for job in self.list_jobs()
             if job.device_id == target.device_id and job.status in PENDING_JOB_STATES
         ]
         for index, job in enumerate(pending, 1):

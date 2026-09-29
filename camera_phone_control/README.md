@@ -157,6 +157,55 @@ mean difference and changed-pixel ratio; its conservative default is `0.001`,
 CAMERA_OCR_CACHE_THRESHOLD=0.002 python app.py --camera 0
 ```
 
+During `wait_for_text`, the camera provider captures a cheap 96×160 signature
+before the preceding input action. It polls that signature every 75 ms, requires
+120 ms of visual stability after a change, and invokes PaddleOCR after settling
+or every 450 ms if no change is detected. The timings are configurable with
+`CAMERA_OCR_POLL_INTERVAL_SECONDS`, `CAMERA_OCR_SETTLE_SECONDS`, and
+`CAMERA_OCR_FORCED_INTERVAL_SECONDS`. Change detection uses a 3-level mean pixel
+difference and a 0.002 changed-pixel ratio by default; advanced deployments can
+tune `CAMERA_OCR_CHANGE_THRESHOLD` and `CAMERA_OCR_CHANGE_RATIO_THRESHOLD` after
+measuring camera noise.
+
+Paddle inference uses a global pool of persistent child processes. The default
+pool size is two. The selectable maximum is calculated from physical CPU cores,
+RAM headroom, and an absolute safety cap of eight:
+
+```bash
+CAMERA_OCR_WORKER_POOL_SIZE=2 python app.py --camera 0
+```
+
+`OCR_CPU_CAPACITY_PERCENT` controls the CPU capacity budget and defaults to 80;
+accepted values are 25 through 90. For example, eight physical cores at 80%
+produce a CPU ceiling of six workers. The RAM ceiling keeps at least 25% or 2 GB
+of total RAM for the OS/backend and at least 1 GB of currently available RAM for
+non-OCR work. It uses observed Paddle process RSS when available, otherwise a
+conservative 900 MB estimate. The final hardware ceiling is the minimum of the
+CPU ceiling, RAM ceiling, and eight-worker safety cap.
+
+The dashboard OCR Worker Pool setting is persisted privately in
+`automation/camera_data/ocr_settings.json` and overrides the environment default.
+Saving a different size marks the pool as requiring restart; **Restart OCR Workers**
+is accepted only while no OCR requests are active or queued. Each process owns one
+Paddle model, while per-device providers retain independent frame signatures and OCR
+caches. Pool status is available from `GET /api/ocr/status`; settings use
+`GET/PUT /api/ocr/settings` and `POST /api/ocr/restart`.
+
+The status API also reports live CPU/RAM data and 30 seconds of bounded OCR queue
+and inference history. A conservative recommendation may suggest one more worker
+for sustained queue pressure with CPU/RAM headroom, or one fewer worker during
+sustained CPU saturation and slow inference. Recommendations never resize or
+restart the pool automatically; **Apply Recommendation** saves the proposed size,
+then the existing explicit restart action applies it safely. If a stored setting
+exceeds the detected startup ceiling, the backend starts the safe ceiling, keeps
+the stored value intact, and exposes a warning in the dashboard.
+
+To compare one and two workers with an exact saved real OCR frame:
+
+```bash
+python tools/benchmark_ocr_pool.py /path/to/paddle-ocr-0001.png
+```
+
 For one-request diagnostics, save the exact NumPy image passed to PaddleOCR and
 log its dimensions, region count, confidence, queue wait, child CPU/thread data,
 and separate capture, decode, warp, copy, preprocessing, worker startup, IPC
@@ -602,18 +651,33 @@ device once, persists that `device_id`, and returns `202 Accepted`. Changing the
 dashboard control target later does not move the job. `GET /api/jobs` and
 `GET /api/jobs/<job_id>` expose safe status metadata without echoing the stored
 payload. `POST /api/jobs/<job_id>/cancel` immediately cancels queued jobs. Running
-jobs record `cancel_requested`; a future worker will connect that flag to the active
-workflow run.
+jobs record `cancel_requested`, signal the active workflow cancellation event, and
+remain assigned until workflow ownership has been released safely.
 
-Job states are `QUEUED`, `WAITING_FOR_DEVICE`, `RUNNING`, `COMPLETED`, `FAILED`, and
-`CANCELLED`. Queues are ordered independently per device. A scheduler reservation is
-atomic, permits at most one running job for a device, and never substitutes another
-phone. On restart, an interrupted `RUNNING` job becomes `FAILED`; physical HID input
-is never replayed automatically.
+Future HTTP/WebSocket providers enter through
+`automation.jobs.ExternalIntegrationService`, rather than calling workflow or
+device code directly. An injected `IntegrationAdapter` converts an unknown provider
+payload into `NormalizedJobRequest(external_ref, bank, action, payload)`. A separate
+injected `JobRouteResolver` maps that normalized request to an existing account and
+workflow. Only then does the service resolve and persist the account's `device_id`.
+No provider field names or transport schema are part of this boundary. Jobs created
+through it retain nullable `external_ref`, `bank`, and `action` metadata; legacy and
+local jobs load with those fields set to null.
+
+Job states are `QUEUED`, `WAITING_FOR_DEVICE`, `RUNNING`, `COMPLETED`, `FAILED`,
+`CANCELLED`, and `INTERRUPTED`. Queues are ordered independently per device. The
+background executor runs one workflow thread for each free device, so different
+phones may progress concurrently while each phone remains strictly sequential. A
+scheduler reservation is atomic within the backend process, permits at most one
+running job for a device, and never substitutes another phone. On restart, an
+interrupted `RUNNING` job becomes `INTERRUPTED`; physical HID input is never replayed
+automatically. Queued and waiting jobs retain their original device and remain
+eligible.
 
 Bindings and jobs are stored as private, atomically replaced JSON files under
 `automation/job_data/`. The dashboard shows the account assigned to each device and
-a read-only view of recent jobs. These local APIs currently retain the dashboard's
+recent jobs with queue position, timestamps, result/error, and valid cancellation
+actions. These local APIs currently retain the dashboard's
 same-origin and control-token protections; a production external service needs a
 separate authenticated ingress policy before network exposure. The JSON stores and
 scheduler serialize threads in the current single Flask process. A future
@@ -628,14 +692,13 @@ POST /api/jobs -> persistent job -> per-device scheduler -> background worker
 -> persist result -> release device
 ```
 
-The background worker is intentionally deferred. Two existing lifecycle constraints
-must be addressed with it: cameras for inactive devices are generally opened by
-dashboard/status access, `WorkflowService` currently enforces one active run for the
-whole process, and its calibrated OCR provider follows the dashboard's selected
-camera state. The prepared `start_for_job()` entry point fixes a job's HID target at
-creation, but it is not called automatically. A future worker must also load the
-captured device's camera and per-device calibration context; after that, execution
-will not require the browser to remain open.
+The normal server entry point starts one executor, which polls persisted eligibility
+independently of browser requests and resolves each job's assigned camera and saved
+calibration when execution starts. Application-factory users must opt in with
+`start_job_executor=True`, preventing test factories or multiple WSGI workers from
+accidentally starting competing schedulers. Per-device OCR providers keep separate
+frame/cache state while sharing the one persistent Paddle worker. Closing the browser
+therefore has no effect on a running job.
 
 ## Errors and diagnostics
 

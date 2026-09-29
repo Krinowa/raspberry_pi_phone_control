@@ -99,12 +99,99 @@
       <section id="jobs" class="card jobs-card" hidden>
         <div class="section-heading">
           <div>
-            <h2>External Jobs</h2>
-            <p class="small">Persistent account-routed queue state.</p>
+            <h2>Jobs</h2>
+            <p class="small">Persistent account-routed execution queues.</p>
           </div>
         </div>
         <p id="jobs-state" role="status" aria-live="polite">Loading jobs…</p>
         <div id="jobs-list" class="jobs-list"></div>
+      </section>
+      <section id="ocr-settings" class="card ocr-settings-card">
+        <div class="section-heading">
+          <div>
+            <h2>OCR Worker Pool</h2>
+            <p class="small">
+              Higher values allow simultaneous OCR requests but use more CPU and
+              memory.
+            </p>
+          </div>
+        </div>
+        <form id="ocr-settings-form" class="ocr-settings-form">
+          <label>
+            Worker pool size
+            <input
+              id="ocr-worker-pool-size"
+              type="number"
+              min="1"
+              max="8"
+              step="1"
+              required
+            />
+          </label>
+          <div class="flow-buttons">
+            <button id="ocr-settings-save" class="primary" type="submit">
+              Save
+            </button>
+            <button id="ocr-workers-restart" type="button">
+              Restart OCR Workers
+            </button>
+            <button id="ocr-apply-recommendation" type="button">
+              Apply Recommendation
+            </button>
+          </div>
+        </form>
+        <p id="ocr-settings-error" class="device-error" role="alert" hidden></p>
+        <p id="ocr-settings-warning" class="small" role="status" hidden></p>
+        <div class="ocr-pool-status" aria-live="polite">
+          <span
+            >Physical CPU cores:
+            <strong id="ocr-physical-cores">—</strong></span
+          >
+          <span
+            >Logical CPU threads:
+            <strong id="ocr-logical-threads">—</strong></span
+          >
+          <span>OCR CPU budget: <strong id="ocr-cpu-budget">—</strong></span>
+          <span
+            >CPU worker ceiling: <strong id="ocr-cpu-ceiling">—</strong></span
+          >
+          <span
+            >RAM worker ceiling: <strong id="ocr-ram-ceiling">—</strong></span
+          >
+          <span
+            >Hardware worker ceiling:
+            <strong id="ocr-hardware-ceiling">—</strong></span
+          >
+          <span>Current workers: <strong id="ocr-pool-size">—</strong></span>
+          <span
+            >Recommended workers:
+            <strong id="ocr-recommended-workers">—</strong></span
+          >
+          <span>Busy workers: <strong id="ocr-busy-workers">—</strong></span>
+          <span
+            >Queued OCR requests:
+            <strong id="ocr-queued-requests">—</strong></span
+          >
+          <span
+            >Restart required:
+            <strong id="ocr-restart-required">—</strong></span
+          >
+          <span>CPU usage: <strong id="ocr-cpu-usage">—</strong></span>
+          <span>Memory usage: <strong id="ocr-memory-usage">—</strong></span>
+          <span>Available RAM: <strong id="ocr-available-ram">—</strong></span>
+          <span
+            >Average queue wait: <strong id="ocr-average-queue">—</strong></span
+          >
+          <span
+            >Average inference:
+            <strong id="ocr-average-inference">—</strong></span
+          >
+        </div>
+        <p class="ocr-recommendation">
+          <strong>Recommendation:</strong>
+          <span id="ocr-recommendation-reason">Collecting metrics…</span>
+        </p>
+        <div id="ocr-workers" class="ocr-workers"></div>
       </section>
       <div
         id="account-settings-dialog"

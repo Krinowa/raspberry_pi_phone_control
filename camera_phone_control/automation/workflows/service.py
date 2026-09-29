@@ -33,11 +33,13 @@ class WorkflowService:
         screen_state_provider=None,
         *,
         device_id=None,
+        screen_resolver=None,
     ):
         self.controller, self.locks = controller, locks
         self.external_screen = external_screen
         self.screen_state_provider = screen_state_provider
         self.device_id = device_id
+        self.screen_resolver = screen_resolver
         self.lock = threading.RLock()
         self.runs = {}
 
@@ -49,16 +51,23 @@ class WorkflowService:
                 for item in self.runs.values()
             )
 
-    def start(self, workflow, variables=None, *, device_id=None):
+    def start(
+        self,
+        workflow,
+        variables=None,
+        *,
+        device_id=None,
+        cancel_event=None,
+    ):
         workflow = validate_workflow(workflow)
         variables = deepcopy(variables)
         resolve_variables(workflow, variables)
         backend_names()
         target_device_id = self.device_id if device_id is None else device_id
         with self.lock:
-            if self.has_active_run():
+            if self.has_active_run(target_device_id):
                 raise ValueError(
-                    "A workflow is already running. Stop it or wait for completion."
+                    "A workflow is already running on this device. Stop it or wait for completion."
                 )
             # Bounded in-memory history, never variable payloads.
             while len(self.runs) >= 100:
@@ -69,7 +78,9 @@ class WorkflowService:
             handler = RunLog()
             logger.addHandler(handler)
             runner = Runner(self.controller, self.locks, logger)
-            cancel, resume = threading.Event(), threading.Event()
+            cancel = cancel_event or threading.Event()
+            resume = threading.Event()
+            completed = threading.Event()
             item = {
                 "runner": runner,
                 "cancel": cancel,
@@ -80,7 +91,15 @@ class WorkflowService:
                 "backend": backend_names()[0],
                 "steps": self.preview_steps(workflow),
                 "timing": WorkflowTiming(),
+                "completed": completed,
             }
+
+            external_screen = self.external_screen
+            screen_state_provider = self.screen_state_provider
+            if self.screen_resolver is not None and target_device_id is not None:
+                external_screen, screen_state_provider = self.screen_resolver(
+                    target_device_id
+                )
 
             def execute():
                 try:
@@ -88,8 +107,8 @@ class WorkflowService:
                         workflow["id"],
                         lambda ctx: WorkflowRunner(
                             ctx,
-                            self.external_screen,
-                            self.screen_state_provider,
+                            external_screen,
+                            screen_state_provider,
                             timing=item["timing"],
                         ).run(workflow, variables),
                         cancel_event=cancel,
@@ -99,6 +118,7 @@ class WorkflowService:
                 finally:
                     if isinstance(variables, dict):
                         variables.clear()
+                    completed.set()
 
             thread = threading.Thread(
                 target=execute, name="workflow-" + run_id, daemon=True
@@ -108,11 +128,22 @@ class WorkflowService:
             thread.start()
             return self.snapshot(run_id)
 
-    def start_for_job(self, job, workflow):
-        """Future worker entry point with a device fixed at job creation."""
+    def start_for_job(self, job, workflow, *, cancel_event=None):
+        """Worker entry point with a device fixed at job creation."""
         if workflow.get("id") != job.workflow:
             raise ValueError("Job workflow does not match the loaded workflow.")
-        return self.start(workflow, job.payload, device_id=job.device_id)
+        options = {"device_id": job.device_id}
+        if cancel_event is not None:
+            options["cancel_event"] = cancel_event
+        return self.start(workflow, job.payload, **options)
+
+    def wait(self, run_id, timeout=None):
+        """Wait for a run without tying its lifetime to an HTTP request."""
+        with self.lock:
+            completed = self.get(run_id)["completed"]
+        if not completed.wait(timeout):
+            return None
+        return self.snapshot(run_id)
 
     @staticmethod
     def preview_steps(workflow):
@@ -134,6 +165,7 @@ class WorkflowService:
                     "stable_ms",
                     "timeout_seconds",
                     "text",
+                    "roi",
                     "label",
                 }
             }

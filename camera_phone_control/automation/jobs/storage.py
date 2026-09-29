@@ -151,7 +151,10 @@ class JobStore(_JsonStore):
 
     def list(self):
         with self.lock:
-            return sorted(self._jobs().values(), key=lambda item: item.created_at)
+            return sorted(
+                self._jobs().values(),
+                key=lambda item: (item.created_at, item.job_id),
+            )
 
     def get(self, job_id):
         with self.lock:
@@ -186,7 +189,7 @@ class JobStore(_JsonStore):
                 if job.status == "RUNNING":
                     jobs[job_id] = replace(
                         job,
-                        status="FAILED",
+                        status="INTERRUPTED",
                         finished_at=timestamp,
                         error=message,
                     )

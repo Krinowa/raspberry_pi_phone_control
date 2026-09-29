@@ -15,6 +15,7 @@ from ..input.base import UnsupportedOperation
 from ..screen.accessibility import AccessibilityScreenStateProvider
 from ..screen.camera import CalibratedCamera
 from ..screen.camera_ocr import CameraOCRScreenStateProvider
+from ..screen.ocr_settings import OCRPoolBusy, OCRSettingsService
 from ..screen.state import ScreenStateError
 from ..screen.text_learning import text_suggestions
 from .capture import inspect_target, tap_preview
@@ -22,6 +23,7 @@ from .recorder import Recorder
 from .runner import WorkflowRunner, screen_keyboard_points, type_with_screen_keyboard
 from .service import WorkflowService
 from .storage import WorkflowStorage
+from hardware.raspberry_pi_input import PiControlTarget
 
 LOG = logging.getLogger("workflow_api")
 
@@ -34,6 +36,8 @@ def register_workflows(
     storage=None,
     *,
     device_id=None,
+    ocr_settings_storage=None,
+    ocr_resource_provider=None,
 ):
     storage = storage or WorkflowStorage()
     recorder = Recorder()
@@ -46,10 +50,51 @@ def register_workflows(
         "",
     ).strip()
 
+    ocr_settings = OCRSettingsService(
+        ocr_settings_storage,
+        resource_provider=ocr_resource_provider,
+    )
+
     if accessibility_url:
         screen_state_provider = AccessibilityScreenStateProvider(accessibility_url)
     else:
-        screen_state_provider = CameraOCRScreenStateProvider(external_screen)
+        screen_state_provider = CameraOCRScreenStateProvider(
+            external_screen,
+            worker_pool_size=ocr_settings.worker_pool_size,
+        )
+
+    # Alternate providers may implement the public screen API without a
+    # Paddle pool. In that case settings stay readable and status reports that
+    # no runtime pool is attached.
+    worker_pool = getattr(screen_state_provider, "_worker", None)
+    if worker_pool is not None:
+        ocr_settings.attach(worker_pool)
+
+    def resolve_job_screen(target_device_id):
+        # Dashboard selection is presentation state. A queued job instead uses
+        # the camera and persisted calibration belonging to its fixed device.
+        if (
+            state.pi_bridge is None
+            or state.camera_manager is None
+            or state.calibration_storage is None
+            or not hasattr(screen_state_provider, "for_screen")
+        ):
+            return external_screen, screen_state_provider
+        camera = state.camera_manager.get_camera(target_device_id)
+        camera_info = camera.status()
+        serial = "pi-api:" + state.pi_bridge.client.base_url
+        if target_device_id != "phone_A":
+            serial += "#" + target_device_id
+        device = PiControlTarget(serial, device_id=target_device_id)
+        calibration = state.calibration_storage.load(camera, camera_info, device)
+        isolated_state = SimpleNamespace(
+            lock=threading.RLock(),
+            calibration=calibration,
+            signature=(device, camera_info["width"], camera_info["height"]),
+            camera=camera,
+        )
+        isolated_screen = CalibratedCamera(isolated_state)
+        return isolated_screen, screen_state_provider.for_screen(isolated_screen)
 
     service = WorkflowService(
         state.android,
@@ -57,6 +102,7 @@ def register_workflows(
         external_screen,
         screen_state_provider,
         device_id=device_id,
+        screen_resolver=resolve_job_screen,
     )
 
     app.extensions.update(
@@ -64,7 +110,29 @@ def register_workflows(
         workflow_recorder=recorder,
         workflow_service=service,
         workflow_screen_state_provider=screen_state_provider,
+        ocr_settings_service=ocr_settings,
     )
+
+    @app.get("/api/ocr/settings")
+    def get_ocr_settings():
+        return jsonify(ocr_settings.settings())
+
+    @app.put("/api/ocr/settings")
+    def update_ocr_settings():
+        return jsonify(ocr_settings.update(payload()))
+
+    @app.get("/api/ocr/status")
+    def get_ocr_status():
+        return jsonify(ocr_settings.status())
+
+    @app.post("/api/ocr/restart")
+    def restart_ocr_workers():
+        if payload():
+            raise ValueError("Restart OCR Workers expects an empty JSON object.")
+        try:
+            return jsonify(ocr_settings.restart())
+        except OCRPoolBusy as exc:
+            return jsonify(ok=False, error=str(exc)), 409
 
     @app.get("/api/ocr/texts")
     def debug_ocr_texts():

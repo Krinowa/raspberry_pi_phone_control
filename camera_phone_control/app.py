@@ -352,6 +352,9 @@ def create_app(
     camera_manager=None,
     account_store=None,
     job_store=None,
+    start_job_executor=False,
+    ocr_settings_storage=None,
+    ocr_resource_provider=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -1267,6 +1270,8 @@ def create_app(
         client_id,
         workflow_storage,
         device_id=device_id,
+        ocr_settings_storage=ocr_settings_storage,
+        ocr_resource_provider=ocr_resource_provider,
     )
     register_jobs(
         app,
@@ -1274,6 +1279,7 @@ def create_app(
         payload,
         account_store=account_store,
         job_store=job_store,
+        start_executor=start_job_executor,
     )
     return app
 
@@ -1348,7 +1354,11 @@ def main():
         height=args.height,
     )
     camera = camera_manager.activate("phone_A")
-    app = create_app(camera, camera_manager=camera_manager)
+    app = create_app(
+        camera,
+        camera_manager=camera_manager,
+        start_job_executor=True,
+    )
 
     screen_provider = app.extensions.get("workflow_screen_state_provider")
     start_ocr_worker = getattr(screen_provider, "start_worker", None)
@@ -1381,6 +1391,9 @@ def main():
         )
 
     finally:
+        job_executor = app.extensions.get("job_executor")
+        if job_executor is not None:
+            job_executor.close()
         screen_provider = app.extensions.get("workflow_screen_state_provider")
         close_provider = getattr(screen_provider, "close", None)
         if close_provider is not None:

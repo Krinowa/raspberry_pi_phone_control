@@ -208,22 +208,27 @@ def validate_workflow(workflow, *, allow_empty=False):
         {"id", "name", "version", "variables", "steps"},
     )
     identifier(workflow["id"])
+
     if not text(workflow["name"], "Name", 160).strip():
         raise ValueError("Workflow name is required.")
     if type(workflow["version"]) is not int or workflow["version"] != 1:
         raise ValueError("Unsupported workflow version.")
     if type(workflow.get("financial", False)) is not bool:
         raise ValueError("financial must be a boolean.")
+
     for field in ("created_at", "updated_at"):
         if field in workflow:
             text(workflow[field], "Timestamp", 80)
+
     variables = workflow["variables"]
     keyboards = workflow.get("keyboards", {})
     steps = workflow["steps"]
 
     if not isinstance(keyboards, dict) or len(keyboards) > 32:
         raise ValueError("At most 32 captured keyboards are supported.")
+
     keyboard_names = set()
+
     for keyboard_id, keyboard in keyboards.items():
         validate_keyboard_map(keyboard_id, keyboard)
         keyboard_name = keyboard["name"].strip().casefold()
@@ -255,6 +260,7 @@ def validate_workflow(workflow, *, allow_empty=False):
             },
             {"name", "label", "type", "required", "default"},
         )
+
         name = identifier(definition["name"])
         text(definition["label"], "Variable label", 160)
 
@@ -305,7 +311,7 @@ def validate_workflow(workflow, *, allow_empty=False):
             "key": {"key"},
             "wait": {"seconds"},
             "wait_until_stable": {"stable_ms", "timeout_seconds"},
-            "wait_for_text": {"text", "timeout_seconds"},
+            "wait_for_text": {"text", "timeout_seconds", "roi"},
             "manual_checkpoint": {"message"},
         }[kind]
 
@@ -372,12 +378,31 @@ def validate_workflow(workflow, *, allow_empty=False):
             if not expected:
                 raise ValueError("Text to detect must not be empty.")
             step["text"] = expected
+
             try:
                 number(step.get("timeout_seconds"), 0.5, 300)
             except ValueError:
                 raise ValueError(
                     "timeout_seconds must be numeric between 0.5 and 300."
                 ) from None
+
+            if "roi" in step:
+                roi = step["roi"]
+                if not isinstance(roi, (list, tuple)) or len(roi) != 4:
+                    raise ValueError("Text ROI must be [x, y, width, height].")
+                try:
+                    for value in roi:
+                        number(value, 0, 1)
+                except ValueError:
+                    raise ValueError(
+                        "Text ROI values must be numeric between 0 and 1."
+                    ) from None
+                x, y, width, height = roi
+                if width <= 0 or height <= 0 or x + width > 1 or y + height > 1:
+                    raise ValueError(
+                        "Text ROI must have positive size and remain within the screen."
+                    )
+                step["roi"] = [x, y, width, height]
         elif kind == "key":
             if not isinstance(step.get("key"), str) or step["key"].upper() not in KEYS:
                 raise ValueError("Unsupported workflow key.")

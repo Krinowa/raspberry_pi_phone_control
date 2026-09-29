@@ -321,6 +321,47 @@ button.primary:hover:not(:disabled) {
   display: grid;
   gap: 8px;
 }
+.ocr-settings-card {
+  padding: 18px 20px;
+  margin-bottom: 22px;
+}
+.ocr-settings-form {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+}
+.ocr-settings-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+}
+.ocr-settings-form input {
+  width: 100px;
+  padding: 9px 10px;
+}
+.ocr-pool-status,
+.ocr-workers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 14px;
+  color: #52675e;
+  font-size: 12px;
+}
+.ocr-workers span {
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #eef3f0;
+}
+
+.ocr-recommendation {
+  margin: 0.8rem 0;
+  padding: 0.75rem;
+  border-radius: 0.55rem;
+  background: var(--panel-muted, #eef1f4);
+}
 .job-item {
   display: grid;
   grid-template-columns: minmax(180px, 1.2fr) repeat(3, minmax(100px, 1fr));
@@ -334,9 +375,16 @@ button.primary:hover:not(:disabled) {
 .job-item strong {
   font-family: ui-monospace, monospace;
 }
-.job-error {
+.job-error,
+.job-result {
   color: #8a3d3d;
   grid-column: 1 / -1;
+}
+.job-result {
+  color: #315f4d;
+}
+.job-cancel {
+  justify-self: start;
 }
 .device-preview {
   position: relative;

@@ -89,7 +89,12 @@ class WorkflowTiming:
                 "retry_count": 0,
                 "camera_frame_count": 0,
                 "ocr_call_count": 0,
+                "ocr_inference_count": 0,
                 "ocr_cache_hit_count": 0,
+                "ocr_skipped_count": 0,
+                "ocr_forced_count": 0,
+                "ocr_change_count": 0,
+                "ocr_initial_count": 0,
                 "repeated_ocr_frame_count": 0,
                 "ocr_calls": [],
                 "_started": self.clock(),
@@ -131,9 +136,20 @@ class WorkflowTiming:
                     self._seen_ocr_frames.add(frame_id)
                 metadata["repeated_frame"] = repeated
                 step["ocr_call_count"] += 1
+                step["ocr_inference_count"] += int(not bool(metadata.get("cache_hit")))
                 step["ocr_cache_hit_count"] += int(bool(metadata.get("cache_hit")))
                 step["repeated_ocr_frame_count"] += int(repeated)
                 step["ocr_calls"].append(metadata)
+            elif category == "ocr_skip":
+                step["ocr_skipped_count"] += count
+            elif category == "ocr_trigger":
+                reason = (event or {}).get("reason")
+                if reason == "forced":
+                    step["ocr_forced_count"] += count
+                elif reason == "changed_and_settled":
+                    step["ocr_change_count"] += count
+                elif reason == "no_baseline":
+                    step["ocr_initial_count"] += count
 
     @staticmethod
     def _public_step(step):
@@ -200,9 +216,16 @@ class WorkflowTiming:
                 "retry_count": sum(step["retry_count"] for step in steps),
                 "camera_frame_count": sum(step["camera_frame_count"] for step in steps),
                 "ocr_call_count": sum(step["ocr_call_count"] for step in steps),
+                "ocr_inference_count": sum(
+                    step["ocr_inference_count"] for step in steps
+                ),
                 "ocr_cache_hit_count": sum(
                     step["ocr_cache_hit_count"] for step in steps
                 ),
+                "ocr_skipped_count": sum(step["ocr_skipped_count"] for step in steps),
+                "ocr_forced_count": sum(step["ocr_forced_count"] for step in steps),
+                "ocr_change_count": sum(step["ocr_change_count"] for step in steps),
+                "ocr_initial_count": sum(step["ocr_initial_count"] for step in steps),
                 "repeated_ocr_frame_count": sum(
                     step["repeated_ocr_frame_count"] for step in steps
                 ),

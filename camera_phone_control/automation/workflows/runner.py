@@ -3,7 +3,11 @@
 from .validation import validate_workflow, resolve_variables
 from ..context import Cancelled
 from ..input.base import UnsupportedOperation
-from ..screen.state import UnavailableScreenStateProvider, wait_for_text
+from ..screen.state import (
+    ScreenStateError,
+    UnavailableScreenStateProvider,
+    wait_for_text,
+)
 from ..screen.stability import wait_until_stable
 from .timing import WorkflowTiming
 
@@ -74,6 +78,12 @@ class WorkflowRunner:
                 )
                 self.timing.begin_step(index, step["type"])
                 try:
+                    following = (
+                        workflow["steps"][index]
+                        if index < len(workflow["steps"])
+                        else None
+                    )
+                    self._prepare_text_wait_baseline(step, following)
                     self.execute_step(step, values, workflow.get("keyboards", {}))
                     ctx.check_cancelled()
                 except Cancelled:
@@ -98,7 +108,8 @@ class WorkflowRunner:
             ctx.logger.info(
                 "Workflow timing total=%.3fs hid_api=%.3fs fixed_sleep=%.3fs "
                 "visual_app_wait=%.3fs camera=%.3fs ocr=%.3fs other=%.3fs "
-                "polls=%d retries=%d",
+                "ocr_checks=%d paddle_calls=%d ocr_skipped=%d forced_ocr=%d "
+                "change_ocr=%d polls=%d retries=%d",
                 summary["total_seconds"],
                 summary["hid_api_seconds"],
                 summary["fixed_sleep_seconds"],
@@ -106,10 +117,33 @@ class WorkflowRunner:
                 summary["camera_frame_seconds"],
                 summary["ocr_wall_seconds"],
                 summary["other_seconds"],
+                summary["ocr_call_count"],
+                summary["ocr_inference_count"],
+                summary["ocr_skipped_count"],
+                summary["ocr_forced_count"],
+                summary["ocr_change_count"],
                 summary["poll_count"],
                 summary["retry_count"],
             )
             ctx.logger.info("Workflow execution finished.")
+
+    def _prepare_text_wait_baseline(self, step, following):
+        """Capture a cheap pre-action frame for a following camera text wait."""
+        if not following or following["type"] != "wait_for_text":
+            return
+        physical_action = step["type"] in {"tap", "swipe", "key"} or (
+            step["type"] == "input" and step.get("source") != "manual"
+        )
+        capture = getattr(self.screen_state_provider, "capture_change_baseline", None)
+        if physical_action and callable(capture):
+            try:
+                capture()
+            except ScreenStateError as exc:
+                # Baseline capture is an optimization. Preserve the prior order:
+                # send the action, then let the text wait report camera failure.
+                self.context.logger.info(
+                    "Text-wait baseline unavailable; continuing: %s", exc
+                )
 
     def _log_step_timing(self, ctx, index):
         step = self.timing.snapshot()["steps"][-1]
@@ -138,7 +172,7 @@ class WorkflowRunner:
         ctx = self.context
         ctx.check_cancelled()
         kind = step["type"]
-        
+
         if kind == "tap":
             ctx.input.tap(step["x"], step["y"])
         elif kind == "swipe":
@@ -163,6 +197,7 @@ class WorkflowRunner:
                 ctx,
                 step["text"],
                 step["timeout_seconds"],
+                roi=step.get("roi"),
             )
             ctx.logger.info("Text detected: %s", step["text"])
         elif kind == "manual_checkpoint":

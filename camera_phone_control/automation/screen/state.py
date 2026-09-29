@@ -57,6 +57,7 @@ def wait_for_text(
     timeout_seconds,
     *,
     interval=0.2,
+    roi=None,
     clock=time.monotonic,
 ):
     """Poll a provider without coupling workflow execution to its data source."""
@@ -64,14 +65,40 @@ def wait_for_text(
         provider = UnavailableScreenStateProvider()
 
     wait_started = time.monotonic()
-    deadline = clock() + timeout_seconds
+    started = clock()
+    deadline = started + timeout_seconds
+    last_ocr_at = started
+    optimized_poll = getattr(provider, "poll_contains_text", None)
+    forced_interval = getattr(provider, "forced_ocr_interval", None)
+    provider_interval = getattr(provider, "poll_interval", None)
+    polling_interval = (
+        provider_interval
+        if isinstance(provider_interval, (int, float)) and provider_interval > 0
+        else interval
+    )
 
     try:
         while True:
             context.check_cancelled()
 
             record_timing("polling_wait", 0.0, count=1)
-            if provider.contains_text(expected_text):
+            if (
+                callable(optimized_poll)
+                and isinstance(forced_interval, (int, float))
+                and forced_interval > 0
+            ):
+                now = clock()
+                checked, found = optimized_poll(
+                    expected_text,
+                    roi=roi,
+                    force=now - last_ocr_at >= forced_interval,
+                )
+                if checked:
+                    last_ocr_at = clock()
+            else:
+                found = provider.contains_text(expected_text)
+
+            if found:
                 return
 
             remaining = deadline - clock()
@@ -83,7 +110,7 @@ def wait_for_text(
                 )
 
             sleep_started = time.monotonic()
-            context.cancel_event.wait(min(interval, remaining))
+            context.cancel_event.wait(min(polling_interval, remaining))
             record_timing("polling_wait", time.monotonic() - sleep_started)
     finally:
         record_timing("wait_for_condition", time.monotonic() - wait_started)

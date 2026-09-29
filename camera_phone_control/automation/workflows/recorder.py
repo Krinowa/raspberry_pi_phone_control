@@ -508,7 +508,7 @@ class Recorder:
                     "key": {"key"},
                     "wait": {"seconds"},
                     "wait_until_stable": {"stable_ms", "timeout_seconds"},
-                    "wait_for_text": {"text", "timeout_seconds"},
+                    "wait_for_text": {"text", "timeout_seconds", "roi"},
                     "manual_checkpoint": {"message"},
                 }.get(old["type"], set())
                 changes = data.get("fields")

@@ -55,8 +55,14 @@ let addPhoneEnrollmentTarget = null;
 let addPhoneInitialDeviceIds = new Set();
 let accountBindings = [];
 let jobCatalog = [];
+const jobCancelsInFlight = new Set();
 let accountSettingsDeviceId = null;
 let accountSettingsAccountId = null;
+let ocrSettingsDirty = false;
+let ocrStatusTimer = null;
+let ocrStatusInFlight = false;
+let ocrPollingStopped = false;
+let ocrRecommendedWorkerCount = null;
 const DEVICE_REFRESH_MS = 1000;
 const DEVICE_STATUS_STALE_MS = 5000;
 const RUNTIME_STATUS_MS = 2000;
@@ -79,11 +85,13 @@ function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
     maxInterval: 0,
   };
   const metrics = previewDebugWindow;
+
   if (metrics.last !== null) {
     const interval = now - metrics.last;
     metrics.interval += interval;
     metrics.maxInterval = Math.max(metrics.maxInterval, interval);
   }
+
   metrics.last = now;
   metrics.count++;
   metrics.fetch += fetchMs;
@@ -91,6 +99,7 @@ function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
   metrics.decode += decodeMs;
   metrics.total += totalMs;
   const elapsed = now - metrics.started;
+
   if (elapsed >= 1000) {
     console.info(
       `Browser preview FPS=${((metrics.count * 1000) / elapsed).toFixed(1)} ` +
@@ -126,6 +135,7 @@ function scheduleRecovery() {
     RECOVERY_DELAYS_MS[
       Math.min(recoveryAttempt, RECOVERY_DELAYS_MS.length - 1)
     ];
+
   recoveryAttempt++;
   recoveryTimer = setTimeout(() => {
     recoveryTimer = null;
@@ -155,12 +165,14 @@ async function api(path, data, method = "POST", options = {}) {
       cache: "no-store",
       signal: AbortSignal.timeout(API_TIMEOUT_MS),
     });
+
     let body = {};
     try {
       body = await response.json();
     } catch {
       body = {};
     }
+
     if (!response.ok) {
       const error = new Error(
         body.error || `Request failed (${response.status})`,
@@ -225,7 +237,193 @@ const accountService = {
 
 const jobService = {
   list: () => api("/api/jobs", undefined, "GET", { monitor: false }),
+  cancel: (jobId) => api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {}),
 };
+
+const ocrService = {
+  settings: () =>
+    api("/api/ocr/settings", undefined, "GET", { monitor: false }),
+  save: (workerPoolSize) =>
+    api("/api/ocr/settings", { worker_pool_size: workerPoolSize }, "PUT"),
+  status: () => api("/api/ocr/status", undefined, "GET", { monitor: false }),
+  restart: () => api("/api/ocr/restart", {}),
+};
+
+function setOCRSettingsError(message = "") {
+  $("ocr-settings-error").textContent = message;
+  $("ocr-settings-error").hidden = !message;
+}
+
+function formatOCRBytes(value) {
+  if (!Number.isFinite(value) || value < 0) return "—";
+  return `${(value / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function formatOCRMilliseconds(value) {
+  if (!Number.isFinite(value)) return "—";
+  return value >= 1000
+    ? `${(value / 1000).toFixed(2)} s`
+    : `${Math.round(value)} ms`;
+}
+
+function renderOCRStatus(status) {
+  const input = $("ocr-worker-pool-size");
+  const maximum = status.hardware_worker_ceiling;
+  if (Number.isInteger(maximum) && maximum >= 1) input.max = String(maximum);
+  ocrRecommendedWorkerCount = Number.isInteger(status.recommended_worker_count)
+    ? status.recommended_worker_count
+    : null;
+
+  $("ocr-physical-cores").textContent =
+    status.physical_cpu_cores == null
+      ? "—"
+      : `${status.physical_cpu_cores}${
+          status.physical_cpu_fallback ? " (logical fallback)" : ""
+        }`;
+  $("ocr-logical-threads").textContent = status.logical_cpu_threads ?? "—";
+  $("ocr-cpu-budget").textContent = Number.isFinite(status.cpu_capacity_percent)
+    ? `${status.cpu_capacity_percent}%`
+    : "—";
+  $("ocr-cpu-ceiling").textContent = status.cpu_worker_ceiling ?? "—";
+  $("ocr-ram-ceiling").textContent = status.ram_worker_ceiling ?? "—";
+  $("ocr-hardware-ceiling").textContent = maximum ?? "—";
+  $("ocr-pool-size").textContent = status.pool_size ?? "—";
+  $("ocr-recommended-workers").textContent = ocrRecommendedWorkerCount ?? "—";
+  $("ocr-busy-workers").textContent = status.busy_workers ?? "—";
+  $("ocr-queued-requests").textContent = status.queued_requests ?? "—";
+  $("ocr-restart-required").textContent = status.restart_required
+    ? "Yes"
+    : "No";
+  $("ocr-cpu-usage").textContent = Number.isFinite(status.current_cpu_percent)
+    ? `${status.current_cpu_percent.toFixed(1)}%`
+    : "—";
+  $("ocr-memory-usage").textContent = Number.isFinite(
+    status.current_ram_percent,
+  )
+    ? `${status.current_ram_percent.toFixed(1)}%`
+    : "—";
+  $("ocr-available-ram").textContent = formatOCRBytes(
+    status.available_ram_bytes,
+  );
+  $("ocr-average-queue").textContent = formatOCRMilliseconds(
+    status.average_queue_wait_ms,
+  );
+  $("ocr-average-inference").textContent = formatOCRMilliseconds(
+    status.average_inference_ms,
+  );
+  $("ocr-recommendation-reason").textContent =
+    status.recommendation_reason ||
+    "Collecting recent OCR performance samples.";
+  const warning = $("ocr-settings-warning");
+  warning.textContent = status.warning || "";
+  warning.hidden = !status.warning;
+  $("ocr-apply-recommendation").disabled =
+    ocrRecommendedWorkerCount === null ||
+    ocrRecommendedWorkerCount === status.configured_pool_size;
+
+  const workers = Array.isArray(status.workers) ? status.workers : [];
+  $("ocr-workers").replaceChildren(
+    ...workers.map((worker) => {
+      const item = document.createElement("span");
+      item.textContent = `Worker ${worker.worker_id} — ${worker.state}`;
+      return item;
+    }),
+  );
+}
+
+function scheduleOCRStatus(delay = 1500) {
+  clearTimeout(ocrStatusTimer);
+  if (ocrPollingStopped) return;
+  ocrStatusTimer = setTimeout(refreshOCRStatus, delay);
+}
+
+async function refreshOCRStatus() {
+  if (ocrStatusInFlight) return;
+  ocrStatusInFlight = true;
+
+  try {
+    renderOCRStatus(await ocrService.status());
+  } catch (error) {
+    setOCRSettingsError(`OCR status unavailable: ${error.message}`);
+  } finally {
+    ocrStatusInFlight = false;
+    scheduleOCRStatus();
+  }
+}
+
+async function loadOCRSettings() {
+  try {
+    const [settings, status] = await Promise.all([
+      ocrService.settings(),
+      ocrService.status(),
+    ]);
+    const input = $("ocr-worker-pool-size");
+
+    if (!ocrSettingsDirty && document.activeElement !== input) {
+      input.value = String(settings.worker_pool_size);
+    }
+    renderOCRStatus(status);
+    setOCRSettingsError();
+  } catch (error) {
+    setOCRSettingsError(`OCR settings unavailable: ${error.message}`);
+  } finally {
+    scheduleOCRStatus();
+  }
+}
+
+async function saveOCRSettings(event) {
+  event.preventDefault();
+  const button = $("ocr-settings-save");
+  button.disabled = true;
+  setOCRSettingsError();
+
+  try {
+    const result = await ocrService.save(
+      Number($("ocr-worker-pool-size").value),
+    );
+    ocrSettingsDirty = false;
+    $("ocr-worker-pool-size").value = String(result.worker_pool_size);
+    await refreshOCRStatus();
+  } catch (error) {
+    setOCRSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function restartOCRWorkers() {
+  const button = $("ocr-workers-restart");
+  button.disabled = true;
+  setOCRSettingsError();
+
+  try {
+    renderOCRStatus(await ocrService.restart());
+  } catch (error) {
+    setOCRSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function applyOCRRecommendation() {
+  if (!Number.isInteger(ocrRecommendedWorkerCount)) return;
+  const button = $("ocr-apply-recommendation");
+  button.disabled = true;
+  setOCRSettingsError();
+
+  try {
+    const result = await ocrService.save(ocrRecommendedWorkerCount);
+    ocrSettingsDirty = false;
+    $("ocr-worker-pool-size").value = String(result.worker_pool_size);
+    await refreshOCRStatus();
+  } catch (error) {
+    setOCRSettingsError(error.message);
+  } finally {
+    button.disabled =
+      ocrRecommendedWorkerCount === null ||
+      Number($("ocr-worker-pool-size").value) === ocrRecommendedWorkerCount;
+  }
+}
 
 function setDeviceError(message = "") {
   const node = $("device-error");
@@ -254,6 +452,7 @@ function scheduleDeviceRefresh(active = true) {
 function scheduleRuntimeStatusRefresh(delay = RUNTIME_STATUS_MS) {
   clearTimeout(runtimeStatusTimer);
   runtimeStatusTimer = null;
+
   if (
     devicePollingStopped ||
     document.hidden ||
@@ -292,6 +491,7 @@ function deviceManagementBlocked() {
 
 function cameraState(details) {
   const config = details?.config;
+
   if (
     !config ||
     config.camera_source === null ||
@@ -337,6 +537,7 @@ function stopDevicePreviews() {
 function startDevicePreview(deviceId, image, placeholder) {
   // Unit-test DOM shims do not decode images. Avoid creating background timers there.
   if (typeof image.decode !== "function") return;
+
   const generation = devicePreviewGeneration;
   const schedule = (delay) => {
     if (generation !== devicePreviewGeneration || devicePollingStopped) return;
@@ -346,17 +547,20 @@ function startDevicePreview(deviceId, image, placeholder) {
     }, delay);
     devicePreviewTimers.set(deviceId, timer);
   };
+
   image.addEventListener("load", () => {
     placeholder.hidden = true;
     image.hidden = false;
     schedule(333);
   });
+
   image.addEventListener("error", () => {
     image.hidden = true;
     placeholder.hidden = false;
     placeholder.textContent = "Camera unavailable";
     schedule(1000);
   });
+
   image.src = `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`;
 }
 
@@ -367,6 +571,7 @@ function renderDevices() {
     : [];
   const enrollment = deviceCatalog?.enrollment || { active: false };
   const selected = deviceCatalog?.selected_device;
+
   $("device-state").textContent = deviceStatusStale
     ? "Device status unavailable. Retrying automatically."
     : devices.length
@@ -387,12 +592,14 @@ function renderDevices() {
     name.textContent = device.name || device.id;
     const badges = document.createElement("div");
     badges.className = "device-badges";
+
     if (device.default || device.id === deviceCatalog.default_device) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = "Default";
       badges.append(badge);
     }
+
     if (device.id === selected) {
       const badge = document.createElement("span");
       badge.className = "badge control-target";
@@ -429,14 +636,17 @@ function renderDevices() {
       details.status?.width,
       details.status?.height,
     );
+
     preview.disabled = device.id === selected || deviceManagementBlocked();
     preview.setAttribute?.(
       "aria-label",
       `Select ${device.name || device.id} for control`,
     );
+
     const previewImage = document.createElement("img");
     previewImage.alt = `${device.name || device.id} live camera preview`;
     previewImage.hidden = true;
+
     const previewPlaceholder = document.createElement("span");
     previewPlaceholder.textContent =
       status.label === "Available"
@@ -444,6 +654,7 @@ function renderDevices() {
         : `Camera ${status.label.toLowerCase()}`;
     preview.append(previewImage, previewPlaceholder);
     preview.addEventListener("click", () => selectDashboardDevice(device.id));
+
     if (
       camera.enabled &&
       camera.camera_source !== null &&
@@ -477,16 +688,19 @@ function renderDevices() {
 
     const actions = document.createElement("div");
     actions.className = "device-item-actions";
+
     const select = document.createElement("button");
     select.type = "button";
     select.textContent = device.id === selected ? "Controlling" : "Select";
     select.disabled = device.id === selected || deviceManagementBlocked();
     select.addEventListener("click", () => selectDashboardDevice(device.id));
+
     const settings = document.createElement("button");
     settings.type = "button";
     settings.textContent = "Camera Settings";
     settings.disabled = deviceManagementBlocked();
     settings.addEventListener("click", () => openCameraSettings(device));
+
     const account = document.createElement("button");
     account.type = "button";
     account.textContent = binding ? "Account Settings" : "Assign Account";
@@ -494,6 +708,7 @@ function renderDevices() {
     account.addEventListener("click", () =>
       openAccountSettings(device, binding),
     );
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "stop";
@@ -515,12 +730,13 @@ function renderDevices() {
     );
     return card;
   });
-  $("device-list").replaceChildren(...cards);
 
+  $("device-list").replaceChildren(...cards);
   $("device-enrollment-active").hidden = !enrollment.active;
   $("device-enrollment-form").hidden =
     !addPhonePanelOpen || !!enrollment.active;
   $("device-add").disabled = !!enrollment.active || deviceManagementBlocked();
+
   if (enrollment.active) {
     $("device-enrollment-target").textContent = enrollment.target_device_id
       ? `Registering ${enrollment.target_device_id}`
@@ -549,11 +765,15 @@ function renderJobs() {
       const id = document.createElement("strong");
       id.textContent = job.job_id;
       const account = document.createElement("span");
-      account.textContent = `Account: ${job.account_id}`;
+      account.textContent = job.bank
+        ? `Account: ${job.account_id} · ${job.bank}`
+        : `Account: ${job.account_id}`;
       const device = document.createElement("span");
       device.textContent = `Device: ${job.device_id}`;
       const workflow = document.createElement("span");
-      workflow.textContent = `Workflow: ${job.workflow}`;
+      workflow.textContent = job.action
+        ? `Workflow: ${job.workflow} · ${job.action}`
+        : `Workflow: ${job.workflow}`;
       const status = document.createElement("span");
       status.textContent = job.queue_position
         ? `${job.status} · queue ${job.queue_position}`
@@ -575,6 +795,42 @@ function renderJobs() {
         error.className = "job-error";
         error.textContent = job.error;
         item.append(error);
+      }
+      if (job.result) {
+        const result = document.createElement("span");
+        result.className = "job-result";
+        result.textContent = job.result;
+        item.append(result);
+      }
+      if (["QUEUED", "WAITING_FOR_DEVICE", "RUNNING"].includes(job.status)) {
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "job-cancel stop";
+        const cancellationPending =
+          job.cancel_requested || jobCancelsInFlight.has(job.job_id);
+        cancel.textContent = job.cancel_requested
+          ? "Cancellation requested"
+          : jobCancelsInFlight.has(job.job_id)
+            ? "Cancelling…"
+            : "Cancel";
+        cancel.disabled = cancellationPending;
+        cancel.addEventListener("click", async () => {
+          if (jobCancelsInFlight.has(job.job_id)) return;
+          jobCancelsInFlight.add(job.job_id);
+          renderJobs();
+          try {
+            const updated = await jobService.cancel(job.job_id);
+            jobCatalog = jobCatalog.map((candidate) =>
+              candidate.job_id === updated.job_id ? updated : candidate,
+            );
+          } catch (error) {
+            notice(`Could not cancel job: ${error.message}`, true);
+          } finally {
+            jobCancelsInFlight.delete(job.job_id);
+            renderJobs();
+          }
+        });
+        item.append(cancel);
       }
       return item;
     });
@@ -1794,9 +2050,14 @@ document.addEventListener("visibilitychange", () => {
     scheduleDeviceRefresh(false);
     clearTimeout(runtimeStatusTimer);
     runtimeStatusTimer = null;
+    clearTimeout(ocrStatusTimer);
+    ocrStatusTimer = null;
   } else if (state?.manual_backend === "raspberry_pi") {
     loadDevices();
     scheduleRuntimeStatusRefresh(0);
+    scheduleOCRStatus(0);
+  } else {
+    scheduleOCRStatus(0);
   }
 });
 
@@ -1809,6 +2070,9 @@ window.addEventListener("pagehide", () => {
   deviceRefreshTimer = null;
   clearTimeout(runtimeStatusTimer);
   runtimeStatusTimer = null;
+  clearTimeout(ocrStatusTimer);
+  ocrStatusTimer = null;
+  ocrPollingStopped = true;
   devicePollingStopped = true;
   // Best effort on close; the server's six-second lease is the fallback.
   if (manual)
@@ -1846,6 +2110,7 @@ async function loadStatus() {
   if (state?.manual_backend === "raspberry_pi") await loadDevices();
   scheduleRuntimeStatusRefresh();
   startLegacyStatusPolling();
+  await loadOCRSettings();
 }
 
 $("device-add").addEventListener("click", () => {
@@ -1906,14 +2171,22 @@ $("camera-settings-close").addEventListener("click", closeCameraSettings);
 $("camera-settings-dialog").addEventListener("click", (event) => {
   if (event.target === $("camera-settings-dialog")) closeCameraSettings();
 });
+$("ocr-worker-pool-size").addEventListener("input", () => {
+  ocrSettingsDirty = true;
+});
+$("ocr-settings-form").addEventListener("submit", saveOCRSettings);
+$("ocr-workers-restart").addEventListener("click", restartOCRWorkers);
+$("ocr-apply-recommendation").addEventListener("click", applyOCRRecommendation);
 window.addEventListener("pageshow", (event) => {
   if (event.persisted) {
+    ocrPollingStopped = false;
     devicePollingStopped = false;
     window.phoneRecorder?.resumePolling?.();
     refreshStatus();
     loadDevices();
     scheduleRuntimeStatusRefresh();
     startLegacyStatusPolling();
+    loadOCRSettings();
   }
 });
 render();

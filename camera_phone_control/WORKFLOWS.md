@@ -575,13 +575,25 @@ Review mode can insert an explicit semantic wait:
   "id": "text_1",
   "type": "wait_for_text",
   "text": "Transfer",
-  "timeout_seconds": 10
+  "timeout_seconds": 10,
+  "roi": [0.0, 0.25, 1.0, 0.5]
 }
 ```
 
 The text is trimmed and must contain 1–500 characters. `timeout_seconds` accepts
-finite numbers from 0.5–300. Playback polls about every 200 ms, checks cancellation
-between samples, and never repeats an earlier action. A timeout fails the run.
+finite numbers from 0.5–300. `roi` is optional normalized
+`[x, y, width, height]`; camera OCR checks that region first and always falls back
+to the full calibrated screen when the region misses. Generic providers poll about
+every 200 ms; the camera provider currently uses a 75 ms visual poll. Playback
+checks cancellation between samples and never repeats an earlier action. A timeout
+fails the run.
+
+When a camera text wait immediately follows an automated input action, playback
+captures a low-resolution pre-action signature. It waits for a visible change to
+settle before invoking PaddleOCR, while a periodic forced OCR check preserves the
+same timeout and target-detection behavior when a change is too small to observe.
+Other `ScreenStateProvider` implementations continue using `contains_text()` on
+every poll.
 
 Workflow execution depends only on `ScreenStateProvider.contains_text()` from
 `automation/screen/state.py`. Providers perform case-insensitive literal substring

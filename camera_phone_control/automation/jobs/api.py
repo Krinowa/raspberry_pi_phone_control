@@ -1,4 +1,4 @@
-"""JSON APIs for account routing and passive persistent job queues."""
+"""JSON APIs for account routing and persistent background job queues."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from flask import jsonify, request
 
 from automation.workflows.validation import resolve_variables
 
+from .executor import BackgroundJobExecutor
 from .service import DeviceEligibility, JobScheduler
 from .storage import AccountBindingStore, JobStore, RecordConflict, RecordNotFound
 
@@ -17,6 +18,7 @@ def register_jobs(
     *,
     account_store=None,
     job_store=None,
+    start_executor=False,
 ):
     account_store = account_store or AccountBindingStore()
     job_store = job_store or JobStore()
@@ -25,11 +27,19 @@ def register_jobs(
     camera_manager = app.extensions["camera_manager"]
     readiness = DeviceEligibility(state, camera_manager, workflow_service)
     scheduler = JobScheduler(job_store, readiness)
+    executor = BackgroundJobExecutor(
+        scheduler,
+        workflow_storage,
+        workflow_service,
+    )
+    if start_executor:
+        executor.start()
 
     app.extensions.update(
         account_binding_store=account_store,
         job_store=job_store,
         job_scheduler=scheduler,
+        job_executor=executor,
         device_eligibility=readiness,
     )
 
@@ -99,14 +109,16 @@ def register_jobs(
 
     @app.get("/api/jobs")
     def list_jobs():
-        return jsonify(jobs=[scheduler.public(job) for job in job_store.list()])
+        return jsonify(jobs=[scheduler.public(job) for job in scheduler.list_jobs()])
 
     @app.post("/api/jobs")
     def create_job():
         data = payload()
+
         if set(data) != {"account_id", "workflow", "payload"}:
             raise ValueError("Expected account_id, workflow, and payload only.")
         binding = account_store.get(data["account_id"])
+
         if not binding.enabled:
             raise RecordConflict("Account binding is disabled.")
         workflow = workflow_storage.read(data["workflow"])
@@ -116,12 +128,12 @@ def register_jobs(
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):
-        return jsonify(scheduler.public(job_store.get(job_id)))
+        return jsonify(scheduler.public(scheduler.get_job(job_id)))
 
     @app.post("/api/jobs/<job_id>/cancel")
     def cancel_job(job_id):
         if payload():
             raise ValueError("Cancel Job expects an empty JSON object.")
-        return jsonify(scheduler.public(scheduler.cancel_job(job_id)))
+        return jsonify(scheduler.public(executor.cancel(job_id)))
 
     return scheduler

@@ -18,9 +18,20 @@ JOB_STATES = {
     "COMPLETED",
     "FAILED",
     "CANCELLED",
+    "INTERRUPTED",
 }
 PENDING_JOB_STATES = {"QUEUED", "WAITING_FOR_DEVICE"}
-TERMINAL_JOB_STATES = {"COMPLETED", "FAILED", "CANCELLED"}
+TERMINAL_JOB_STATES = {"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"}
+
+JOB_TRANSITIONS = {
+    "QUEUED": {"WAITING_FOR_DEVICE", "RUNNING", "CANCELLED"},
+    "WAITING_FOR_DEVICE": {"QUEUED", "RUNNING", "CANCELLED"},
+    "RUNNING": {"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"},
+    "COMPLETED": set(),
+    "FAILED": set(),
+    "CANCELLED": set(),
+    "INTERRUPTED": set(),
+}
 
 
 def _plain_text(value, label, maximum, *, required=True):
@@ -52,12 +63,15 @@ class AccountBinding:
     def create(cls, data, existing=None):
         if not isinstance(data, dict):
             raise ValueError("Account binding must be a JSON object.")
+
         allowed = {"account_id", "display_name", "provider", "device_id", "enabled"}
+
         if set(data) - allowed:
             raise ValueError("Unsupported account binding field.")
         account_id = identifier(
             data.get("account_id", existing.account_id if existing else None)
         )
+
         if existing is not None and account_id != existing.account_id:
             raise ValueError("account_id is stable and cannot be changed.")
         display_name = _plain_text(
@@ -71,6 +85,7 @@ class AccountBinding:
             80,
             required=False,
         )
+
         device_id = data.get("device_id", existing.device_id if existing else None)
         validate_device_id(device_id)
         enabled = data.get("enabled", existing.enabled if existing else True)
@@ -91,6 +106,7 @@ class AccountBinding:
     def from_dict(cls, data):
         if not isinstance(data, dict) or set(data) != set(cls.__dataclass_fields__):
             raise ValueError("Stored account binding is invalid.")
+
         binding = cls.create(
             {
                 key: data.get(key)
@@ -129,22 +145,44 @@ class Job:
     error: str | None = None
     result: str | None = None
     cancel_requested: bool = False
+    external_ref: str | None = None
+    bank: str | None = None
+    action: str | None = None
 
     @classmethod
-    def create(cls, account_id, device_id, workflow, payload, status):
+    def create(
+        cls,
+        account_id,
+        device_id,
+        workflow,
+        payload,
+        status,
+        *,
+        external_ref=None,
+        bank=None,
+        action=None,
+    ):
         account_id = identifier(account_id)
         validate_device_id(device_id)
         workflow = identifier(workflow)
+
         if status not in PENDING_JOB_STATES:
             raise ValueError("New jobs must start queued or waiting for their device.")
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object.")
+
         try:
             encoded = json.dumps(payload, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("payload must contain valid JSON values.") from exc
+
         if len(encoded.encode("utf-8")) > 64 * 1024:
             raise ValueError("payload is too large.")
+
+        external_ref = _plain_text(external_ref, "external_ref", 256, required=False)
+        bank = _plain_text(bank, "bank", 80, required=False)
+        action = _plain_text(action, "action", 80, required=False)
+
         return cls(
             job_id="job_" + uuid.uuid4().hex,
             account_id=account_id,
@@ -153,16 +191,29 @@ class Job:
             payload=deepcopy(payload),
             status=status,
             created_at=now(),
+            external_ref=external_ref,
+            bank=bank,
+            action=action,
         )
 
     @classmethod
     def from_dict(cls, data):
-        if not isinstance(data, dict) or set(data) != set(cls.__dataclass_fields__):
+        if not isinstance(data, dict):
             raise ValueError("Stored job record is invalid.")
+
+        fields = set(cls.__dataclass_fields__)
+        legacy_fields = fields - {"external_ref", "bank", "action"}
+
+        if set(data) == legacy_fields:
+            data = {**data, "external_ref": None, "bank": None, "action": None}
+        elif set(data) != fields:
+            raise ValueError("Stored job record is invalid.")
+
         identifier(data.get("job_id"))
         identifier(data.get("account_id"))
         validate_device_id(data.get("device_id"))
         identifier(data.get("workflow"))
+
         if data.get("status") not in JOB_STATES:
             raise ValueError("Stored job status is invalid.")
         if not isinstance(data.get("payload"), dict):
@@ -171,15 +222,21 @@ class Job:
             encoded = json.dumps(data["payload"], allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("Stored job payload is invalid.") from exc
+
         if len(encoded.encode("utf-8")) > 64 * 1024:
             raise ValueError("Stored job payload is too large.")
         if type(data.get("cancel_requested")) is not bool:
             raise ValueError("Stored cancellation state is invalid.")
         _plain_text(data.get("created_at"), "created_at", 80)
+
         for field in ("started_at", "finished_at"):
             _plain_text(data.get(field), field, 80, required=False)
         for field in ("error", "result"):
             _plain_text(data.get(field), field, 500, required=False)
+
+        _plain_text(data.get("external_ref"), "external_ref", 256, required=False)
+        _plain_text(data.get("bank"), "bank", 80, required=False)
+        _plain_text(data.get("action"), "action", 80, required=False)
         return cls(**deepcopy(data))
 
     def stored(self):
@@ -193,6 +250,9 @@ class Job:
             "account_id": self.account_id,
             "device_id": self.device_id,
             "workflow": self.workflow,
+            "external_ref": self.external_ref,
+            "bank": self.bank,
+            "action": self.action,
             "status": self.status,
             "queue_position": queue_position,
             "created_at": self.created_at,
