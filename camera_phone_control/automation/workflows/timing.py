@@ -36,7 +36,16 @@ def measure_timing(category, *, count=0, event=None):
 class WorkflowTiming:
     """Collect step and aggregate wall-clock timing for one workflow run."""
 
+    _ROI_COUNTS = (
+        "roi_attempt_count",
+        "roi_hit_count",
+        "roi_miss_count",
+        "full_fallback_count",
+    )
+
     _DURATION_FIELDS = (
+        "roi_ocr_seconds",
+        "full_ocr_seconds",
         "hid_api_seconds",
         "fixed_sleep_seconds",
         "polling_wait_seconds",
@@ -97,6 +106,7 @@ class WorkflowTiming:
                 "ocr_initial_count": 0,
                 "repeated_ocr_frame_count": 0,
                 "ocr_calls": [],
+                **{field: 0 for field in self._ROI_COUNTS},
                 "_started": self.clock(),
             }
             self.steps.append(step)
@@ -130,6 +140,20 @@ class WorkflowTiming:
                 step["retry_count"] += count
             elif category == "ocr_call":
                 metadata = dict(event or {})
+                for field in self._ROI_COUNTS:
+                    step[field] += metadata.get(field, 0)
+                scope = "roi" if metadata.get("scope") == "roi" else "full"
+                step[scope + "_ocr_seconds"] += sum(
+                    metadata.get(key, 0.0)
+                    for key in (
+                        "preprocessing_seconds",
+                        "queue_wait_seconds",
+                        "ipc_send_seconds",
+                        "ipc_wait_seconds",
+                        "postprocessing_seconds",
+                        "worker_start_seconds",
+                    )
+                )
                 frame_id = metadata.get("frame_id")
                 repeated = frame_id is not None and frame_id in self._seen_ocr_frames
                 if frame_id is not None:
@@ -160,6 +184,13 @@ class WorkflowTiming:
             + result["ocr_ipc_seconds"]
             + result["ocr_postprocessing_seconds"]
         )
+        calls = result["ocr_calls"]
+        result["roi"] = next(
+            (call["roi"] for call in calls if call.get("roi") is not None), None
+        )
+        result["scopes"] = sorted({call.get("scope", "full") for call in calls})
+        for field in ("inference_ms", "queue_wait_ms", "region_count"):
+            result[field] = sum(call.get(field) or 0 for call in calls)
         result["visual_app_wait_seconds"] = result["polling_wait_seconds"]
         accounted = (
             result["hid_api_seconds"]
@@ -208,6 +239,10 @@ class WorkflowTiming:
             )
             summary = {
                 **totals,
+                **{
+                    field: sum(step[field] for step in steps)
+                    for field in self._ROI_COUNTS
+                },
                 "ocr_wall_seconds": ocr_wall,
                 "visual_app_wait_seconds": totals["polling_wait_seconds"],
                 "other_seconds": max(0.0, total - accounted),

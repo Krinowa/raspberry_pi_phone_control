@@ -360,7 +360,7 @@ class Recorder:
         self._clear_annotation_state()
         return self.snapshot()
 
-    def add_pending_expected_text(self, owner, text, timeout_seconds=10):
+    def add_pending_expected_text(self, owner, text, timeout_seconds=10, roi=None):
         self.require_owner(owner)
 
         if not self.active or self.pending_expected_text is None:
@@ -374,6 +374,8 @@ class Recorder:
             "text": text,
             "timeout_seconds": timeout_seconds,
         }
+        if roi is not None:
+            step["roi"] = deepcopy(roi)
 
         if target == "current":
             candidate["steps"].append(step)
@@ -488,8 +490,12 @@ class Recorder:
                         "text": data.get("text"),
                         "timeout_seconds": data.get("timeout_seconds", 10),
                     }
+                    if "roi" in data:
+                        fields["roi"] = deepcopy(data["roi"])
                     if wait is not None:
                         wait.update(fields)
+                        if fields.get("roi", False) is None:
+                            wait.pop("roi", None)
                     else:
                         candidate["steps"].insert(
                             index + 1,
@@ -515,6 +521,8 @@ class Recorder:
                 if not isinstance(changes, dict) or set(changes) - allowed:
                     raise ValueError("Unsupported fields for this step.")
                 old.update(deepcopy(changes))
+                if old["type"] == "wait_for_text" and changes.get("roi", False) is None:
+                    old.pop("roi", None)
             elif operation == "wait":
                 if old["type"] != "wait":
                     raise ValueError("Choose a wait step to edit its duration.")

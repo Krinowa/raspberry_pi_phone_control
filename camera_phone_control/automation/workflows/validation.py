@@ -6,7 +6,7 @@ import math
 import re
 import unicodedata
 from copy import deepcopy
-from ..coordinates import unit
+from ..coordinates import unit, normalized_roi
 from .models import STEP_TYPES, VARIABLE_TYPES
 
 IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,79}")
@@ -387,22 +387,12 @@ def validate_workflow(workflow, *, allow_empty=False):
                 ) from None
 
             if "roi" in step:
-                roi = step["roi"]
-                if not isinstance(roi, (list, tuple)) or len(roi) != 4:
-                    raise ValueError("Text ROI must be [x, y, width, height].")
-                try:
-                    for value in roi:
-                        number(value, 0, 1)
-                except ValueError:
-                    raise ValueError(
-                        "Text ROI values must be numeric between 0 and 1."
-                    ) from None
-                x, y, width, height = roi
-                if width <= 0 or height <= 0 or x + width > 1 or y + height > 1:
-                    raise ValueError(
-                        "Text ROI must have positive size and remain within the screen."
-                    )
-                step["roi"] = [x, y, width, height]
+                values = normalized_roi(step["roi"])
+                step["roi"] = (
+                    dict(zip(("x", "y", "width", "height"), values))
+                    if isinstance(step["roi"], dict)
+                    else values
+                )
         elif kind == "key":
             if not isinstance(step.get("key"), str) or step["key"].upper() not in KEYS:
                 raise ValueError("Unsupported workflow key.")

@@ -1,5 +1,9 @@
 """Workflow routes share the dashboard's local token, ownership and health gates."""
 
+import base64
+import uuid
+import cv2
+
 import logging
 import os
 import threading
@@ -11,6 +15,8 @@ from flask import jsonify, request
 
 from ..backends import backend_names, select_device
 from ..context import AutomationContext
+from ..coordinates import normalized_roi
+from .timing import WorkflowTiming
 from ..input.base import UnsupportedOperation
 from ..screen.accessibility import AccessibilityScreenStateProvider
 from ..screen.camera import CalibratedCamera
@@ -133,6 +139,75 @@ def register_workflows(
             return jsonify(ocr_settings.restart())
         except OCRPoolBusy as exc:
             return jsonify(ok=False, error=str(exc)), 409
+
+    # Bounded, short-lived calibrated snapshots: testing uses exactly the image
+    # displayed in the picker, even if the live phone changes meanwhile.
+    roi_previews = {}
+    roi_preview_lock = threading.Lock()
+
+    @app.post("/api/ocr/roi-preview")
+    def roi_preview():
+        if not hasattr(screen_state_provider, "_crop_roi"):
+            raise ValueError("ROI testing requires the PaddleOCR camera provider.")
+
+        image = screen_state_provider.capture_snapshot()
+        ok, encoded = cv2.imencode(".png", image)
+
+        if not ok:
+            raise ValueError("Could not encode calibrated preview.")
+        token = uuid.uuid4().hex
+        with roi_preview_lock:
+            now = time.monotonic()
+            for key, (stamp, _) in list(roi_previews.items()):
+                if now - stamp > 300:
+                    roi_previews.pop(key)
+            while len(roi_previews) >= 8:
+                roi_previews.pop(next(iter(roi_previews)))
+            roi_previews[token] = (now, image)
+        return jsonify(
+            token=token,
+            width=image.shape[1],
+            height=image.shape[0],
+            image="data:image/png;base64," + base64.b64encode(encoded).decode(),
+        )
+
+    @app.post("/api/ocr/roi-test")
+    def roi_test():
+        data = payload()
+        roi = normalized_roi(data.get("roi"))
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 500:
+            raise ValueError("Text to detect must be between 1 and 500 characters.")
+        token = data.get("token")
+        if not isinstance(token, str):
+            raise ValueError("Refresh the calibrated preview first.")
+        with roi_preview_lock:
+            saved = roi_previews.get(token)
+        if saved is None or time.monotonic() - saved[0] > 300:
+            raise ValueError("Calibrated preview expired; refresh it first.")
+        timing = WorkflowTiming()
+        timing.start()
+        timing.begin_step(1, "Test ROI OCR")
+        try:
+            crop = screen_state_provider._crop_roi(saved[1], roi)
+            expected = " ".join(text.split()).casefold()
+            # Share pool dispatch, but never overwrite a running device's caches.
+            provider = screen_state_provider.for_screen(external_screen)
+            candidates = provider._recognize_candidates(
+                crop,
+                scope="roi:" + repr(tuple(roi)),
+                expected=expected,
+                timings={"roi": dict(zip(("x", "y", "width", "height"), roi))},
+            )
+            found = screen_state_provider._candidates_contain(candidates, expected)
+        finally:
+            timing.end_step()
+            timing.finish()
+        return jsonify(
+            found=found,
+            texts=[item["text"] for item in candidates],
+            timing=timing.snapshot(),
+        )
 
     @app.get("/api/ocr/texts")
     def debug_ocr_texts():
@@ -540,7 +615,7 @@ def register_workflows(
     def add_recording_expected_text():
         data = payload()
 
-        if set(data) - {"text", "timeout_seconds"}:
+        if set(data) - {"text", "timeout_seconds", "roi"}:
             raise ValueError("Unexpected expected-text fields.")
 
         with lock:
@@ -549,6 +624,7 @@ def register_workflows(
                     recorder_id(),
                     data.get("text"),
                     data.get("timeout_seconds", 10),
+                    data.get("roi"),
                 )
             )
 

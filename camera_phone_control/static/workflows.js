@@ -102,6 +102,7 @@
 
   let expectedActionId = null,
     expectedMode = null,
+    expectedOriginalROI = null,
     keyboardSetupOpen = false,
     variableInputOpen = false,
     returnToVariableInput = false;
@@ -189,6 +190,8 @@
       : "Choose expected text for the current screen";
     $("expected-text-value").value = wait?.text || "";
     $("expected-text-timeout").value = wait?.timeout_seconds ?? 10;
+    expectedOriginalROI = wait?.roi || null;
+    expectedROIPicker.reset(expectedOriginalROI);
     $("expected-suggestions").replaceChildren();
     $("expected-text-status").textContent = "Reading current phone screen…";
     renderRecording();
@@ -237,6 +240,8 @@
   function closeExpectedText() {
     expectedActionId = null;
     expectedMode = null;
+    expectedOriginalROI = null;
+    expectedROIPicker.reset(null);
     $("expected-text-editor").hidden = true;
     render();
   }
@@ -657,6 +662,8 @@
     $("step-text-value").value = step.text ?? "";
     $("step-text-timeout").value = step.timeout_seconds ?? 10;
 
+    stepROIPicker.reset(step.roi);
+
     // Tap
     if (step.type === "tap") {
       $("step-tap-x").value = (step.x * 100).toFixed(1);
@@ -937,6 +944,185 @@
     return { stable_ms, timeout_seconds };
   }
 
+  const roiKeys = ["x", "y", "width", "height"];
+
+  function mountRegionOCR(prefix) {
+    const template = $("region-ocr-template");
+    if (!template?.content) return;
+    const fragment = template.content.cloneNode(true);
+    for (const control of fragment.querySelectorAll("[data-roi-control]")) {
+      control.id = `${prefix}-roi-${control.dataset.roiControl}`;
+      control.removeAttribute("data-roi-control");
+    }
+    $(`${prefix}-roi-picker`).append(fragment);
+  }
+
+  function createRegionOCRPicker(prefix, textPrefix) {
+    mountRegionOCR(prefix);
+    const canvas = $(`${prefix}-roi-canvas`);
+    let image = null,
+      token = null,
+      start = null,
+      generation = 0;
+
+    function hasValues() {
+      return roiKeys.every((key) => $(`${prefix}-roi-${key}`).value !== "");
+    }
+
+    function read(validate = true) {
+      const roi = Object.fromEntries(
+        roiKeys.map((key) => [key, Number($(`${prefix}-roi-${key}`).value)]),
+      );
+      if (
+        validate &&
+        (roiKeys.some(
+          (key) =>
+            $(`${prefix}-roi-${key}`).value === "" ||
+            !Number.isFinite(roi[key]) ||
+            roi[key] < 0 ||
+            roi[key] > 1,
+        ) ||
+          roi.width <= 0 ||
+          roi.height <= 0 ||
+          roi.x + roi.width > 1 + 1e-12 ||
+          roi.y + roi.height > 1 + 1e-12)
+      )
+        throw new Error(
+          "ROI must have positive size and fit inside the calibrated screen.",
+        );
+      return roi;
+    }
+
+    function setValues(roi) {
+      roiKeys.forEach((key, index) => {
+        $(`${prefix}-roi-${key}`).value =
+          (Array.isArray(roi) ? roi[index] : roi?.[key]) ?? "";
+      });
+    }
+
+    function draw() {
+      const roi = read(false);
+      $(`${prefix}-roi-values`).textContent = hasValues()
+        ? roiKeys.map((key) => `${key}: ${roi[key].toFixed(4)}`).join(" · ")
+        : "No OCR region selected.";
+      $(`${prefix}-roi-result`).textContent = "";
+      if (!image) return;
+      const context = canvas.getContext("2d");
+      context.drawImage(image, 0, 0);
+      if (!hasValues()) return;
+      context.strokeStyle = "#ff3b30";
+      context.lineWidth = Math.max(2, canvas.width / 200);
+      context.strokeRect(
+        roi.x * canvas.width,
+        roi.y * canvas.height,
+        roi.width * canvas.width,
+        roi.height * canvas.height,
+      );
+    }
+
+    function reset(roi) {
+      generation++;
+      image = token = start = null;
+      canvas.hidden = true;
+      $(`${prefix}-roi-enabled`).checked = !!roi;
+      setValues(roi);
+      draw();
+    }
+
+    function clear() {
+      generation++;
+      start = null;
+      $(`${prefix}-roi-enabled`).checked = false;
+      setValues(null);
+      draw();
+    }
+
+    function fields(existingROI = null) {
+      if ($(`${prefix}-roi-enabled`).checked) return { roi: read() };
+      return existingROI ? { roi: null } : {};
+    }
+
+    function point(event) {
+      const bounds = canvas.getBoundingClientRect();
+      return [
+        Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+        Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
+      ];
+    }
+
+    roiKeys.forEach((key) =>
+      $(`${prefix}-roi-${key}`).addEventListener("input", draw),
+    );
+    $(`${prefix}-roi-refresh`).addEventListener("click", () =>
+      task(async () => {
+        const selectedGeneration = ++generation;
+        const result = await api("/api/ocr/roi-preview", {});
+        const nextImage = new Image();
+        await new Promise((resolve, reject) => {
+          nextImage.onload = resolve;
+          nextImage.onerror = reject;
+          nextImage.src = result.image;
+        });
+        if (selectedGeneration !== generation) return;
+        image = nextImage;
+        token = result.token;
+        canvas.width = result.width;
+        canvas.height = result.height;
+        canvas.hidden = false;
+        draw();
+      }),
+    );
+    $(`${prefix}-roi-clear`).addEventListener("click", clear);
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!image || event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      start = point(event);
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!start) return;
+      const [x, y] = point(event);
+      setValues(
+        [
+          Math.min(x, start[0]),
+          Math.min(y, start[1]),
+          Math.abs(x - start[0]),
+          Math.abs(y - start[1]),
+        ].map((value) => Number(value.toFixed(6))),
+      );
+      $(`${prefix}-roi-enabled`).checked = true;
+      draw();
+    });
+    for (const name of ["pointerup", "pointercancel", "lostpointercapture"])
+      canvas.addEventListener(name, () => {
+        start = null;
+      });
+    $(`${prefix}-roi-test`).addEventListener("click", () =>
+      task(async () => {
+        if (!token) throw new Error("Select an OCR region snapshot first.");
+        const testedGeneration = generation;
+        const text = $(`${textPrefix}-text-value`).value.trim();
+        const result = await api("/api/ocr/roi-test", {
+          token,
+          roi: read(),
+          text,
+        });
+        if (testedGeneration !== generation) return;
+        $(`${prefix}-roi-result`).textContent = result.found
+          ? `Target detected in selected snapshot crop · ${result.texts.join(" | ")}`
+          : `Target not detected in selected snapshot crop · ${result.texts.join(" | ") || "No text read"}`;
+      }),
+    );
+
+    return { fields, reset };
+  }
+
+  const stepROIPicker = createRegionOCRPicker("step", "step");
+  const recordROIPicker = createRegionOCRPicker("record", "record");
+  const expectedROIPicker = createRegionOCRPicker("expected", "expected");
+  recordROIPicker.reset(null);
+
   function textWaitFields(prefix) {
     const text = $(`${prefix}-text-value`).value.trim();
     const timeout_seconds = Number($(`${prefix}-text-timeout`).value);
@@ -948,17 +1134,30 @@
       timeout_seconds > 300
     )
       throw new Error("Maximum wait must be between 0.5 and 300 seconds.");
-    return { text, timeout_seconds };
+    const fields = { text, timeout_seconds };
+    if (prefix === "step")
+      Object.assign(
+        fields,
+        stepROIPicker.fields(
+          recording.workflow?.steps.find((step) => step.id === editingId)?.roi,
+        ),
+      );
+    else if (prefix === "record")
+      Object.assign(fields, recordROIPicker.fields());
+    else if (prefix === "expected")
+      Object.assign(fields, expectedROIPicker.fields(expectedOriginalROI));
+    return fields;
   }
 
   $("record-text").addEventListener("click", () =>
-    task(() =>
-      review({
+    task(async () => {
+      await review({
         operation: "insert",
         index: Number($("insert-position").value),
         step: { type: "wait_for_text", ...textWaitFields("record") },
-      }),
-    ),
+      });
+      recordROIPicker.reset(null);
+    }),
   );
 
   $("record-wait").addEventListener("click", () =>

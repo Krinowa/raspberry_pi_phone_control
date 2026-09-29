@@ -77,6 +77,10 @@ def wait_for_text(
         else interval
     )
 
+    roi_options = {}
+    if roi is not None and callable(getattr(provider, "new_roi_wait", None)):
+        roi_options["roi_state"] = provider.new_roi_wait()
+
     try:
         while True:
             context.check_cancelled()
@@ -92,6 +96,7 @@ def wait_for_text(
                     expected_text,
                     roi=roi,
                     force=now - last_ocr_at >= forced_interval,
+                    **roi_options,
                 )
                 if checked:
                     last_ocr_at = clock()

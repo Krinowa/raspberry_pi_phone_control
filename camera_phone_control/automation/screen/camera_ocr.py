@@ -17,6 +17,7 @@ from collections import deque
 import cv2
 import numpy as np
 
+from ..coordinates import normalized_roi
 from .state import ScreenStateError, TextDetectionUnavailable
 from ..workflows.timing import measure_timing, record_timing
 
@@ -283,6 +284,7 @@ class _PaddleWorkerClient:
                 raise ScreenStateError(
                     "PaddleOCR worker stopped before accepting the image."
                 ) from exc
+
             send_seconds = time.monotonic() - send_started
             wait_started = time.monotonic()
             message = self._receive(wait_started + self.timeout, "inference")
@@ -697,6 +699,13 @@ class CameraOCRScreenStateProvider:
         self.forced_ocr_interval = self._configured_forced_interval()
         self.poll_interval = self._configured_poll_interval()
         self.settle_seconds = self._configured_settle_seconds()
+        self.roi_fallback_misses = int(
+            self._configured_float("CAMERA_OCR_ROI_FALLBACK_MISSES", 3, 1, 100)
+        )
+        self.roi_fallback_seconds = self._configured_float(
+            "CAMERA_OCR_ROI_FALLBACK_SECONDS", 3.0, 0.1, 300
+        )
+        self._roi_waits = {}
         self._debug_sequence = itertools.count(1)
         self._cache_by_scope = {}
         self._change_baseline = self._change_candidate = None
@@ -1096,7 +1105,18 @@ class CameraOCRScreenStateProvider:
                     int(frame_id) if isinstance(frame_id, np.integer) else frame_id
                 ),
                 "cache_hit": cache_hit,
-                "scope": scope,
+                "scope": "roi" if scope.startswith("roi:") else "full",
+                "roi": timings.get("roi"),
+                "roi_attempt_count": int(scope.startswith("roi:")),
+                "roi_hit_count": int(
+                    scope.startswith("roi:") and timings.get("matched", False)
+                ),
+                "roi_miss_count": int(
+                    scope.startswith("roi:")
+                    and not failed
+                    and not timings.get("matched", False)
+                ),
+                "full_fallback_count": int(scope == "full_fallback"),
                 "failed": failed,
                 "worker_pid": timings.get("worker_pid"),
                 "worker_id": timings.get("worker_id"),
@@ -1111,6 +1131,7 @@ class CameraOCRScreenStateProvider:
                 "total_seconds": timings.get("total", 0.0),
                 "preprocessing_seconds": timings.get("preprocess", 0.0),
                 "queue_wait_seconds": timings.get("queue_wait", 0.0),
+                "worker_start_seconds": timings.get("worker_start", 0.0),
                 "ipc_send_seconds": timings.get("ipc_send", 0.0),
                 "ipc_wait_seconds": timings.get("ipc_wait", 0.0),
                 "inference_seconds": timings.get("inference", 0.0),
@@ -1133,7 +1154,14 @@ class CameraOCRScreenStateProvider:
         )
 
     def _recognize_candidates(
-        self, image, *, timings=None, total_started=None, frame_id=None, scope="full"
+        self,
+        image,
+        *,
+        timings=None,
+        total_started=None,
+        frame_id=None,
+        scope="full",
+        expected=None,
     ):
         timings = {} if timings is None else timings
         total_started = time.monotonic() if total_started is None else total_started
@@ -1210,6 +1238,8 @@ class CameraOCRScreenStateProvider:
             mean_difference,
             changed_ratio,
         )
+        if expected is not None:
+            timings["matched"] = self._candidates_contain(candidates, expected)
         self._record_workflow_timings(timings, frame_id, cache_hit, scope=scope)
         return candidates
 
@@ -1260,7 +1290,7 @@ class CameraOCRScreenStateProvider:
 
     @staticmethod
     def _crop_roi(image, roi):
-        x, y, width, height = roi
+        x, y, width, height = normalized_roi(roi)
         image_height, image_width = image.shape[:2]
         left = min(image_width - 1, max(0, int(math.floor(x * image_width))))
         top = min(image_height - 1, max(0, int(math.floor(y * image_height))))
@@ -1280,7 +1310,11 @@ class CameraOCRScreenStateProvider:
             complete_text = " ".join(item["text"] for item in candidates).casefold()
             return expected in complete_text
 
-    def poll_contains_text(self, text, *, roi=None, force=False):
+    @staticmethod
+    def new_roi_wait():
+        return {"misses": 0, "last_fallback": time.monotonic()}
+
+    def poll_contains_text(self, text, *, roi=None, force=False, roi_state=None):
         """Cheaply gate wait polling, then run ROI OCR with a full fallback.
 
         Returns ``(ocr_was_run, text_found)`` so the caller can maintain the
@@ -1356,29 +1390,46 @@ class CameraOCRScreenStateProvider:
         self._change_candidate_since = None
         record_timing("ocr_trigger", 0.0, count=1, event={"reason": reason})
         if roi is not None:
+            roi = normalized_roi(roi)
+            if roi_state is None:
+                roi_state = self._roi_waits.setdefault(
+                    (expected, tuple(roi)), self.new_roi_wait()
+                )
             roi_image = self._crop_roi(snapshot, roi)
-            roi_timings = dict(timings)
+            roi_timings = dict(
+                timings, roi=dict(zip(("x", "y", "width", "height"), roi))
+            )
             candidates = self._recognize_candidates(
                 roi_image,
                 timings=roi_timings,
                 total_started=total_started,
                 frame_id=sequence,
-                scope="roi:" + ",".join(f"{value:.6g}" for value in roi),
+                scope="roi:" + repr(tuple(roi)),
+                expected=expected,
             )
-            if self._candidates_contain(candidates, expected):
+            if roi_timings["matched"]:
                 return True, True
+            roi_state["misses"] += 1
+            if (
+                roi_state["misses"] < self.roi_fallback_misses
+                and time.monotonic() - roi_state["last_fallback"]
+                < self.roi_fallback_seconds
+            ):
+                return True, False
             # Capture/warp happened once; do not count it again for fallback.
             fallback_timings = {
                 key: value
                 for key, value in timings.items()
                 if key not in {"capture", "decode", "warp", "copy"}
             }
+            fallback_timings["roi"] = roi_timings["roi"]
             candidates = self._recognize_candidates(
                 snapshot,
                 timings=fallback_timings,
                 frame_id=sequence,
                 scope="full_fallback",
             )
+            roi_state.update(misses=0, last_fallback=time.monotonic())
         else:
             candidates = self._recognize_candidates(
                 snapshot,

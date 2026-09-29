@@ -832,6 +832,7 @@
                   value="10"
                 />
               </label>
+              <div id="step-roi-picker"></div>
             </div>
 
             <div id="step-input-options" hidden>
@@ -939,6 +940,7 @@
                 value="10"
               />
             </label>
+            <div id="record-roi-picker"></div>
             <button id="record-text">Insert Wait for Text</button>
             <h4>Fixed Wait</h4>
             <div class="flow-buttons">
@@ -989,9 +991,75 @@
               required
             />
           </label>
+          <div id="expected-roi-picker"></div>
           <button type="submit">Add Check</button>
           <button id="expected-text-cancel" type="button">Cancel</button>
         </form>
+        <template id="region-ocr-template">
+          <div class="region-ocr-picker">
+            <label
+              ><input data-roi-control="enabled" type="checkbox" /> Use Region
+              OCR</label
+            >
+            <p>
+              Optional. Select on the calibrated OCR snapshot; refresh after the
+              phone screen changes.
+            </p>
+            <button data-roi-control="refresh" type="button">
+              Select OCR Region
+            </button>
+            <button data-roi-control="clear" type="button">
+              Clear OCR Region
+            </button>
+            <canvas
+              data-roi-control="canvas"
+              width="1"
+              height="1"
+              hidden
+            ></canvas>
+            <div class="row">
+              <label
+                >x
+                <input
+                  data-roi-control="x"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+              <label
+                >y
+                <input
+                  data-roi-control="y"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+              <label
+                >width
+                <input
+                  data-roi-control="width"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+              <label
+                >height
+                <input
+                  data-roi-control="height"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+            </div>
+            <output data-roi-control="values" aria-live="polite"></output>
+            <button data-roi-control="test" type="button">Test ROI OCR</button>
+            <p data-roi-control="result" role="status"></p>
+          </div>
+        </template>
         <div id="saved-flow-panel">
           <h3>Saved Flows</h3>
           <button id="flows-refresh">Refresh Flows</button>
