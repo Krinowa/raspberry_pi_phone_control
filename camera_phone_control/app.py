@@ -1192,6 +1192,7 @@ def create_app(
 
                 if name not in (
                     "tap",
+                    "swipe",
                     "back",
                     "home",
                     "recents",
@@ -1205,6 +1206,7 @@ def create_app(
                     raise ValueError("Unsupported control action.")
 
                 pixel, normalized = None, None
+                swipe_start, swipe_end, swipe_duration = None, None, None
 
                 if name == "tap":
                     if state.pi_bridge is not None:
@@ -1217,11 +1219,31 @@ def create_app(
                             state.device.width,
                             state.device.height,
                         )
+                elif name == "swipe":
+                    start, end = data.get("start"), data.get("end")
+                    swipe_duration = data.get("duration_ms", 300)
+                    if (
+                        type(swipe_duration) is not int
+                        or not 50 <= swipe_duration <= 60000
+                    ):
+                        raise ValueError(
+                            "Swipe duration must be 50–60000 milliseconds."
+                        )
+                    if state.pi_bridge is not None:
+                        swipe_start = state.calibration.map(start)
+                        swipe_end = state.calibration.map(end)
+                    else:
+                        _, swipe_start = state.calibration.pixel(
+                            start, state.device.width, state.device.height
+                        )
+                        _, swipe_end = state.calibration.pixel(
+                            end, state.device.width, state.device.height
+                        )
 
                 recorded = None
                 try:
                     if state.pi_bridge is not None:
-                        if name not in state.pi_bridge.ACTIONS:
+                        if name != "swipe" and name not in state.pi_bridge.ACTIONS:
                             raise ValueError(
                                 "This action is not supported; no input sent."
                             )
@@ -1230,6 +1252,13 @@ def create_app(
                                 "type": "tap",
                                 "x": normalized[0],
                                 "y": normalized[1],
+                            }
+                        elif name == "swipe":
+                            step = {
+                                "type": "swipe",
+                                "start": list(swipe_start),
+                                "end": list(swipe_end),
+                                "duration_ms": swipe_duration,
                             }
                         elif name in state.pi_bridge.SWIPES:
                             points = state.pi_bridge.SWIPES[name]
@@ -1240,9 +1269,13 @@ def create_app(
                             }
                         else:
                             step = {"type": "key", "key": name.upper()}
-                        recorded = app.extensions["record_manual"](
-                            step, lambda: state.pi_bridge.action(name, normalized)
-                        )
+                        if name == "swipe":
+                            operation = lambda: state.pi_bridge.swipe(
+                                *swipe_start, *swipe_end
+                            )
+                        else:
+                            operation = lambda: state.pi_bridge.action(name, normalized)
+                        recorded = app.extensions["record_manual"](step, operation)
                     else:
                         context = AutomationContext(
                             state.device,
@@ -1252,7 +1285,12 @@ def create_app(
                             SimpleNamespace(),
                             input_backend="appium",
                         )
-                        context.send(name, pixel)
+                        if name == "swipe":
+                            context.input.swipe(
+                                *swipe_start, *swipe_end, swipe_duration
+                            )
+                        else:
+                            context.send(name, pixel)
                 except (DeviceError, PiApiError) as exc:
                     state.disable(str(exc))
                     raise

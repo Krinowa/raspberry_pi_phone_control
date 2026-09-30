@@ -74,6 +74,15 @@ let recoveryPanelOpen = false;
 let recoveryRequestInFlight = false;
 let recoveryTargetJobId = null;
 let manualAssistanceOpen = false;
+let readyVerificationJobId = null;
+let readyVerificationFailedJobId = null;
+let readyVerificationMessage = "";
+let readyVerificationRestoreManual = false;
+let readyVerificationRestoreInFlight = false;
+let readyVerificationRestorePromise = null;
+let readyVerificationFinishInFlight = false;
+let previewGesture = null;
+let suppressPreviewClick = false;
 let ocrOperationalHealthy = null;
 let workflowRuntime = null;
 
@@ -84,7 +93,7 @@ function setDashboardMode(mode) {
   $("dashboard-admin").ariaSelected = String(dashboardMode === "admin");
   $("enable").textContent =
     dashboardMode === "operate"
-      ? "Enable Manual Assistance"
+      ? "Start Manual Control"
       : "Enable Manual Control";
 }
 
@@ -136,6 +145,26 @@ function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
 function notice(text, error = false) {
   $("notice").textContent = text;
   $("notice").classList.toggle("error", error);
+}
+
+function renderControllerTag() {
+  const tag = $("controller-tag");
+  if (!tag) return;
+
+  if (connectionState !== "connected") {
+    tag.textContent = "● Controller Reconnecting";
+    tag.classList.add("error");
+    return;
+  }
+
+  if (!state) {
+    tag.textContent = "● Checking controller…";
+    tag.classList.remove("error");
+    return;
+  }
+
+  tag.textContent = "● Controller Online";
+  tag.classList.remove("error");
 }
 
 function transientFailure(error, status = 0) {
@@ -625,9 +654,38 @@ function renderDevices() {
     const details = deviceCameraDetails?.[device.id] || {};
     const camera = details.config || {};
     const status = cameraState(details);
+    const deviceJobs = [...jobCatalog]
+      .reverse()
+      .filter((job) => job.device_id === device.id);
+    const recoveryJob = deviceJobs.find(
+      (job) =>
+        ["FAILED", "INTERRUPTED"].includes(job.status) &&
+        job.recovery_status !== "READY",
+    );
+    const runningJob = deviceJobs.find((job) => job.status === "RUNNING");
+    const manualWorkflowNeedsAttention =
+      workflowRuntime?.status === "failed" &&
+      workflowRuntime?.device_id === device.id;
+
+    const operationalState = recoveryJob
+      ? recoveryJob.recovery_status === "RECOVERING"
+        ? "recovering"
+        : "needs-attention"
+      : manualWorkflowNeedsAttention
+        ? "needs-attention"
+        : runningJob
+          ? "running"
+          : device.connected
+            ? "ready"
+            : "offline";
     const card = document.createElement("article");
     card.className =
-      "device-item" + (device.id === selected ? " selected" : "");
+      `device-item device-card--${operationalState}` +
+      (!device.connected && operationalState !== "offline"
+        ? " device-card--offline"
+        : "") +
+      (device.id === selected ? " selected" : "");
+    card.dataset.state = operationalState;
 
     const heading = document.createElement("div");
     heading.className = "device-item-heading";
@@ -652,24 +710,19 @@ function renderDevices() {
       badge.textContent = "Control target";
       badges.append(badge);
     }
-    const recoveryJob = [...jobCatalog]
-      .reverse()
-      .find(
-        (job) =>
-          job.device_id === device.id &&
-          ["FAILED", "INTERRUPTED"].includes(job.status),
-      );
-    if (recoveryJob) {
-      const recovery = document.createElement("span");
-      recovery.className = "badge";
-      recovery.textContent =
-        recoveryJob.recovery_status === "READY"
-          ? "Ready"
-          : recoveryJob.recovery_status === "RECOVERING"
-            ? "Recovering"
-            : "Needs Attention";
-      badges.append(recovery);
-    }
+    const operationalBadge = document.createElement("span");
+    operationalBadge.className = `badge device-state-badge device-state-badge--${operationalState}`;
+    operationalBadge.textContent =
+      operationalState === "needs-attention"
+        ? "Needs Attention"
+        : operationalState === "recovering"
+          ? "Recovering"
+          : operationalState === "running"
+            ? "Running"
+            : operationalState === "offline"
+              ? "Offline"
+              : "Ready";
+    badges.append(operationalBadge);
     heading.append(name, logicalId, badges);
 
     const states = document.createElement("div");
@@ -678,9 +731,11 @@ function renderDevices() {
     bluetooth.className =
       "device-status" +
       (!deviceStatusStale && device.connected ? " connected" : "");
+
     bluetooth.textContent = deviceStatusStale
       ? "Bluetooth: ? Status unavailable"
       : `Bluetooth: ● ${device.connected ? "Connected" : "Disconnected"}`;
+
     const cameraStatus = document.createElement("span");
     cameraStatus.className = "device-status " + status.className;
     cameraStatus.textContent = deviceStatusStale
@@ -750,6 +805,29 @@ function renderDevices() {
     accountId.textContent = binding?.account_id || "—";
     accountSummary.append(accountHeading, accountName, accountId);
 
+    let issueSummary = null;
+    if (operationalState === "needs-attention") {
+      issueSummary = document.createElement("p");
+      issueSummary.className = "device-issue-summary";
+
+      const issueLabel = document.createElement("strong");
+      issueLabel.textContent = "Last issue:";
+
+      const issueMessage = document.createElement("span");
+      const manualWorkflowMessage =
+        workflowRuntime?.device_id === device.id
+          ? workflowRuntime?.message
+          : null;
+
+      issueMessage.textContent = friendlyOperationalError(
+        recoveryJob?.recovery_error ||
+          recoveryJob?.error ||
+          manualWorkflowMessage ||
+          "This phone needs attention.",
+      );
+      issueSummary.append(issueLabel, issueMessage);
+    }
+
     const actions = document.createElement("div");
     actions.className = "device-item-actions";
 
@@ -758,6 +836,18 @@ function renderDevices() {
     select.textContent = device.id === selected ? "Controlling" : "Select";
     select.disabled = device.id === selected || deviceManagementBlocked();
     select.addEventListener("click", () => selectDashboardDevice(device.id));
+
+    let resolve = null;
+    if (operationalState === "needs-attention") {
+      resolve = document.createElement("button");
+      resolve.type = "button";
+      resolve.className = "primary device-resolve";
+      resolve.textContent = "Resolve";
+      resolve.disabled = deviceManagementBlocked();
+      resolve.addEventListener("click", () =>
+        resolveDeviceIssue(device.id, recoveryJob?.job_id || null),
+      );
+    }
 
     const settings = document.createElement("button");
     settings.className = "admin-only";
@@ -784,16 +874,16 @@ function renderDevices() {
     remove.disabled =
       deviceDeletesInFlight.has(device.id) || deviceManagementBlocked();
     remove.addEventListener("click", () => deleteDevice(device, remove));
-    actions.append(select, settings, account, remove);
-    card.append(
-      heading,
-      states,
-      mac,
-      preview,
-      summary,
-      accountSummary,
-      actions,
+    actions.append(
+      ...(resolve ? [resolve] : []),
+      select,
+      settings,
+      account,
+      remove,
     );
+    card.append(heading, states, mac, preview, summary, accountSummary);
+    if (issueSummary) card.append(issueSummary);
+    card.append(actions);
     return card;
   });
 
@@ -1017,11 +1107,19 @@ function currentOperationalIssue() {
       recommendation: "Open Admin and calibrate the selected phone.",
       manualAvailable: false,
     };
+
+  const selectedDeviceId = deviceCatalog?.selected_device;
   const targetJob = recoveryTargetJobId
     ? jobCatalog.find((job) => job.job_id === recoveryTargetJobId)
     : [...jobCatalog]
         .reverse()
-        .find((job) => ["FAILED", "INTERRUPTED"].includes(job.status));
+        .find(
+          (job) =>
+            job.device_id === selectedDeviceId &&
+            ["FAILED", "INTERRUPTED"].includes(job.status) &&
+            job.recovery_status !== "READY",
+        );
+
   if (targetJob?.recovery_status === "READY") return null;
   if (targetJob?.recovery_status === "RECOVERING")
     return {
@@ -1053,10 +1151,10 @@ function currentOperationalIssue() {
             ),
       recommendation:
         targetJob.recovery_status === "NEEDS_ATTENTION" && recoveryAttempted
-          ? "Use Manual Assistance and verify the configured ready screen before further work."
+          ? "Resolve the phone issue and verify the expected starting screen before further work."
           : targetJob.recovery_workflow_id
             ? "Run the configured recovery workflow. The failed job will not be retried."
-            : "No recovery workflow is configured. Use Manual Assistance or open Admin to configure one.",
+            : "No recovery workflow is configured. Resolve the phone issue manually or open Admin to configure one.",
       state: "Needs Attention",
       recoverAvailable: !!targetJob.recovery_workflow_id && !recoveryAttempted,
       manualAvailable: !targetJob.recovery_workflow_id || recoveryAttempted,
@@ -1098,20 +1196,70 @@ function currentOperationalIssue() {
 function renderOperationalRecovery() {
   // Lightweight unit-test DOMs and embedded clients may omit the page body.
   if (!document.body) return;
-  const issue = currentOperationalIssue();
+  let issue = currentOperationalIssue();
   const recoveryJob = recoveryTargetJobId
     ? jobCatalog.find((job) => job.job_id === recoveryTargetJobId)
     : [...jobCatalog]
         .reverse()
-        .find((job) => ["FAILED", "INTERRUPTED"].includes(job.status));
+        .find(
+          (job) =>
+            ["FAILED", "INTERRUPTED"].includes(job.status) &&
+            job.recovery_status !== "READY",
+        );
   const recovered = recoveryJob?.recovery_status === "READY";
   const recoveryAttempted =
     !!recoveryJob?.recovery_run_id ||
     !!recoveryJob?.recovery_error ||
     !!recoveryJob?.recovered_at;
+  if (
+    readyVerificationJobId &&
+    recoveryJob?.job_id === readyVerificationJobId &&
+    recoveryJob.recovery_status === "READY"
+  ) {
+    if (manual || readyVerificationRestoreInFlight) {
+      readyVerificationMessage =
+        "Ready screen detected. Releasing manual control…";
+      void finishSuccessfulReadyVerification(recoveryJob.job_id);
+    } else {
+      readyVerificationJobId = null;
+      readyVerificationFailedJobId = null;
+      readyVerificationMessage = "";
+      readyVerificationRestoreManual = false;
+      manualAssistanceOpen = false;
+      recoveryPanelOpen = false;
+      recoveryTargetJobId = null;
+      renderDevices();
+      issue = currentOperationalIssue();
+    }
+  } else if (
+    readyVerificationJobId &&
+    recoveryJob?.job_id === readyVerificationJobId &&
+    recoveryJob.recovery_status === "NEEDS_ATTENTION" &&
+    recoveryAttempted
+  ) {
+    readyVerificationFailedJobId = readyVerificationJobId;
+    readyVerificationJobId = null;
+    readyVerificationMessage = "Expected starting screen was not detected.";
+    manualAssistanceOpen = true;
+    recoveryPanelOpen = true;
+  }
   const attention = $("operate-attention");
   attention.hidden = !issue;
-  if (issue) $("operate-attention-message").textContent = issue.label;
+  if (issue) {
+    const affectedDevices = new Set(
+      jobCatalog
+        .filter(
+          (job) =>
+            ["FAILED", "INTERRUPTED"].includes(job.status) &&
+            job.recovery_status !== "READY",
+        )
+        .map((job) => job.device_id),
+    );
+    $("operate-attention-message").textContent =
+      affectedDevices.size > 1
+        ? `${affectedDevices.size} devices need attention`
+        : issue.label;
+  }
 
   $("operate-recovery").hidden = !recoveryPanelOpen || (!issue && !recovered);
   if (issue) {
@@ -1127,28 +1275,47 @@ function renderOperationalRecovery() {
   $("operate-recover-phone").hidden = !issue?.recoverAvailable;
   $("operate-recover-phone").disabled = recoveryRequestInFlight;
   $("operate-open-assistance").hidden = !issue?.manualAvailable;
+  $("operate-verify-finish").disabled =
+    recoveryRequestInFlight ||
+    readyVerificationRestoreInFlight ||
+    readyVerificationFinishInFlight;
   if (recoveryJob?.recovery_status === "RECOVERING")
     $("operate-recovery-result").textContent =
       "Recovery workflow is running. The failed workflow will not be retried.";
+  else if (recoveryJob?.job_id === readyVerificationFailedJobId)
+    $("operate-recovery-result").textContent =
+      "Expected starting screen was not detected.";
   else if (
     recoveryJob?.recovery_status === "NEEDS_ATTENTION" &&
     recoveryAttempted
   )
     $("operate-recovery-result").textContent =
       recoveryJob.recovery_error ||
-      "Automatic recovery failed. Manual assistance required.";
+      "Automatic recovery failed. Resolve the phone issue manually.";
   else if (recovered)
     $("operate-recovery-result").textContent =
       "Phone recovered successfully. Status: Ready.";
+  if (manualAssistanceOpen && readyVerificationMessage)
+    $("operate-recovery-result").textContent = readyVerificationMessage;
   document.body.dataset.manualAssistance = manualAssistanceOpen
     ? "open"
     : "closed";
+  if (
+    recoveryJob?.job_id === readyVerificationFailedJobId &&
+    readyVerificationRestoreManual &&
+    !manual
+  )
+    void restoreManualControlAfterVerificationFailure();
 }
 
 async function startPhoneRecovery(jobId) {
   if (recoveryRequestInFlight) return;
   recoveryRequestInFlight = true;
   recoveryTargetJobId = jobId;
+  readyVerificationJobId = null;
+  readyVerificationFailedJobId = null;
+  readyVerificationMessage = "";
+  readyVerificationRestoreManual = false;
   recoveryPanelOpen = true;
   $("operate-recovery-result").textContent = "Starting recovery workflow…";
   renderOperationalRecovery();
@@ -1168,6 +1335,12 @@ async function startPhoneRecovery(jobId) {
 }
 
 function openManualAssistance(jobId = null) {
+  if (jobId !== recoveryTargetJobId) {
+    readyVerificationJobId = null;
+    readyVerificationFailedJobId = null;
+    readyVerificationMessage = "";
+    readyVerificationRestoreManual = false;
+  }
   recoveryTargetJobId = jobId;
   recoveryPanelOpen = true;
   manualAssistanceOpen = true;
@@ -1182,33 +1355,77 @@ async function verifyPhoneReady() {
   const job = recoveryTargetJobId
     ? jobCatalog.find((candidate) => candidate.job_id === recoveryTargetJobId)
     : null;
-  if (!job?.recovery_workflow_id) {
-    $("operate-recovery-result").textContent =
-      "Ready state cannot be verified because no recovery workflow is configured.";
-    recoveryPanelOpen = true;
-    renderOperationalRecovery();
-    return;
-  }
-  if (manual) {
+
+  if (readyVerificationRestorePromise) await readyVerificationRestorePromise;
+
+  const restoreManualOnFailure = manual;
+  if (restoreManualOnFailure) {
     try {
       await disable();
     } catch (error) {
       notice(error.message, true);
+      readyVerificationMessage =
+        "Manual control could not be stopped safely. Verification was not started.";
+      readyVerificationRestoreManual = false;
+      recoveryPanelOpen = true;
+      renderOperationalRecovery();
+      return;
     }
   }
+
+  const manualWorkflowIssue =
+    !job && ["failed", "waiting_manual"].includes(workflowRuntime?.status);
+
+  if (!job?.recovery_workflow_id) {
+    if (manualWorkflowIssue) {
+      // Operator confirms they have manually returned the phone
+      // to the expected state.
+      workflowRuntime = null;
+
+      readyVerificationJobId = null;
+      readyVerificationFailedJobId = null;
+      readyVerificationMessage = "";
+      readyVerificationRestoreManual = false;
+
+      manualAssistanceOpen = false;
+      recoveryPanelOpen = false;
+      recoveryTargetJobId = null;
+
+      renderDevices();
+      renderOperationalRecovery();
+
+      notice("Phone marked ready.");
+      return;
+    }
+
+    readyVerificationMessage =
+      "Ready state cannot be verified because no recovery workflow is configured.";
+    readyVerificationRestoreManual = restoreManualOnFailure;
+    recoveryPanelOpen = true;
+    renderOperationalRecovery();
+
+    if (readyVerificationRestoreManual)
+      await restoreManualControlAfterVerificationFailure();
+
+    return;
+  }
+
   if (recoveryRequestInFlight) return;
   recoveryRequestInFlight = true;
-  $("operate-recovery-result").textContent =
-    "Verifying the configured ready screen…";
+  readyVerificationRestoreManual = restoreManualOnFailure;
+  readyVerificationMessage = "Verifying the configured ready screen…";
+  renderOperationalRecovery();
   try {
     const updated = await jobService.verifyReady(job.job_id);
     jobCatalog = jobCatalog.map((candidate) =>
       candidate.job_id === updated.job_id ? updated : candidate,
     );
-    manualAssistanceOpen = false;
+    readyVerificationJobId = job.job_id;
+    readyVerificationFailedJobId = null;
   } catch (error) {
-    $("operate-recovery-result").textContent =
-      `Ready state could not be verified: ${friendlyOperationalError(error.message)}`;
+    readyVerificationMessage = `Ready state could not be verified: ${friendlyOperationalError(error.message)}`;
+    if (readyVerificationRestoreManual)
+      await restoreManualControlAfterVerificationFailure();
   } finally {
     recoveryRequestInFlight = false;
     renderJobs();
@@ -1225,6 +1442,10 @@ async function closeManualAssistance() {
     }
   }
   manualAssistanceOpen = false;
+  readyVerificationJobId = null;
+  readyVerificationFailedJobId = null;
+  readyVerificationMessage = "";
+  readyVerificationRestoreManual = false;
   renderOperationalRecovery();
 }
 
@@ -1463,19 +1684,48 @@ async function selectDashboardDevice(deviceId) {
   setDeviceError();
   if (calibrating) {
     setDeviceError("Finish or cancel calibration before switching phones.");
-    return;
+    return false;
   }
   try {
     clearPreview(`Switching to ${deviceId} camera…`);
-    await deviceService.select(deviceId);
+    const result = await deviceService.select(deviceId);
+    if (deviceCatalog && result.selected_device === deviceId)
+      deviceCatalog = { ...deviceCatalog, selected_device: deviceId };
     manual = false;
     controlVersion++;
     await refreshStatus();
     await loadDevices();
     notice(`Selected ${deviceId}. Calibrate this phone if required.`);
+    return deviceCatalog?.selected_device === deviceId;
   } catch (error) {
     setDeviceError(error.message);
+    return false;
   }
+}
+
+async function resolveDeviceIssue(deviceId, jobId) {
+  if (
+    deviceId !== deviceCatalog?.selected_device &&
+    !(await selectDashboardDevice(deviceId))
+  )
+    return;
+  if (deviceCatalog?.selected_device !== deviceId) return;
+
+  recoveryTargetJobId = jobId;
+  recoveryPanelOpen = true;
+  readyVerificationJobId = null;
+  readyVerificationFailedJobId = null;
+  readyVerificationMessage = "";
+  readyVerificationRestoreManual = false;
+  const issue = currentOperationalIssue();
+  manualAssistanceOpen = !!issue?.manualAvailable;
+  renderOperationalRecovery();
+  $(
+    manualAssistanceOpen ? "manual-control-card" : "operate-recovery",
+  ).scrollIntoView?.({
+    block: "start",
+    behavior: "smooth",
+  });
 }
 
 function setCameraSettingsError(message = "") {
@@ -1739,6 +1989,7 @@ function renderKeyboard() {
 }
 
 function render() {
+  renderControllerTag();
   const piMode = state?.manual_backend === "raspberry_pi";
   const selectedDevice = selectedPiDevice();
   $("devices").hidden = !piMode;
@@ -1816,7 +2067,9 @@ function render() {
       : state?.pending
         ? "Takeover requested"
         : active()
-          ? "Manual control active"
+          ? dashboardMode === "operate"
+            ? "Control active"
+            : "Manual control active"
           : state?.enabled && !state?.owned
             ? "Other tab"
             : "Disabled";
@@ -1832,13 +2085,17 @@ function render() {
   $("takeover").disabled = busy || !!state?.pending || !state?.device;
   $("control-help").textContent = automation
     ? dashboardMode === "operate"
-      ? "Manual control disabled while automation owns the phone. Manual Assistance remains unavailable until it stops."
+      ? "Phone controls are unavailable while automation owns the phone."
       : "Manual control disabled. Camera monitoring remains available. Use Take Over to interrupt automation."
     : state?.pending
       ? "Takeover requested. Manual input stays disabled until automation yields."
       : dashboardMode === "operate"
-        ? "Enable assistance to use the phone preview and troubleshooting controls."
+        ? active()
+          ? "Click the phone preview to tap or drag to swipe."
+          : "Start manual control to use the phone preview, Back, and Home."
         : "Enable control when you are ready. Each click sends one tap to the phone.";
+
+  $("enable").hidden = dashboardMode === "operate" && active();
 
   $("enable").disabled =
     busy ||
@@ -1883,9 +2140,11 @@ function render() {
       ? `Click the phone display’s ${names[corners.length]} corner.`
       : "Check the outline, then save calibration."
     : active()
-      ? "Click inside the outlined display to send one tap."
+      ? dashboardMode === "operate"
+        ? "Click to tap or drag to swipe inside the outlined display."
+        : "Click inside the outlined display to send one tap."
       : dashboardMode === "operate"
-        ? "Manual assistance is disabled."
+        ? "Start manual control when you are ready."
         : "Input disabled. Calibrate, then enable Manual Control.";
 }
 
@@ -2059,7 +2318,21 @@ window.phoneConnection = {
 };
 
 window.phoneRuntimeStateChanged = (runtime = null) => {
-  workflowRuntime = runtime;
+  if (runtime) {
+    workflowRuntime = {
+      ...runtime,
+      device_id:
+        runtime.device_id ||
+        workflowRuntime?.device_id ||
+        deviceCatalog?.selected_device ||
+        null,
+    };
+  } else {
+    workflowRuntime = null;
+  }
+
+  deviceRenderSignature = null;
+  renderDevices();
   renderOperationalRecovery();
   refreshStatus();
 };
@@ -2223,24 +2496,78 @@ function applyControlResult(result) {
   render();
 }
 
-$("enable").addEventListener("click", () =>
-  report(async () => {
-    const version = ++controlVersion;
-    let result;
+async function enableManualControl() {
+  const version = ++controlVersion;
+  let result;
+  try {
+    result = await api("/api/control", {
+      enabled: true,
+      frame_id: frameId,
+    });
+  } finally {
+    // Enabling checks the Pi on the server; fetch the resulting cached badges.
+    if (state?.manual_backend === "raspberry_pi") await refreshStatus();
+  }
+  if (version !== controlVersion) return false;
+  applyControlResult(result);
+  if (result.enabled) notice("Manual control active.");
+  return !!result.enabled;
+}
+
+async function restoreManualControlAfterVerificationFailure() {
+  if (readyVerificationRestoreInFlight) return readyVerificationRestorePromise;
+  if (!readyVerificationRestoreManual || manual || !manualAssistanceOpen)
+    return;
+  readyVerificationRestoreInFlight = true;
+  readyVerificationRestorePromise = (async () => {
     try {
-      result = await api("/api/control", {
-        enabled: true,
-        frame_id: frameId,
-      });
+      await enableManualControl();
+    } catch (error) {
+      notice(
+        `Manual control was not restored: ${friendlyOperationalError(error.message)}`,
+        true,
+      );
     } finally {
-      // Enabling checks the Pi on the server; fetch the resulting cached badges.
-      if (state?.manual_backend === "raspberry_pi") await refreshStatus();
+      readyVerificationRestoreManual = false;
+      readyVerificationRestoreInFlight = false;
+      readyVerificationRestorePromise = null;
+      renderOperationalRecovery();
     }
-    if (version !== controlVersion) return;
-    applyControlResult(result);
-    if (result.enabled) notice("Manual control active.");
-  }),
-);
+  })();
+  return readyVerificationRestorePromise;
+}
+
+async function finishSuccessfulReadyVerification(jobId) {
+  if (readyVerificationFinishInFlight) return;
+  readyVerificationFinishInFlight = true;
+  try {
+    if (readyVerificationRestorePromise) await readyVerificationRestorePromise;
+    if (manual) await disable();
+    const verified = jobCatalog.find((job) => job.job_id === jobId);
+    if (verified?.recovery_status !== "READY") return;
+
+    readyVerificationJobId = null;
+    readyVerificationFailedJobId = null;
+    readyVerificationMessage = "";
+    readyVerificationRestoreManual = false;
+    manualAssistanceOpen = false;
+    recoveryPanelOpen = false;
+    recoveryTargetJobId = null;
+  } catch (error) {
+    readyVerificationJobId = null;
+    readyVerificationMessage =
+      "Ready screen was detected, but manual control could not be released safely.";
+    manualAssistanceOpen = true;
+    recoveryPanelOpen = true;
+    notice(error.message, true);
+  } finally {
+    readyVerificationFinishInFlight = false;
+    renderDevices();
+    renderOperationalRecovery();
+  }
+}
+
+$("enable").addEventListener("click", () => report(enableManualControl));
 
 $("takeover").addEventListener("click", () =>
   report(async () => {
@@ -2345,6 +2672,27 @@ async function sendAction(action, point) {
   });
 }
 
+async function sendPreviewSwipe(start, end, durationMs) {
+  if (!active() || busy || physicalBusy) return;
+  await report(async () => {
+    try {
+      await manualApi("/api/action", {
+        action: "swipe",
+        start,
+        end,
+        duration_ms: durationMs,
+        frame_id: frameId,
+      });
+      notice("Sent swipe.");
+    } catch (error) {
+      // No automatic command retries, including after a network timeout.
+      manual = false;
+      api("/api/control", { enabled: false }).catch(() => {});
+      throw error;
+    }
+  });
+}
+
 const phoneKeys = {
   Enter: "enter",
   Backspace: "backspace",
@@ -2434,7 +2782,72 @@ document.addEventListener("pointerdown", (event) => {
   if (event.target !== canvas) releaseKeyboard();
 });
 
+canvas.addEventListener("pointerdown", (event) => {
+  if (
+    calibrating ||
+    window.phoneRecorder?.capturesPreview() ||
+    window.phoneRecorder?.blocksInput?.() ||
+    !active() ||
+    !fresh() ||
+    busy ||
+    physicalBusy ||
+    event.button !== 0 ||
+    !event.isPrimary
+  )
+    return;
+  event.preventDefault();
+  canvas.focus({ preventScroll: true });
+  canvas.setPointerCapture(event.pointerId);
+  previewGesture = {
+    id: event.pointerId,
+    start: window.phonePreviewGestures.point(event, canvas),
+    at: performance.now(),
+  };
+});
+
+canvas.addEventListener("pointerup", (event) => {
+  if (!previewGesture || previewGesture.id !== event.pointerId) return;
+  const saved = previewGesture;
+  previewGesture = null;
+  suppressPreviewClick = true;
+  setTimeout(() => {
+    suppressPreviewClick = false;
+  }, 0);
+  if (
+    window.phoneRecorder?.blocksInput?.() ||
+    !active() ||
+    !fresh() ||
+    busy ||
+    physicalBusy
+  )
+    return;
+  const end = window.phonePreviewGestures.point(event, canvas);
+  if ([...saved.start, ...end].some((value) => value < 0 || value > 1)) {
+    notice("Keep the gesture inside the phone preview.", true);
+    return;
+  }
+  const gesture = window.phonePreviewGestures.classify(
+    saved.start,
+    end,
+    canvas,
+    performance.now() - saved.at,
+  );
+  if (gesture.type === "swipe")
+    sendPreviewSwipe(gesture.start, gesture.end, gesture.duration_ms);
+  else sendAction("tap", gesture.end);
+});
+
+for (const name of ["pointercancel", "lostpointercapture"])
+  canvas.addEventListener(name, () => {
+    previewGesture = null;
+  });
+
 canvas.addEventListener("click", (event) => {
+  if (suppressPreviewClick) {
+    suppressPreviewClick = false;
+    return;
+  }
+  if (window.phoneRecorder?.blocksInput?.()) return;
   if (!calibrating && window.phoneRecorder?.capturesPreview()) return;
   if (!fresh() || busy || physicalBusy) return;
 
@@ -2442,11 +2855,7 @@ canvas.addEventListener("click", (event) => {
   keyboardArmed = keyboardEligible();
   renderKeyboard();
 
-  const box = canvas.getBoundingClientRect();
-  const point = [
-    (event.clientX - box.left) / box.width,
-    (event.clientY - box.top) / box.height,
-  ];
+  const point = window.phonePreviewGestures.point(event, canvas);
 
   if (point.some((value) => value < 0 || value > 1)) return;
 
@@ -2564,7 +2973,7 @@ $("operate-open-assistance").addEventListener("click", () => {
   openManualAssistance(issue?.job?.job_id || null);
 });
 
-$("operate-phone-ready").addEventListener("click", verifyPhoneReady);
+$("operate-verify-finish").addEventListener("click", verifyPhoneReady);
 
 $("operate-close-assistance").addEventListener("click", () =>
   closeManualAssistance(),

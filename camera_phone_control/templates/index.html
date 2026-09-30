@@ -10,6 +10,10 @@
       rel="stylesheet"
       href="{{ url_for('static', filename='style.css') }}"
     />
+    <script
+      defer
+      src="{{ url_for('static', filename='phone_gestures.js') }}"
+    ></script>
     <script defer src="{{ url_for('static', filename='app.js') }}"></script>
     <script
       defer
@@ -23,7 +27,9 @@
           <p class="eyebrow">PHONE CONTROL / EXTERNAL CAMERA</p>
           <h1>Local control</h1>
         </div>
-        <span class="local-tag">● On this Mac only</span>
+        <span id="controller-tag" class="local-tag"
+          >● Checking controller…</span
+        >
       </header>
       <nav class="dashboard-tabs" aria-label="Dashboard mode">
         <button id="dashboard-operate" type="button" aria-selected="true">
@@ -107,7 +113,7 @@
           </button>
           <button id="operate-view-details" type="button">View Details</button>
           <button id="operate-open-assistance" type="button" hidden>
-            Open Manual Assistance
+            Resolve Phone Issue
           </button>
         </div>
       </section>
@@ -438,7 +444,7 @@
               width="1280"
               height="720"
               tabindex="0"
-              aria-label="Live external camera. Click to tap and control the keyboard. Press Escape to release."
+              aria-label="Live external camera. Click to tap or drag to swipe."
               aria-describedby="keyboard-help"
             ></canvas>
             <div id="video-placeholder">Waiting for camera access…</div>
@@ -633,56 +639,68 @@
           <section id="manual-control-card" class="card manual-control-surface">
             <div class="section-heading">
               <h2 class="admin-only">Input</h2>
-              <h2 class="operate-only">Manual Assistance</h2>
+              <h2 class="operate-only">Resolve Phone Issue</h2>
               <span id="mode" class="badge">Disabled</span>
             </div>
             <p class="operate-only manual-assistance-help">
-              Use this only when automatic recovery cannot return the phone to a
-              ready state.
+              Use the phone preview to return the phone to the expected starting
+              screen.
             </p>
             <p id="control-help">
-              Enable control when you are ready. Each click sends one tap to the
-              phone.
+              Start manual control to use the phone preview, Back, and Home.
             </p>
             <button id="enable" class="primary" disabled>
-              Enable Manual Control
+              Start Manual Control
             </button>
             <button id="takeover" class="stop admin-only" hidden disabled>
               Take Over
             </button>
-            <button id="disable" class="stop">Disable input</button>
+            <button id="disable" class="stop admin-only">Disable input</button>
             <p
               id="keyboard-state"
-              class="badge"
+              class="badge admin-only"
               role="status"
               aria-live="polite"
             >
               Keyboard control inactive
             </p>
-            <p id="keyboard-help" class="small">
+            <p id="keyboard-help" class="small admin-only">
               Click or focus the phone view to enable keyboard control.
             </p>
             <div class="controls">
               <button data-action="back" disabled>← Back</button>
               <button data-action="home" disabled>⌂ Home</button>
-              <button data-action="recents" disabled>▣ Recent apps</button>
-              <button data-action="swipe_up" disabled>↑ Swipe up</button>
-              <button data-action="swipe_down" disabled>↓ Swipe down</button>
-              <button data-action="swipe_left" disabled>← Swipe left</button>
-              <button data-action="swipe_right" disabled>→ Swipe right</button>
-              <button data-action="screen_on" disabled>☀ Wake screen</button>
-              <button data-action="screen_off" disabled>⏻ Screen off</button>
+              <button class="admin-only" data-action="recents" disabled>
+                ▣ Recent apps
+              </button>
+              <button class="admin-only" data-action="swipe_up" disabled>
+                ↑ Swipe up
+              </button>
+              <button class="admin-only" data-action="swipe_down" disabled>
+                ↓ Swipe down
+              </button>
+              <button class="admin-only" data-action="swipe_left" disabled>
+                ← Swipe left
+              </button>
+              <button class="admin-only" data-action="swipe_right" disabled>
+                → Swipe right
+              </button>
+              <button class="admin-only" data-action="screen_on" disabled>
+                ☀ Wake screen
+              </button>
+              <button class="admin-only" data-action="screen_off" disabled>
+                ⏻ Screen off
+              </button>
             </div>
             <div class="operate-only manual-assistance-finish">
-              <button id="operate-phone-ready" type="button">
-                Phone is Ready
+              <button id="operate-verify-finish" class="primary" type="button">
+                Verify &amp; Finish
               </button>
               <button id="operate-close-assistance" type="button">
-                Close Manual Assistance
+                Cancel
               </button>
               <p class="small">
-                This verifies the configured ready-screen condition. It never
-                resumes or retries the failed workflow.
+                Verification never resumes or retries the failed workflow.
               </p>
             </div>
           </section>

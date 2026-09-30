@@ -1722,14 +1722,6 @@
     addText(value);
   });
 
-  function location(event, element) {
-    const box = element.getBoundingClientRect();
-    return [
-      (event.clientX - box.left) / box.width,
-      (event.clientY - box.top) / box.height,
-    ];
-  }
-
   function installGestures(element, camera) {
     element.addEventListener("pointerdown", (event) => {
       if (
@@ -1750,7 +1742,7 @@
       element.setPointerCapture(event.pointerId);
       gesture = {
         id: event.pointerId,
-        start: location(event, element),
+        start: window.phonePreviewGestures.point(event, element),
         at: performance.now(),
         element,
       };
@@ -1770,19 +1762,17 @@
       if (camera && !fresh())
         return show("The camera frame expired; gesture discarded.", true);
 
-      const end = location(event, element);
+      const end = window.phonePreviewGestures.point(event, element);
       if ([...saved.start, ...end].some((v) => v < 0 || v > 1))
         return show("Keep the gesture inside the preview.", true);
-      const box = element.getBoundingClientRect();
-      const swipe =
-        Math.hypot(
-          (end[0] - saved.start[0]) * box.width,
-          (end[1] - saved.start[1]) * box.height,
-        ) > 8;
-      const duration_ms = Math.max(
-        50,
-        Math.min(60000, Math.round(performance.now() - saved.at)),
+      const classified = window.phonePreviewGestures.classify(
+        saved.start,
+        end,
+        element,
+        performance.now() - saved.at,
       );
+      const swipe = classified.type === "swipe";
+      const duration_ms = classified.duration_ms;
       const step = swipe ? { type: "swipe", duration_ms } : { type: "tap" };
       const extra = camera
         ? {
@@ -1819,7 +1809,7 @@
           true,
         );
       if (!camera && backend !== "mock") return;
-      const point = location(event, element);
+      const point = window.phonePreviewGestures.point(event, element);
       if (point.some((value) => value < 0 || value > 1))
         return show("Click inside the phone preview.", true);
       event.preventDefault();

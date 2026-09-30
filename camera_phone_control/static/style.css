@@ -389,6 +389,24 @@ button.primary:hover:not(:disabled) {
   border-color: #5b9678;
   box-shadow: 0 0 0 2px #d8eadf;
 }
+.device-item.device-card--offline {
+  border-color: #aeb9b4;
+  background: #f5f7f6;
+}
+.device-item.device-card--running {
+  border-color: #7ca5c8;
+  box-shadow: inset 3px 0 #4f82ad;
+}
+.device-item.device-card--recovering {
+  border-color: #d8b45e;
+  background: #fffaf0;
+  box-shadow: inset 3px 0 #c58a17;
+}
+.device-item.device-card--needs-attention {
+  border-color: #c86464;
+  background: #fff8f8;
+  box-shadow: inset 3px 0 #b84242;
+}
 .device-item-heading,
 .device-item-actions,
 .device-enrollment-active {
@@ -412,6 +430,26 @@ button.primary:hover:not(:disabled) {
   background: #d8eadf;
   color: #1f6240;
 }
+.device-state-badge--ready {
+  color: #1f6240;
+  background: #dcefe4;
+}
+.device-state-badge--running {
+  color: #28577e;
+  background: #e2edf6;
+}
+.device-state-badge--recovering {
+  color: #744d0c;
+  background: #fff0c9;
+}
+.device-state-badge--needs-attention {
+  color: #8d2929;
+  background: #f9dddd;
+}
+.device-state-badge--offline {
+  color: #53615a;
+  background: #e4e9e6;
+}
 .device-item h3 {
   font-size: 14px;
   margin: 0;
@@ -434,6 +472,20 @@ button.primary:hover:not(:disabled) {
   font-size: 11px;
   color: #687870;
   overflow-wrap: anywhere;
+}
+.device-issue-summary {
+  display: grid;
+  gap: 4px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-left: 3px solid #b84242;
+  border-radius: 6px;
+  color: #742d2d;
+  background: #fceaea;
+  font-size: 12px;
+}
+.device-issue-summary strong {
+  font-size: 11px;
 }
 .account-summary {
   margin: 10px 0;
