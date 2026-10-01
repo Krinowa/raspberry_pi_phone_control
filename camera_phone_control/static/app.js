@@ -70,6 +70,7 @@ const PREVIEW_INTERVAL_MS = 65;
 const PREVIEW_ERROR_RETRY_MS = 600;
 const PREVIEW_BACKGROUND_MS = 1000;
 let dashboardMode = "operate";
+let adminSession = { authenticated: false, username: null, role: null };
 let recoveryPanelOpen = false;
 let recoveryRequestInFlight = false;
 let recoveryTargetJobId = null;
@@ -87,7 +88,8 @@ let ocrOperationalHealthy = null;
 let workflowRuntime = null;
 
 function setDashboardMode(mode) {
-  dashboardMode = mode === "admin" ? "admin" : "operate";
+  dashboardMode =
+    mode === "admin" && adminSession.authenticated ? "admin" : "operate";
   if (document.body) document.body.dataset.dashboardMode = dashboardMode;
   $("dashboard-operate").ariaSelected = String(dashboardMode === "operate");
   $("dashboard-admin").ariaSelected = String(dashboardMode === "admin");
@@ -95,6 +97,51 @@ function setDashboardMode(mode) {
     dashboardMode === "operate"
       ? "Start Manual Control"
       : "Enable Manual Control";
+  return dashboardMode;
+}
+
+function renderAdminSession() {
+  const authenticated =
+    adminSession.authenticated && adminSession.role === "admin";
+  $("dashboard-admin").textContent = authenticated ? "Admin" : "Admin 🔒";
+  $("admin-session").hidden = !authenticated;
+  $("admin-session-username").textContent = authenticated
+    ? adminSession.username
+    : "";
+}
+
+function closeAdminLogin() {
+  $("admin-login-dialog").hidden = true;
+  $("admin-login-password").value = "";
+  $("admin-login-error").hidden = true;
+  $("admin-login-error").textContent = "";
+}
+
+function openAdminLogin() {
+  $("admin-login-dialog").hidden = false;
+  $("admin-login-error").hidden = true;
+  $("admin-login-username").focus();
+}
+
+function lockAdminState() {
+  adminSession = { authenticated: false, username: null, role: null };
+  setDashboardMode("operate");
+  renderAdminSession();
+}
+
+async function loadAdminSession() {
+  try {
+    const result = await api("/api/auth/session", undefined, "GET", {
+      monitor: false,
+    });
+    adminSession = result.authenticated
+      ? result
+      : { authenticated: false, username: null, role: null };
+  } catch {
+    adminSession = { authenticated: false, username: null, role: null };
+  }
+  if (!adminSession.authenticated) setDashboardMode("operate");
+  renderAdminSession();
 }
 
 function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
@@ -221,6 +268,8 @@ async function api(path, data, method = "POST", options = {}) {
     }
 
     if (!response.ok) {
+      if (response.status === 403 && body.error === "Admin login required.")
+        lockAdminState();
       const error = new Error(
         body.error || `Request failed (${response.status})`,
       );
@@ -1115,7 +1164,7 @@ function currentOperationalIssue() {
         .reverse()
         .find(
           (job) =>
-            job.device_id === selectedDeviceId &&
+            (!selectedDeviceId || job.device_id === selectedDeviceId) &&
             ["FAILED", "INTERRUPTED"].includes(job.status) &&
             job.recovery_status !== "READY",
         );
@@ -2693,76 +2742,76 @@ async function sendPreviewSwipe(start, end, durationMs) {
   });
 }
 
-const phoneKeys = {
-  Enter: "enter",
-  Backspace: "backspace",
-  Tab: "tab",
-  ArrowLeft: "left",
-  ArrowRight: "right",
-  ArrowUp: "up",
-  ArrowDown: "down",
-  Delete: "delete",
-  Home: "home",
-  End: "end",
-  PageUp: "pageup",
-  PageDown: "pagedown",
-};
+// const phoneKeys = {
+//   Enter: "enter",
+//   Backspace: "backspace",
+//   Tab: "tab",
+//   ArrowLeft: "left",
+//   ArrowRight: "right",
+//   ArrowUp: "up",
+//   ArrowDown: "down",
+//   Delete: "delete",
+//   Home: "home",
+//   End: "end",
+//   PageUp: "pageup",
+//   PageDown: "pagedown",
+// };
 
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && keyboardArmed) {
-    event.preventDefault();
-    releaseKeyboard();
-    canvas.blur();
-    return;
-  }
-  if (
-    !keyboardActive() ||
-    busy ||
-    physicalBusy ||
-    event.defaultPrevented ||
-    event.repeat ||
-    event.ctrlKey ||
-    event.metaKey ||
-    event.altKey ||
-    event.isComposing ||
-    event.keyCode === 229 ||
-    event.getModifierState("AltGraph") ||
-    event.getModifierState("Fn")
-  )
-    return;
+// document.addEventListener("keydown", (event) => {
+//   if (event.key === "Escape" && keyboardArmed) {
+//     event.preventDefault();
+//     releaseKeyboard();
+//     canvas.blur();
+//     return;
+//   }
+//   if (
+//     !keyboardActive() ||
+//     busy ||
+//     physicalBusy ||
+//     event.defaultPrevented ||
+//     event.repeat ||
+//     event.ctrlKey ||
+//     event.metaKey ||
+//     event.altKey ||
+//     event.isComposing ||
+//     event.keyCode === 229 ||
+//     event.getModifierState("AltGraph") ||
+//     event.getModifierState("Fn")
+//   )
+//     return;
 
-  // Leave local editing and keyboard activation of dashboard controls intact.
-  const target = event.target;
-  if (target?.isContentEditable || target?.closest?.("input, textarea, select"))
-    return;
-  if (
-    (event.key === "Enter" || event.key === " ") &&
-    target?.closest?.("button, a, [role='button']")
-  )
-    return;
+//   // Leave local editing and keyboard activation of dashboard controls intact.
+//   const target = event.target;
+//   if (target?.isContentEditable || target?.closest?.("input, textarea, select"))
+//     return;
+//   if (
+//     (event.key === "Enter" || event.key === " ") &&
+//     target?.closest?.("button, a, [role='button']")
+//   )
+//     return;
 
-  let type, value;
-  if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
-    type = "text";
-    value = event.key;
-  } else if (!event.shiftKey && Object.hasOwn(phoneKeys, event.key)) {
-    type = "key";
-    value = phoneKeys[event.key];
-  } else return;
+//   let type, value;
+//   if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
+//     type = "text";
+//     value = event.key;
+//   } else if (!event.shiftKey && Object.hasOwn(phoneKeys, event.key)) {
+//     type = "key";
+//     value = phoneKeys[event.key];
+//   } else return;
 
-  event.preventDefault();
-  // Send immediately using the existing busy gate. No buffer or keyboard history.
-  report(async () => {
-    try {
-      await manualApi("/api/key", { type, value, frame_id: frameId });
-    } catch (error) {
-      // An uncertain input is never retried, even after a network timeout.
-      manual = false;
-      api("/api/control", { enabled: false }).catch(() => {});
-      throw error;
-    }
-  });
-});
+//   event.preventDefault();
+//   // Send immediately using the existing busy gate. No buffer or keyboard history.
+//   report(async () => {
+//     try {
+//       await manualApi("/api/key", { type, value, frame_id: frameId });
+//     } catch (error) {
+//       // An uncertain input is never retried, even after a network timeout.
+//       manual = false;
+//       api("/api/control", { enabled: false }).catch(() => {});
+//       throw error;
+//     }
+//   });
+// });
 
 window.addEventListener("focus", renderKeyboard);
 window.addEventListener("blur", releaseKeyboard);
@@ -2950,7 +2999,52 @@ $("dashboard-operate").addEventListener("click", () =>
   setDashboardMode("operate"),
 );
 
-$("dashboard-admin").addEventListener("click", () => setDashboardMode("admin"));
+$("dashboard-admin").addEventListener("click", () => {
+  if (adminSession.authenticated) setDashboardMode("admin");
+  else openAdminLogin();
+});
+$("admin-login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submit = $("admin-login-submit");
+  const error = $("admin-login-error");
+  submit.disabled = true;
+  error.hidden = true;
+  try {
+    adminSession = await api(
+      "/api/auth/login",
+      {
+        username: $("admin-login-username").value.trim(),
+        password: $("admin-login-password").value,
+      },
+      "POST",
+      { monitor: false },
+    );
+    closeAdminLogin();
+    renderAdminSession();
+    setDashboardMode("admin");
+  } catch (loginError) {
+    error.textContent = loginError.message;
+    error.hidden = false;
+    $("admin-login-password").select();
+  } finally {
+    submit.disabled = false;
+  }
+});
+$("admin-login-cancel").addEventListener("click", closeAdminLogin);
+$("admin-login-dialog").addEventListener("click", (event) => {
+  if (event.target === $("admin-login-dialog")) closeAdminLogin();
+});
+$("admin-logout").addEventListener("click", async () => {
+  setDashboardMode("operate");
+  try {
+    await api("/api/auth/logout", {}, "POST", { monitor: false });
+  } catch (error) {
+    notice(`Could not lock Admin: ${error.message}`, true);
+    await loadAdminSession();
+    return;
+  }
+  lockAdminState();
+});
 $("operate-resolve-issue").addEventListener("click", () => {
   const issue = currentOperationalIssue();
   if (issue?.job) recoveryTargetJobId = issue.job.job_id;
@@ -3079,6 +3173,8 @@ window.addEventListener("pageshow", (event) => {
 });
 
 setDashboardMode(dashboardMode);
+renderAdminSession();
+loadAdminSession();
 render();
 loadStatus();
 videoLoop();

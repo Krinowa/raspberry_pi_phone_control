@@ -164,9 +164,11 @@
     }
 
     if (kind === "alphabetic") {
-      const keys = Array.from("abcdefghijklmnopqrstuvwxyz");
+      const keys = Array.from("qwertyuiopasdfghjklzxcvbnm");
+
       if ($("keyboard-include-space").checked) keys.push(" ");
       if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
+
       return keys;
     }
 
@@ -187,15 +189,52 @@
     );
   }
 
+  function isUsefulExpectedText(text) {
+    const value = String(text || "").trim();
+
+    if (value.length < 2) return false;
+
+    const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    const keyboardPatterns = [
+      "qwertyuiop",
+      "asdfghjkl",
+      "zxcvbnm",
+      "1234567890",
+    ];
+
+    if (
+      keyboardPatterns.some(
+        (pattern) => pattern.includes(compact) || compact.includes(pattern),
+      )
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
   async function openExpectedText(step, wait, mode = "review") {
     expectedActionId = step?.id || null;
     expectedMode = mode;
+
     $("expected-text-editor").hidden = false;
+
+    requestAnimationFrame(() => {
+      $("expected-text-editor").scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+
     $("expected-text-title").textContent = step
       ? `Choose expected text after ${describe(step)}`
       : "Choose expected text for the current screen";
+
     $("expected-text-value").value = wait?.text || "";
+
     $("expected-text-timeout").value = wait?.timeout_seconds ?? 10;
+
     expectedOriginalROI = wait?.roi || null;
     expectedROIPicker.reset(expectedOriginalROI);
     $("expected-suggestions").replaceChildren();
@@ -215,7 +254,17 @@
       )
         return;
 
-      const choices = (result.suggestions || []).slice(0, 5);
+      const choices = (result.suggestions || [])
+        .map((text) => String(text || "").trim())
+        .filter(isUsefulExpectedText)
+        .filter(
+          (text, index, list) =>
+            list.findIndex(
+              (item) => item.toLowerCase() === text.toLowerCase(),
+            ) === index,
+        )
+        .slice(0, 5);
+
       $("expected-suggestions").replaceChildren(
         ...choices.map((text) => {
           const label = document.createElement("label");
@@ -243,13 +292,28 @@
     renderRecording();
   }
 
-  function closeExpectedText() {
+  function closeExpectedText(scrollBack = false) {
     expectedActionId = null;
     expectedMode = null;
     expectedOriginalROI = null;
+
     expectedROIPicker.reset(null);
     $("expected-text-editor").hidden = true;
+
     render();
+
+    if (scrollBack) {
+      requestAnimationFrame(() => {
+        const returnTarget = recording.active
+          ? $("record-live")
+          : $("review-flow");
+
+        returnTarget?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      });
+    }
   }
 
   async function openPendingExpectedText() {
@@ -281,7 +345,8 @@
         recording = await api("/api/recorder/expected-text", {
           ...textWaitFields("expected"),
         });
-      closeExpectedText();
+
+      closeExpectedText(true);
     });
   });
 
@@ -289,7 +354,8 @@
     task(async () => {
       if (expectedMode && expectedMode !== "review")
         recording = await api("/api/recorder/expected-text/cancel", {});
-      closeExpectedText();
+
+      closeExpectedText(true);
     }),
   );
 
@@ -341,6 +407,49 @@
         image.width = 96;
         image.height = 96;
         row.append(image);
+      }
+
+      if (!recording.active && step.recording_screenshot?.image) {
+        const wrap = document.createElement("div");
+        wrap.className = "recording-step-preview";
+
+        const image = document.createElement("img");
+
+        const format =
+          step.recording_screenshot.format === "png" ? "png" : "jpeg";
+
+        image.src =
+          `data:image/${format};base64,` + step.recording_screenshot.image;
+
+        image.alt = `Screen before ${describe(step, index)}`;
+
+        wrap.append(image);
+
+        if (step.type === "tap") {
+          const marker = document.createElement("span");
+          marker.className = "recording-tap-marker";
+
+          marker.style.left = `${step.x * 100}%`;
+          marker.style.top = `${step.y * 100}%`;
+
+          wrap.append(marker);
+        }
+
+        if (step.type === "swipe") {
+          const start = document.createElement("span");
+          start.className = "recording-swipe-start";
+          start.style.left = `${step.start[0] * 100}%`;
+          start.style.top = `${step.start[1] * 100}%`;
+
+          const end = document.createElement("span");
+          end.className = "recording-swipe-end";
+          end.style.left = `${step.end[0] * 100}%`;
+          end.style.top = `${step.end[1] * 100}%`;
+
+          wrap.append(start, end);
+        }
+
+        row.append(wrap);
       }
 
       const actions = document.createElement("div");
@@ -418,7 +527,9 @@
     $("workflow-debug-data").textContent = JSON.stringify(
       draft,
       (key, value) =>
-        ["value", "default", "preview"].includes(key) ? "(hidden)" : value,
+        ["value", "default", "preview", "image"].includes(key)
+          ? "(hidden)"
+          : value,
       2,
     );
   }
@@ -544,10 +655,6 @@
 
     $("record-stop").disabled = stopping;
 
-    $("record-mark-next").textContent = recording.mark_next_screen
-      ? "✓ Next Screen Will Be Checked"
-      : "Mark Next Screen: OFF";
-    $("record-mark-next").disabled = stopping || annotationBusy();
     $("record-expect-current").disabled = stopping || annotationBusy();
     $("record-capture-keyboard").disabled = stopping || annotationBusy();
     $("review-capture-keyboard").disabled = annotationBusy();
@@ -574,12 +681,23 @@
       keyboardCaptureSlot.append($("keyboard-capture"));
 
     const captureKey = currentKeyboardKey();
-    if (recording.keyboard_capture) {
-      const done = Object.keys(recording.keyboard_capture.keys || {});
+    const overlay = $("keyboard-capture-overlay");
+    const overlayKey = $("keyboard-capture-overlay-key");
 
-      $("keyboard-capture-instruction").textContent = captureKey
-        ? `Currently capturing “${displayKeyboardKey(captureKey)}”. Click that key on the phone preview. Captured: ${done.map(displayKeyboardKey).join(", ") || "none"}.`
-        : "All selected keys are captured. Save the keyboard or cancel.";
+    if (recording.keyboard_capture && captureKey) {
+      const label = displayKeyboardKey(captureKey);
+
+      overlay.hidden = false;
+      overlayKey.textContent = label;
+
+      $("keyboard-capture-instruction").textContent =
+        `Tap ${label} on the phone preview.`;
+    } else {
+      overlay.hidden = true;
+
+      $("keyboard-capture-instruction").textContent = recording.keyboard_capture
+        ? "All selected keys are captured. Save the keyboard or cancel."
+        : "Choose keys, then start capture.";
     }
 
     $("keyboard-capture-start").hidden = !!recording.keyboard_capture;
@@ -1337,19 +1455,6 @@
 
   $("record-new").addEventListener("click", () => $("record-start").click());
 
-  $("record-mark-next").addEventListener("click", () =>
-    task(async () => {
-      await pendingManual;
-      await flushText();
-      recording = await api("/api/recorder/mark-next-screen", {});
-      show(
-        recording.mark_next_screen
-          ? "The next tap, swipe, Home or Back action will be checked."
-          : "Next-screen check cancelled.",
-      );
-    }),
-  );
-
   $("record-expect-current").addEventListener("click", () =>
     task(async () => {
       await pendingManual;
@@ -1535,39 +1640,55 @@
 
   $("record-start").addEventListener("click", () =>
     task(async () => {
+      let enabledManualForRecording = false;
+
       if (piManual() || backend !== "mock") {
-        let result;
-        try {
-          result = await api("/api/control", {
-            enabled: true,
-            frame_id: frameId,
-          });
-        } finally {
-          if (piManual()) await refreshStatus();
+        if (!active()) {
+          const enabled = await enableManualControl();
+
+          if (!enabled) {
+            throw new Error(
+              "Manual Control could not be enabled. Recording was not started.",
+            );
+          }
+
+          enabledManualForRecording = true;
         }
-        applyControlResult(result);
       }
 
       try {
         keyboardSetupOpen = false;
         variableInputOpen = false;
         returnToVariableInput = false;
+
         recording = await api("/api/recorder/start", {
           name: "New Recording",
           execute: true,
         });
       } catch (error) {
-        if (piManual() || backend !== "mock") await disable();
+        if (enabledManualForRecording) {
+          await disable();
+        }
+
         throw error;
       }
 
       timelineSignature = "";
       textBuffer = "";
       stopping = false;
-      show("Use the phone preview as usual. Stop when you’re ready to review.");
+
+      show(
+        "Recording started. Manual Control is enabled — use the phone preview normally.",
+      );
+
       const livePreview = !piManual() && backend === "mock" ? preview : canvas;
+
       livePreview.focus({ preventScroll: true });
-      livePreview.scrollIntoView?.({ block: "center", behavior: "smooth" });
+
+      livePreview.scrollIntoView?.({
+        block: "center",
+        behavior: "smooth",
+      });
     }),
   );
 
@@ -1654,73 +1775,73 @@
     }),
   );
 
-  function localTarget(event) {
-    return (
-      event.target?.isContentEditable ||
-      event.target?.closest?.(
-        "input, textarea, select, button, a, [role='button']",
-      )
-    );
-  }
-  document.addEventListener("keydown", (event) => {
-    if (
-      piManual() ||
-      !recording.active ||
-      stopping ||
-      annotationBusy() ||
-      event.defaultPrevented ||
-      localTarget(event) ||
-      document.hidden ||
-      !document.hasFocus()
-    )
-      return;
-    if (
-      event.ctrlKey ||
-      event.metaKey ||
-      event.altKey ||
-      event.isComposing ||
-      event.keyCode === 229 ||
-      event.getModifierState?.("AltGraph")
-    )
-      return;
-    if (backend !== "mock" && (!active() || !fresh())) return;
-    if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
-      event.preventDefault();
-      addText(event.key);
-    } else if (
-      !event.shiftKey &&
-      ["Enter", "Backspace", "Tab"].includes(event.key)
-    ) {
-      event.preventDefault();
-      if (event.key === "Backspace" && textBuffer)
-        textBuffer = textBuffer.slice(0, -1);
-      else {
-        flushText();
-        enqueue({ type: "key", key: event.key.toUpperCase() });
-      }
-    }
-  });
-  document.addEventListener("paste", (event) => {
-    if (
-      piManual() ||
-      !recording.active ||
-      stopping ||
-      annotationBusy() ||
-      localTarget(event) ||
-      document.hidden ||
-      !document.hasFocus()
-    )
-      return;
-    if (backend !== "mock" && (!active() || !fresh())) return;
-    const value = event.clipboardData?.getData("text/plain") || "";
-    event.preventDefault();
-    if (!/^[ -~]*$/.test(value))
-      return show(
-        "This phone input currently supports printable English characters only.",
-        true,
-      );
-    addText(value);
-  });
+  // function localTarget(event) {
+  //   return (
+  //     event.target?.isContentEditable ||
+  //     event.target?.closest?.(
+  //       "input, textarea, select, button, a, [role='button']",
+  //     )
+  //   );
+  // }
+  // document.addEventListener("keydown", (event) => {
+  //   if (
+  //     piManual() ||
+  //     !recording.active ||
+  //     stopping ||
+  //     annotationBusy() ||
+  //     event.defaultPrevented ||
+  //     localTarget(event) ||
+  //     document.hidden ||
+  //     !document.hasFocus()
+  //   )
+  //     return;
+  //   if (
+  //     event.ctrlKey ||
+  //     event.metaKey ||
+  //     event.altKey ||
+  //     event.isComposing ||
+  //     event.keyCode === 229 ||
+  //     event.getModifierState?.("AltGraph")
+  //   )
+  //     return;
+  //   if (backend !== "mock" && (!active() || !fresh())) return;
+  //   if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
+  //     event.preventDefault();
+  //     addText(event.key);
+  //   } else if (
+  //     !event.shiftKey &&
+  //     ["Enter", "Backspace", "Tab"].includes(event.key)
+  //   ) {
+  //     event.preventDefault();
+  //     if (event.key === "Backspace" && textBuffer)
+  //       textBuffer = textBuffer.slice(0, -1);
+  //     else {
+  //       flushText();
+  //       enqueue({ type: "key", key: event.key.toUpperCase() });
+  //     }
+  //   }
+  // });
+  // document.addEventListener("paste", (event) => {
+  //   if (
+  //     piManual() ||
+  //     !recording.active ||
+  //     stopping ||
+  //     annotationBusy() ||
+  //     localTarget(event) ||
+  //     document.hidden ||
+  //     !document.hasFocus()
+  //   )
+  //     return;
+  //   if (backend !== "mock" && (!active() || !fresh())) return;
+  //   const value = event.clipboardData?.getData("text/plain") || "";
+  //   event.preventDefault();
+  //   if (!/^[ -~]*$/.test(value))
+  //     return show(
+  //       "This phone input currently supports printable English characters only.",
+  //       true,
+  //     );
+  //   addText(value);
+  // });
 
   function installGestures(element, camera) {
     element.addEventListener("pointerdown", (event) => {

@@ -44,6 +44,8 @@ def register_workflows(
     device_id=None,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
+    admin_required,
+    require_admin,
 ):
     storage = storage or WorkflowStorage()
     recorder = Recorder()
@@ -124,6 +126,7 @@ def register_workflows(
         return jsonify(ocr_settings.settings())
 
     @app.put("/api/ocr/settings")
+    @admin_required
     def update_ocr_settings():
         return jsonify(ocr_settings.update(payload()))
 
@@ -132,6 +135,7 @@ def register_workflows(
         return jsonify(ocr_settings.status())
 
     @app.post("/api/ocr/restart")
+    @admin_required
     def restart_ocr_workers():
         if payload():
             raise ValueError("Restart OCR Workers expects an empty JSON object.")
@@ -146,6 +150,7 @@ def register_workflows(
     roi_preview_lock = threading.Lock()
 
     @app.post("/api/ocr/roi-preview")
+    @admin_required
     def roi_preview():
         if not hasattr(screen_state_provider, "_crop_roi"):
             raise ValueError("ROI testing requires the PaddleOCR camera provider.")
@@ -172,6 +177,7 @@ def register_workflows(
         )
 
     @app.post("/api/ocr/roi-test")
+    @admin_required
     def roi_test():
         data = payload()
         roi = normalized_roi(data.get("roi"))
@@ -260,6 +266,42 @@ def register_workflows(
 
         return value
 
+    def recording_screenshot():
+        capture = getattr(
+            screen_state_provider,
+            "capture_snapshot",
+            None,
+        )
+
+        if not callable(capture):
+            return None
+
+        try:
+            image = capture()
+
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                image,
+                [cv2.IMWRITE_JPEG_QUALITY, 75],
+            )
+
+            if not ok:
+                return None
+
+            return {
+                "image": base64.b64encode(encoded).decode("ascii"),
+                "width": int(image.shape[1]),
+                "height": int(image.shape[0]),
+                "format": "jpeg",
+            }
+
+        except Exception as exc:
+            LOG.info(
+                "Recording screenshot skipped: %s",
+                exc,
+            )
+            return None
+
     def record_manual(step, perform):
         # The caller already holds the manual ownership/frame/action gates.
         with lock:
@@ -268,6 +310,20 @@ def register_workflows(
                 return None
 
             owner = recorder_id()
+
+            step = dict(step)
+
+            # Capture the screen BEFORE the physical action happens.
+            if step.get("type") in {
+                "tap",
+                "swipe",
+                "key",
+                "input",
+            }:
+                screenshot = recording_screenshot()
+
+                if screenshot:
+                    step["recording_screenshot"] = screenshot
 
             candidate = recorder.prepare_manual(
                 owner,
@@ -322,6 +378,7 @@ def register_workflows(
         )
 
     @app.post("/api/workflows")
+    @admin_required
     def create_workflow():
         return (
             jsonify(
@@ -344,6 +401,10 @@ def register_workflows(
     def workflow(workflow_id):
         if request.method == "GET":
             return jsonify(storage.read(workflow_id))
+
+        denied = require_admin()
+        if denied is not None:
+            return denied
 
         if request.method == "DELETE":
             storage.delete(workflow_id)
@@ -458,6 +519,7 @@ def register_workflows(
     # =====================================================================
 
     @app.post("/api/recorder/start")
+    @admin_required
     def start_recording():
         data = payload()
         client = client_id()
@@ -492,6 +554,7 @@ def register_workflows(
             )
 
     @app.post("/api/recorder/edit")
+    @admin_required
     def edit_saved_workflow():
         data = payload()
 
@@ -550,6 +613,7 @@ def register_workflows(
                 yield device
 
     @app.post("/api/recorder/text-suggestions")
+    @admin_required
     def recording_text_suggestions():
         data = payload()
 
@@ -601,17 +665,8 @@ def register_workflows(
                 raise ValueError("Expected-text selection was cancelled.")
         return jsonify(suggestions=suggestions)
 
-    @app.post("/api/recorder/mark-next-screen")
-    def mark_next_screen():
-        data = payload()
-
-        if data:
-            raise ValueError("Expected an empty JSON object.")
-
-        with lock:
-            return jsonify(recorder.toggle_mark_next_screen(recorder_id()))
-
     @app.post("/api/recorder/expected-text")
+    @admin_required
     def add_recording_expected_text():
         data = payload()
 
@@ -629,6 +684,7 @@ def register_workflows(
             )
 
     @app.post("/api/recorder/expected-text/cancel")
+    @admin_required
     def cancel_recording_expected_text():
         data = payload()
 
@@ -639,6 +695,7 @@ def register_workflows(
             return jsonify(recorder.cancel_expected_text(recorder_id()))
 
     @app.post("/api/recorder/keyboard-capture/start")
+    @admin_required
     def start_keyboard_capture():
         data = payload()
         if set(data) - {"name", "keys", "kind"} or not {
@@ -657,6 +714,7 @@ def register_workflows(
             )
 
     @app.post("/api/recorder/keyboard-capture/key")
+    @admin_required
     def capture_keyboard_key():
         data = payload()
         if set(data) - {"key", "point", "camera_point", "frame_id"}:
@@ -682,6 +740,7 @@ def register_workflows(
             )
 
     @app.post("/api/recorder/keyboard-capture/save")
+    @admin_required
     def save_keyboard_capture():
         if payload():
             raise ValueError("Expected an empty JSON object.")
@@ -689,6 +748,7 @@ def register_workflows(
             return jsonify(recorder.save_keyboard_capture(recorder_id()))
 
     @app.post("/api/recorder/keyboard-capture/cancel")
+    @admin_required
     def cancel_keyboard_capture():
         if payload():
             raise ValueError("Expected an empty JSON object.")
@@ -696,6 +756,7 @@ def register_workflows(
             return jsonify(recorder.cancel_keyboard_capture(recorder_id()))
 
     @app.post("/api/recorder/keyboard-delete")
+    @admin_required
     def delete_recording_keyboard():
         data = payload()
         if set(data) != {"keyboard_id"}:
@@ -704,6 +765,7 @@ def register_workflows(
             return jsonify(recorder.delete_keyboard(recorder_id(), data["keyboard_id"]))
 
     @app.post("/api/recorder/variable-input")
+    @admin_required
     def record_variable_input():
         data = payload()
         allowed = {
@@ -824,6 +886,7 @@ def register_workflows(
                 state.action_lock.release()
 
     @app.post("/api/recorder/review")
+    @admin_required
     def review_recording():
         data = payload()
 
@@ -837,6 +900,7 @@ def register_workflows(
             )
 
     @app.post("/api/recorder/step")
+    @admin_required
     def record_step():
         data = payload()
         client = client_id()
@@ -894,6 +958,17 @@ def register_workflows(
                     raise ValueError(
                         "Camera coordinates " "require a tap or " "swipe step."
                     )
+
+            if step.get("type") in {
+                "tap",
+                "swipe",
+                "key",
+                "input",
+            }:
+                screenshot = recording_screenshot()
+
+                if screenshot:
+                    step["recording_screenshot"] = screenshot
 
             capture = data.get(
                 "capture",
@@ -1073,6 +1148,7 @@ def register_workflows(
             return jsonify(result)
 
     @app.post("/api/recorder/<operation>")
+    @admin_required
     def recording_operation(operation):
         data = payload()
         client = client_id()

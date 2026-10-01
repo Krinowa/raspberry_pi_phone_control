@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import getpass
 import logging
 import os
 import secrets
@@ -25,6 +26,7 @@ from camera_manager import (
 )
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
+from automation.auth import UserStore, admin_required, register_auth, require_admin
 from automation.context import AutomationContext
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
@@ -355,6 +357,7 @@ def create_app(
     start_job_executor=False,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
+    auth_store=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -388,8 +391,19 @@ def create_app(
         )
     camera = camera_manager.activate(selected_camera_device)
     app = Flask(__name__)
+    secret_key = os.environ.get("PHONE_DASHBOARD_SECRET_KEY")
+    if not secret_key:
+        secret_key = secrets.token_bytes(32)
+        LOG.warning(
+            "PHONE_DASHBOARD_SECRET_KEY is not set; admin sessions will reset "
+            "when this process restarts."
+        )
     app.config.update(
-        MAX_CONTENT_LENGTH=1024 * 1024, TRUSTED_HOSTS=["localhost", "127.0.0.1"]
+        MAX_CONTENT_LENGTH=1024 * 1024,
+        TRUSTED_HOSTS=["localhost", "127.0.0.1"],
+        SECRET_KEY=secret_key,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
     )
     preview_debug = os.environ.get("CAMERA_PREVIEW_DEBUG", "").strip().casefold() in {
         "1",
@@ -426,6 +440,7 @@ def create_app(
     )
     app.extensions["control_state"] = state
     app.extensions["camera_manager"] = camera_manager
+    app.extensions["auth_user_store"] = auth_store or UserStore()
     app.config["CONTROL_TOKEN"] = token
 
     @app.before_request
@@ -527,6 +542,8 @@ def create_app(
             raise ValueError("Missing browser identifier. Reload the page.")
         return client
 
+    register_auth(app, payload, app.extensions["auth_user_store"])
+
     @app.get("/")
     def index():
         return render_template(
@@ -601,6 +618,7 @@ def create_app(
         return jsonify(result)
 
     @app.post("/api/cameras/test")
+    @admin_required
     def test_camera():
         data = payload()
         if set(data) != {"camera_source", "rotation"}:
@@ -623,6 +641,10 @@ def create_app(
             selected = device_id == selected_camera_device_id()
             status = camera_manager.status(device_id, open_camera=True)
             return jsonify({**status, "selected": selected})
+
+        denied = require_admin()
+        if denied is not None:
+            return denied
 
         data = payload()
         allowed = {"camera_source", "rotation", "enabled", "display_name"}
@@ -759,6 +781,7 @@ def create_app(
         return jsonify(require_pi_bridge().enrollment())
 
     @app.post("/api/enrollment/start")
+    @admin_required
     def start_pi_enrollment():
         data = payload()
         if set(data) != {"target_device_id"}:
@@ -771,6 +794,7 @@ def create_app(
         return jsonify(bridge.start_enrollment(data["target_device_id"]))
 
     @app.post("/api/enrollment/stop")
+    @admin_required
     def stop_pi_enrollment():
         data = payload()
         if data:
@@ -778,6 +802,7 @@ def create_app(
         return jsonify(require_pi_bridge().stop_enrollment())
 
     @app.post("/api/devices/<device_id>/replace")
+    @admin_required
     def replace_pi_device(device_id):
         data = payload()
         if data:
@@ -790,6 +815,7 @@ def create_app(
         return jsonify(bridge.replace_device(device_id))
 
     @app.delete("/api/devices/<device_id>")
+    @admin_required
     def delete_pi_device(device_id):
         data = payload()
         if data:
@@ -984,6 +1010,7 @@ def create_app(
             ), (202 if state.pending else 200)
 
     @app.post("/api/takeover")
+    @admin_required
     def takeover():
         data, client = payload(), client_id()
         if data:
@@ -1048,6 +1075,7 @@ def create_app(
             )
 
     @app.route("/api/calibration", methods=["POST", "DELETE"])
+    @admin_required
     def calibrate():
         data = payload()
         with state.lock:
@@ -1310,6 +1338,8 @@ def create_app(
         device_id=device_id,
         ocr_settings_storage=ocr_settings_storage,
         ocr_resource_provider=ocr_resource_provider,
+        admin_required=admin_required,
+        require_admin=require_admin,
     )
     register_jobs(
         app,
@@ -1318,12 +1348,20 @@ def create_app(
         account_store=account_store,
         job_store=job_store,
         start_executor=start_job_executor,
+        admin_required=admin_required,
+        require_admin=require_admin,
     )
     return app
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+
+    parser.add_argument(
+        "--create-admin",
+        action="store_true",
+        help="Create a local dashboard administrator and exit",
+    )
 
     parser.add_argument(
         "--camera",
@@ -1366,6 +1404,19 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.create_admin:
+        username = input("Admin username: ").strip()
+        password = getpass.getpass("Admin password: ")
+        confirmation = getpass.getpass("Confirm password: ")
+        if password != confirmation:
+            parser.error("Passwords do not match.")
+        try:
+            user = UserStore().create_admin(username, password)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(f"Created admin user {user['username']!r}.")
+        return
 
     if (
         args.camera < 0

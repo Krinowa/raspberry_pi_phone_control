@@ -329,6 +329,7 @@ def validate_workflow(workflow, *, allow_empty=False):
                 "type",
                 "label",
                 "preview",
+                "recording_screenshot",
                 "recorded_at",
                 "critical",
             }
@@ -350,6 +351,34 @@ def validate_workflow(workflow, *, allow_empty=False):
                 raise ValueError("Invalid PNG preview.") from None
             if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise ValueError("Invalid PNG preview.")
+        if "recording_screenshot" in step:
+            screenshot = step["recording_screenshot"]
+
+            fields(
+                screenshot,
+                {"image", "width", "height", "format"},
+                {"image", "width", "height", "format"},
+            )
+
+            if screenshot["format"] != "jpeg":
+                raise ValueError("Recording screenshot must be JPEG.")
+
+            number(screenshot["width"], 1, 10000)
+            number(screenshot["height"], 1, 10000)
+
+            encoded = text(
+                screenshot["image"],
+                "Recording screenshot",
+                1000000,
+            )
+
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                raise ValueError("Invalid recording screenshot.") from None
+
+            if not raw.startswith(b"\xff\xd8\xff"):
+                raise ValueError("Invalid recording screenshot.")
 
         sid = identifier(step["id"])
 

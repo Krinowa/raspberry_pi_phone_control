@@ -23,12 +23,10 @@ class Recorder:
         self.execute = False
         self.input_target = None
         self.editing_existing = False
-        self.mark_next_screen = False
         self.pending_expected_text = None
         self.keyboard_capture = None
 
     def _clear_annotation_state(self):
-        self.mark_next_screen = False
         self.pending_expected_text = None
         self.keyboard_capture = None
 
@@ -68,7 +66,6 @@ class Recorder:
         keyboard["name"] = keyboard["name"].strip()
         if keyboard["name"].casefold() in existing_names:
             raise ValueError("A captured keyboard already uses this name.")
-        self.mark_next_screen = False
         self.keyboard_capture = {**keyboard, "requested_keys": list(keys)}
         return self.snapshot()
 
@@ -289,32 +286,11 @@ class Recorder:
         return step
 
     def commit_recording(self, owner, candidate, input_target=None):
-        """Commit a successful action and expose an armed navigation target."""
+        """Commit a successful recorded action."""
         self.require_owner(owner)
         self.workflow = candidate
         self.input_target = input_target
 
-        if self.mark_next_screen and candidate["steps"]:
-            step = candidate["steps"][-1]
-
-            try:
-                self.require_expected_text_action(step["id"])
-            except ValueError:
-                pass
-            else:
-                self.mark_next_screen = False
-                self.pending_expected_text = step["id"]
-
-        return self.snapshot()
-
-    def toggle_mark_next_screen(self, owner):
-        self.require_owner(owner)
-
-        if not self.active:
-            raise ValueError("Recording is stopped.")
-
-        self._require_not_annotating()
-        self.mark_next_screen = not self.mark_next_screen
         return self.snapshot()
 
     def begin_current_screen_annotation(self, owner):
@@ -338,7 +314,6 @@ class Recorder:
                 "Expected text is unavailable after a secure or manual checkpoint."
             )
 
-        self.mark_next_screen = False
         self.pending_expected_text = "current"
         return self.workflow
 
@@ -696,7 +671,6 @@ class Recorder:
             "editing_existing": self.editing_existing,
             "active": self.active,
             "execute": self.execute,
-            "mark_next_screen": self.mark_next_screen,
             "expected_text_pending": self.pending_expected_text is not None,
             "pending_expected_text_step_id": (
                 self.pending_expected_text

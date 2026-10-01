@@ -36,9 +36,62 @@
           Operate
         </button>
         <button id="dashboard-admin" type="button" aria-selected="false">
-          Admin
+          Admin 🔒
         </button>
+        <span id="admin-session" class="admin-session" hidden>
+          Admin: <strong id="admin-session-username"></strong>
+          <button id="admin-logout" type="button">Lock Admin</button>
+        </span>
       </nav>
+      <div
+        id="admin-login-dialog"
+        class="modal-backdrop"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="admin-login-title"
+        hidden
+      >
+        <form id="admin-login-form" class="modal-panel auth-modal">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">RESTRICTED SETTINGS</p>
+              <h2 id="admin-login-title">Admin login</h2>
+            </div>
+          </div>
+          <label>
+            Username
+            <input
+              id="admin-login-username"
+              name="username"
+              autocomplete="username"
+              maxlength="80"
+              required
+            />
+          </label>
+          <label>
+            Password
+            <input
+              id="admin-login-password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <p
+            id="admin-login-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+          <div class="flow-buttons">
+            <button id="admin-login-submit" class="primary" type="submit">
+              Login
+            </button>
+            <button id="admin-login-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
       <section
         class="card operate-only operate-health"
         aria-labelledby="operate-health-title"
@@ -447,7 +500,18 @@
               aria-label="Live external camera. Click to tap or drag to swipe."
               aria-describedby="keyboard-help"
             ></canvas>
+
             <div id="video-placeholder">Waiting for camera access…</div>
+
+            <div
+              id="keyboard-capture-overlay"
+              class="keyboard-capture-overlay"
+              hidden
+            >
+              <span>Capture key</span>
+              <strong id="keyboard-capture-overlay-key">—</strong>
+              <small>Tap this key on the phone</small>
+            </div>
           </div>
           <div class="viewer-footer">
             <span id="instruction"
@@ -494,11 +558,7 @@
                   <button id="record-screenshot-here" type="button">
                     Mark Screenshot Here
                   </button>
-                </div>
-                <div class="record-action-group">
-                  <span>More</span>
                   <button id="record-capture-keyboard">Capture Keyboard</button>
-                  <button id="record-mark-next">Mark Next Screen: OFF</button>
                 </div>
                 <div class="record-action-group">
                   <span>Recording controls</span>
@@ -537,7 +597,7 @@
                     >
                   </div>
                   <div id="keyboard-alphabetic-options" hidden>
-                    <p>Lowercase a-z are included.</p>
+                    <p>Lowercase QWERTY keys are included.</p>
                     <label class="check"
                       ><input id="keyboard-include-space" type="checkbox" />
                       Include space</label
@@ -558,6 +618,14 @@
                       placeholder="A,B,C,1,2,3,-"
                     />
                   </label>
+                  <div
+                    id="keyboard-capture-target"
+                    class="keyboard-capture-target"
+                    hidden
+                  >
+                    <span>Capture this key</span>
+                    <strong id="keyboard-capture-target-key">—</strong>
+                  </div>
                   <p id="keyboard-capture-instruction" role="status">
                     Choose keys, then start capture.
                   </p>
@@ -594,7 +662,7 @@
                       <option value="screen_keyboard">
                         Captured on-screen keyboard
                       </option>
-                      <option value="hid">Bluetooth HID</option>
+                      <!-- <option value="hid">Bluetooth HID</option> -->
                     </select>
                   </label>
                   <label id="record-variable-keyboard-field">
@@ -670,9 +738,9 @@
             <div class="controls">
               <button data-action="back" disabled>← Back</button>
               <button data-action="home" disabled>⌂ Home</button>
-              <button class="admin-only" data-action="recents" disabled>
+              <!-- <button class="admin-only" data-action="recents" disabled>
                 ▣ Recent apps
-              </button>
+              </button> -->
               <button class="admin-only" data-action="swipe_up" disabled>
                 ↑ Swipe up
               </button>
@@ -688,9 +756,9 @@
               <button class="admin-only" data-action="screen_on" disabled>
                 ☀ Wake screen
               </button>
-              <button class="admin-only" data-action="screen_off" disabled>
+              <!-- <button class="admin-only" data-action="screen_off" disabled>
                 ⏻ Screen off
-              </button>
+              </button> -->
             </div>
             <div class="operate-only manual-assistance-finish">
               <button id="operate-verify-finish" class="primary" type="button">
@@ -1025,7 +1093,7 @@
                 <label>
                   Input method
                   <select id="input-method">
-                    <option value="hid">Bluetooth HID</option>
+                    <!-- <option value="hid">Bluetooth HID</option> -->
                     <option value="screen_keyboard">
                       Captured on-screen keyboard
                     </option>

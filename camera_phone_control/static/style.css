@@ -40,6 +40,28 @@ body[data-dashboard-mode="operate"][data-manual-assistance="open"]
   background: #285d45;
   box-shadow: 0 1px 3px #17342633;
 }
+.admin-session {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-left: 8px;
+  padding-left: 12px;
+  border-left: 1px solid #cad5cf;
+  color: #52645b;
+  font-size: 12px;
+}
+.admin-session[hidden] {
+  display: none;
+}
+.dashboard-tabs .admin-session button {
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid #bdcbc4;
+  background: #fff;
+}
+.auth-modal {
+  width: min(420px, 100%);
+}
 .operate-health {
   margin-bottom: 22px;
 }
@@ -1099,4 +1121,97 @@ summary {
 .region-ocr-picker output {
   display: block;
   margin: 0.45rem 0;
+}
+
+.keyboard-capture-overlay {
+  position: absolute;
+  right: 24px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+
+  min-width: 180px;
+  padding: 18px 24px;
+
+  text-align: center;
+
+  background: rgba(0, 0, 0, 0.78);
+  color: white;
+
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 14px;
+
+  pointer-events: none;
+}
+
+.keyboard-capture-overlay span {
+  display: block;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  opacity: 0.7;
+}
+
+.keyboard-capture-overlay strong {
+  display: block;
+  font-size: 4rem;
+  line-height: 1;
+  margin: 10px 0;
+}
+
+.keyboard-capture-overlay small {
+  display: block;
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.recording-step-preview {
+  position: relative;
+  width: 220px;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 10px;
+  border: 1px solid #d0d0d0;
+}
+
+.recording-step-preview img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.recording-tap-marker {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border: 3px solid red;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.recording-tap-marker::after {
+  content: "";
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  background: red;
+  border-radius: 50%;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.recording-swipe-start,
+.recording-swipe-end {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 3px solid red;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.recording-swipe-end {
+  background: red;
 }

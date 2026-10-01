@@ -19,6 +19,8 @@ def register_jobs(
     account_store=None,
     job_store=None,
     start_executor=False,
+    admin_required,
+    require_admin,
 ):
     account_store = account_store or AccountBindingStore()
     job_store = job_store or JobStore()
@@ -73,6 +75,7 @@ def register_jobs(
         return jsonify(accounts=[item.public() for item in account_store.list()])
 
     @app.post("/api/accounts")
+    @admin_required
     def create_account():
         data = payload()
         ensure_registered_device(data.get("device_id"))
@@ -82,6 +85,9 @@ def register_jobs(
     def account(account_id):
         if request.method == "GET":
             return jsonify(account_store.get(account_id).public())
+        denied = require_admin()
+        if denied is not None:
+            return denied
         if request.method == "DELETE":
             data = payload()
             if data:
