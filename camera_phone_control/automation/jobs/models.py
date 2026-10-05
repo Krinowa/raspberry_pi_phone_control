@@ -191,6 +191,10 @@ class Job:
     recovery_run_id: str | None = None
     recovery_error: str | None = None
     recovered_at: str | None = None
+    failed_step_index: int | None = None
+    failed_step_id: str | None = None
+    retry_of_job_id: str | None = None
+    start_step_index: int = 0
     screenshots: list = field(default_factory=list)
 
     @classmethod
@@ -206,6 +210,8 @@ class Job:
         bank=None,
         action=None,
         recovery_workflow_id=None,
+        retry_of_job_id=None,
+        start_step_index=0,
     ):
         account_id = identifier(account_id)
         validate_device_id(device_id)
@@ -229,6 +235,10 @@ class Job:
         action = _plain_text(action, "action", 80, required=False)
         if recovery_workflow_id is not None:
             recovery_workflow_id = identifier(recovery_workflow_id)
+        if retry_of_job_id is not None:
+            retry_of_job_id = identifier(retry_of_job_id)
+        if type(start_step_index) is not int or start_step_index < 0:
+            raise ValueError("start_step_index must be a non-negative integer.")
 
         return cls(
             job_id="job_" + uuid.uuid4().hex,
@@ -242,6 +252,8 @@ class Job:
             bank=bank,
             action=action,
             recovery_workflow_id=recovery_workflow_id,
+            retry_of_job_id=retry_of_job_id,
+            start_step_index=start_step_index,
         )
 
     @classmethod
@@ -259,13 +271,21 @@ class Job:
             "recovery_run_id",
             "recovery_error",
             "recovered_at",
+            "failed_step_index",
+            "failed_step_id",
+            "retry_of_job_id",
+            "start_step_index",
             "screenshots",
         }
         required_fields = fields - optional_fields
         if set(data) - fields or not required_fields.issubset(data):
             raise ValueError("Stored job record is invalid.")
         data = {
-            **{field: None for field in optional_fields - {"screenshots"}},
+            **{
+                field: None
+                for field in optional_fields - {"screenshots", "start_step_index"}
+            },
+            "start_step_index": 0,
             "screenshots": [],
             **data,
         }
@@ -313,6 +333,19 @@ class Job:
             identifier(recovery_run_id)
         _plain_text(data.get("recovery_error"), "recovery_error", 500, required=False)
         _plain_text(data.get("recovered_at"), "recovered_at", 80, required=False)
+        failed_step_index = data.get("failed_step_index")
+        if failed_step_index is not None and (
+            type(failed_step_index) is not int or failed_step_index < 0
+        ):
+            raise ValueError("Stored failed step index is invalid.")
+        for field in ("failed_step_id", "retry_of_job_id"):
+            if data.get(field) is not None:
+                identifier(data[field])
+        if (
+            type(data.get("start_step_index")) is not int
+            or data["start_step_index"] < 0
+        ):
+            raise ValueError("Stored start step index is invalid.")
         data["screenshots"] = _screenshot_metadata(data.get("screenshots"))
         return cls(**deepcopy(data))
 
@@ -343,5 +376,9 @@ class Job:
             "recovery_run_id": self.recovery_run_id,
             "recovery_error": self.recovery_error,
             "recovered_at": self.recovered_at,
+            "failed_step_index": self.failed_step_index,
+            "failed_step_id": self.failed_step_id,
+            "retry_of_job_id": self.retry_of_job_id,
+            "start_step_index": self.start_step_index,
             "screenshots": deepcopy(self.screenshots),
         }

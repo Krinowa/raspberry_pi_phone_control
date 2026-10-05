@@ -23,6 +23,7 @@ NUMERIC_KEY_LABELS = set("0123456789.") | {"BACKSPACE"}
 ALPHABETIC_KEY_LABELS = set("abcdefghijklmnopqrstuvwxyz ") | {"backspace"}
 MAX_CUSTOM_KEYS = 100
 MAX_CUSTOM_KEY_LABEL = 32
+MAX_CONDITION_DEPTH = 5
 KEYS = {
     "ENTER",
     "BACKSPACE",
@@ -81,7 +82,7 @@ def point(value):
 
 
 def validate_variable_value(definition, value):
-    if value is None or value == "":
+    if value is None:
         if definition.get("required", False):
             raise ValueError("A required workflow variable is missing.")
         return ""
@@ -99,9 +100,15 @@ def normalize_workflow(workflow):
     normalized.pop("visual_references", None)
     steps = normalized.get("steps")
     if isinstance(steps, list):
-        for step in steps:
+        pending = list(steps)
+        while pending:
+            step = pending.pop()
             if isinstance(step, dict):
                 step.pop("expect_after", None)
+                for branch in ("then_steps", "else_steps"):
+                    nested = step.get(branch)
+                    if isinstance(nested, list):
+                        pending.extend(nested)
     return normalized
 
 
@@ -293,7 +300,13 @@ def validate_workflow(workflow, *, allow_empty=False):
 
     ids = set()
 
-    for step in steps:
+    pending_steps = [(step, 0) for step in reversed(steps)]
+    validated_step_count = 0
+    while pending_steps:
+        step, depth = pending_steps.pop()
+        validated_step_count += 1
+        if validated_step_count > 1000:
+            raise ValueError("A workflow must have at most 1000 steps.")
         if (
             not isinstance(step, dict)
             or not isinstance(step.get("type"), str)
@@ -318,6 +331,13 @@ def validate_workflow(workflow, *, allow_empty=False):
             "wait": {"seconds"},
             "wait_until_stable": {"stable_ms", "timeout_seconds"},
             "wait_for_text": {"text", "timeout_seconds", "roi"},
+            "if_text": {
+                "text",
+                "timeout_seconds",
+                "roi",
+                "then_steps",
+                "else_steps",
+            },
             "capture_screen": set(),
             "manual_checkpoint": {"message"},
         }[kind]
@@ -412,17 +432,22 @@ def validate_workflow(workflow, *, allow_empty=False):
                 raise ValueError(
                     "timeout_seconds must allow the requested stability window."
                 )
-        elif kind == "wait_for_text":
+        elif kind in {"wait_for_text", "if_text"}:
             expected = text(step.get("text"), "Text to detect", 500).strip()
             if not expected:
                 raise ValueError("Text to detect must not be empty.")
             step["text"] = expected
 
             try:
-                number(step.get("timeout_seconds"), 0.5, 300)
+                number(
+                    step.get("timeout_seconds"),
+                    0.1 if kind == "if_text" else 0.5,
+                    300,
+                )
             except ValueError:
                 raise ValueError(
-                    "timeout_seconds must be numeric between 0.5 and 300."
+                    "timeout_seconds must be numeric between "
+                    f"{'0.1' if kind == 'if_text' else '0.5'} and 300."
                 ) from None
 
             if "roi" in step:
@@ -432,6 +457,19 @@ def validate_workflow(workflow, *, allow_empty=False):
                     if isinstance(step["roi"], dict)
                     else values
                 )
+            if kind == "if_text":
+                if depth >= MAX_CONDITION_DEPTH:
+                    raise ValueError(
+                        f"if_text nesting cannot exceed {MAX_CONDITION_DEPTH} levels."
+                    )
+                for branch in ("then_steps", "else_steps"):
+                    nested = step.get(branch)
+                    if not isinstance(nested, list):
+                        raise ValueError(f"{branch} must be a list of workflow steps.")
+                    pending_steps.extend(
+                        (child, depth + 1) for child in reversed(nested)
+                    )
+
         elif kind == "key":
             if not isinstance(step.get("key"), str) or step["key"].upper() not in KEYS:
                 raise ValueError("Unsupported workflow key.")
@@ -514,10 +552,9 @@ def resolve_variables(workflow, supplied=None):
     resolved = {}
     for definition in workflow["variables"]:
         name = definition["name"]
+        value = supplied[name] if name in supplied else definition.get("default")
         try:
-            resolved[name] = validate_variable_value(
-                definition, supplied.get(name, definition.get("default"))
-            )
+            resolved[name] = validate_variable_value(definition, value)
         except ValueError as exc:
             raise ValueError(f"Variable {name!r}: {exc}") from None
     return resolved
@@ -530,11 +567,19 @@ def validate_recovery_workflow(workflow):
         raise ValueError(
             "Recovery workflow must end with wait_for_text to verify the ready state."
         )
+    pending = list(workflow["steps"])
+    nested_steps = []
+    while pending:
+        step = pending.pop()
+        nested_steps.append(step)
+        if step["type"] == "if_text":
+            pending.extend(step["then_steps"])
+            pending.extend(step["else_steps"])
     if any(
         step.get("critical") is True
         or step["type"] == "manual_checkpoint"
         or (step["type"] == "input" and step.get("source") == "manual")
-        for step in workflow["steps"]
+        for step in nested_steps
     ):
         raise ValueError(
             "Recovery workflow cannot contain critical or manual checkpoint steps."

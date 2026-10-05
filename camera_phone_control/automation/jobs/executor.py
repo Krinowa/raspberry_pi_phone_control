@@ -137,7 +137,16 @@ class BackgroundJobExecutor:
                 if not isinstance(message, str) or not message:
                     message = "Workflow failed; physical actions were not retried."
                 self.scheduler.fail_job(
-                    job.job_id, message[:500], screenshots=screenshots
+                    job.job_id,
+                    message[:500],
+                    screenshots=screenshots,
+                    failed_step_index=(
+                        snapshot["step_index"] - 1
+                        if type(snapshot.get("step_index")) is int
+                        and snapshot["step_index"] > 0
+                        else None
+                    ),
+                    failed_step_id=snapshot.get("step_id"),
                 )
         except (RecordConflict, RecordNotFound):
             LOG.exception(

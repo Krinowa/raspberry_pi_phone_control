@@ -117,6 +117,23 @@ class WorkflowTiming:
             if self._current is not None:
                 self._finish_step_locked(status)
 
+    def annotate_current(self, **values):
+        with self.lock:
+            if self._current is not None:
+                self._current.update(values)
+
+    def record_nested_step(self, path, name, status, seconds):
+        with self.lock:
+            if self._current is not None:
+                self._current.setdefault("nested_steps", []).append(
+                    {
+                        "path": path,
+                        "name": name,
+                        "status": status,
+                        "total_seconds": max(0.0, float(seconds)),
+                    }
+                )
+
     def _finish_step_locked(self, status):
         self._current["total_seconds"] = self.clock() - self._current.pop("_started")
         self._current["status"] = status

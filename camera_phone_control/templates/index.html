@@ -437,7 +437,7 @@
               id="camera-settings-source"
               list="camera-source-options"
               maxlength="2048"
-              placeholder="0 or camera URL"
+              placeholder="Select a camera, index, or camera URL"
               required
             />
             <datalist id="camera-source-options"></datalist>
@@ -485,8 +485,61 @@
           </div>
         </form>
       </div>
-      <div class="workspace control-workspace">
-        <section class="viewer manual-control-surface">
+      <div
+        id="workflow-settings-dialog"
+        class="modal-backdrop admin-only"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="workflow-settings-title"
+        hidden
+      >
+        <form id="workflow-settings-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">DEVICE AUTOMATION</p>
+              <h2 id="workflow-settings-title">Assigned Workflow</h2>
+            </div>
+            <button
+              id="workflow-settings-close"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <p id="workflow-settings-help" class="small"></p>
+          <label>
+            Search workflows
+            <input
+              id="workflow-settings-search"
+              type="search"
+              placeholder="Search by workflow name or ID"
+              autocomplete="off"
+            />
+          </label>
+          <div
+            id="workflow-settings-list"
+            class="workflow-assignment-list"
+          ></div>
+          <p
+            id="workflow-settings-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+          <div class="flow-buttons">
+            <button id="workflow-settings-save" class="primary" type="submit">
+              Save Workflow
+            </button>
+            <button id="workflow-settings-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
+      <div id="control-workspace" class="workspace control-workspace">
+        <section
+          id="workflow-phone-pane"
+          class="viewer manual-control-surface workflow-phone-pane"
+        >
           <div class="section-heading">
             <h2>Camera view</h2>
             <span id="frame-state">Waiting for live video</span>
@@ -502,6 +555,22 @@
             ></canvas>
 
             <div id="video-placeholder">Waiting for camera access…</div>
+
+            <div id="workflow-mock-preview-slot" class="admin-only" hidden>
+              <div id="mock-recording-preview" hidden>
+                <p>
+                  Interact with this phone preview to try recording without
+                  hardware.
+                </p>
+              </div>
+              <canvas
+                id="workflow-preview"
+                width="270"
+                height="480"
+                aria-label="Phone preview. Click, drag and type to record in mock mode."
+                tabindex="0"
+              ></canvas>
+            </div>
 
             <div
               id="keyboard-capture-overlay"
@@ -539,7 +608,7 @@
               </p>
               <p class="small">
                 Secure input belongs on the phone. Avoid typing sensitive values
-                while recording. You can add a manual checkpoint during review.
+                while recording.
               </p>
               <button id="record-start" class="primary">Start Recording</button>
             </div>
@@ -559,6 +628,25 @@
                     Mark Screenshot Here
                   </button>
                   <button id="record-capture-keyboard">Capture Keyboard</button>
+                  <button id="record-alternate-screen" type="button">
+                    Add Special Case
+                  </button>
+                </div>
+                <div
+                  id="alternate-screen-active"
+                  class="alternate-screen-panel is-active"
+                  hidden
+                >
+                  <strong>Recording Special Case</strong>
+                  <p id="alternate-screen-status"></p>
+                  <div class="flow-buttons">
+                    <button id="alternate-screen-finish" type="button">
+                      Finish Special Case
+                    </button>
+                    <button id="alternate-screen-cancel" type="button">
+                      Cancel
+                    </button>
+                  </div>
                 </div>
                 <div class="record-action-group">
                   <span>Recording controls</span>
@@ -670,23 +758,22 @@
                     <select id="record-variable-keyboard"></select>
                   </label>
                   <label>
-                    Sample value for recording
+                    Default value
                     <input
-                      id="record-variable-sample"
+                      id="record-variable-default"
                       autocomplete="off"
                       maxlength="4096"
                     />
                   </label>
                   <p class="small">
-                    The sample can be typed during recording, but it is never
-                    saved in the workflow.
+                    Used when no value is provided when the workflow starts.
                   </p>
                   <div class="flow-buttons">
                     <button id="record-variable-add" type="button">
-                      Add Step Only
+                      Add Step
                     </button>
                     <button id="record-variable-type" type="button">
-                      Add &amp; Type Sample
+                      Add &amp; Type Now
                     </button>
                     <button id="record-variable-cancel" type="button">
                       Cancel
@@ -696,6 +783,52 @@
                 <div id="live-timeline-slot"></div>
               </div>
             </div>
+            <div
+              id="alternate-screen-setup"
+              class="alternate-screen-panel"
+              hidden
+            >
+              <h3>Special Case</h3>
+              <p class="small">
+                Sometimes something extra appears here. Record what to do when
+                it does.
+              </p>
+              <label>
+                When this appears
+                <input
+                  id="condition-text-value"
+                  maxlength="500"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="duration-field">
+                Check for up to
+                <span>
+                  <input
+                    id="condition-text-timeout"
+                    type="number"
+                    min="0.1"
+                    max="300"
+                    step="any"
+                    value="2"
+                  />
+                  seconds
+                </span>
+              </label>
+              <details id="condition-text-advanced" class="advanced-options">
+                <summary>Advanced options</summary>
+                <div id="condition-roi-picker"></div>
+              </details>
+              <p class="small">If not found: Continue normally</p>
+              <div class="flow-buttons">
+                <button id="alternate-screen-start" type="button">
+                  Record What To Do
+                </button>
+                <button id="alternate-screen-setup-cancel" type="button">
+                  Cancel
+                </button>
+              </div>
+            </div>
             <div id="captured-keyboards" hidden>
               <h3>Captured Keyboards</h3>
               <p class="small">
@@ -703,6 +836,7 @@
               </p>
               <ul id="captured-keyboard-list"></ul>
             </div>
+            <div id="workflow-authoring-slot"></div>
           </section>
           <section id="manual-control-card" class="card manual-control-surface">
             <div class="section-heading">
@@ -813,22 +947,9 @@
         <div class="section-heading">
           <h2>Automations</h2>
         </div>
-        <div id="mock-recording-preview" class="admin-only" hidden>
-          <p>
-            Interact with this phone preview to try recording without hardware.
-          </p>
-        </div>
-        <canvas
-          id="workflow-preview"
-          class="admin-only"
-          width="270"
-          height="480"
-          aria-label="Phone preview. Click, drag and type to record in mock mode."
-          tabindex="0"
-        ></canvas>
         <div id="review-flow" class="admin-only" hidden>
           <h3>Review Recording</h3>
-          <label>Workflow name <input id="flow-name" maxlength="160" /></label>
+          <label>Bank name <input id="flow-name" maxlength="160" /></label>
           <button id="flow-rename">Rename</button>
           <div class="flow-buttons">
             <button id="review-capture-keyboard" type="button">
@@ -1020,18 +1141,24 @@
                   autocomplete="off"
                 />
               </label>
-              <label
-                >Maximum wait (sec)
-                <input
-                  id="step-text-timeout"
-                  type="number"
-                  min="0.5"
-                  max="300"
-                  step="any"
-                  value="10"
-                />
+              <label class="duration-field">
+                Wait up to
+                <span>
+                  <input
+                    id="step-text-timeout"
+                    type="number"
+                    min="0.5"
+                    max="300"
+                    step="any"
+                    value="10"
+                  />
+                  seconds
+                </span>
               </label>
-              <div id="step-roi-picker"></div>
+              <details id="step-text-advanced" class="advanced-options">
+                <summary>Advanced options</summary>
+                <div id="step-roi-picker"></div>
+              </details>
             </div>
 
             <div id="step-input-options" hidden>
@@ -1059,30 +1186,18 @@
 
                   <input id="variable-name" placeholder="customer_name" />
                 </label>
-
                 <label>
-                  Label
+                  Default value
 
-                  <input id="variable-label" placeholder="Customer Name" />
+                  <input
+                    id="variable-default"
+                    autocomplete="off"
+                    maxlength="4096"
+                  />
                 </label>
-
-                <label class="check">
-                  <input id="variable-required" type="checkbox" checked />
-
-                  Required
-                </label>
-
-                <label>
-                  Default value (optional)
-
-                  <input id="variable-default" autocomplete="off" />
-                </label>
-
-                <label class="check">
-                  <input id="variable-ask" type="checkbox" checked />
-
-                  Ask When Running
-                </label>
+                <p class="small">
+                  Used when no value is provided when the workflow starts.
+                </p>
               </div>
 
               <p id="manual-input-help" hidden>
@@ -1128,24 +1243,30 @@
                 placeholder="Transfer"
               />
             </label>
-            <label
-              >Maximum wait (sec)
-              <input
-                id="record-text-timeout"
-                type="number"
-                min="0.5"
-                max="300"
-                step="any"
-                value="10"
-              />
+            <label class="duration-field">
+              Wait up to
+              <span>
+                <input
+                  id="record-text-timeout"
+                  type="number"
+                  min="0.5"
+                  max="300"
+                  step="any"
+                  value="10"
+                />
+                seconds
+              </span>
             </label>
-            <div id="record-roi-picker"></div>
+            <details id="record-text-advanced" class="advanced-options">
+              <summary>Advanced options</summary>
+              <div id="record-roi-picker"></div>
+            </details>
             <button id="record-text">Insert Wait for Text</button>
             <h4>Screenshot</h4>
             <button id="record-screenshot" type="button">
               Insert Screenshot
             </button>
-            <h4>Fixed Wait</h4>
+            <h4>Wait</h4>
             <div class="flow-buttons">
               <input
                 id="record-wait-seconds"
@@ -1155,32 +1276,9 @@
                 step="0.1"
                 value="1"
                 aria-label="Wait seconds"
-              /><button id="record-wait">Insert Fixed Wait</button>
+              /><button id="record-wait">Insert Wait</button>
             </div>
-            <label
-              >Checkpoint message
-              <input
-                id="checkpoint-message"
-                value="Complete this step manually, then Resume."
-                maxlength="500"
-            /></label>
-            <button id="record-checkpoint">Insert Manual Checkpoint</button>
           </details>
-          <label class="check"
-            ><input id="flow-financial" type="checkbox" /> Financial preparation
-            flow — end with manual authorization</label
-          >
-          <label>
-            Recovery workflow
-            <select id="flow-recovery-workflow">
-              <option value="">None</option>
-            </select>
-          </label>
-          <p class="small">
-            Optional. Recovery runs separately after a failed or interrupted
-            job. The selected workflow must end with Wait for Text so the ready
-            screen is verified.
-          </p>
         </div>
         <form id="expected-text-editor" class="admin-only" hidden>
           <h3 id="expected-text-title">Choose expected text</h3>
@@ -1193,19 +1291,25 @@
             >Expected text
             <input id="expected-text-value" maxlength="500" required
           /></label>
-          <label
-            >Maximum wait (sec)
-            <input
-              id="expected-text-timeout"
-              type="number"
-              min="0.5"
-              max="300"
-              step="0.5"
-              value="10"
-              required
-            />
+          <label class="duration-field">
+            Wait up to
+            <span>
+              <input
+                id="expected-text-timeout"
+                type="number"
+                min="0.5"
+                max="300"
+                step="0.5"
+                value="10"
+                required
+              />
+              seconds
+            </span>
           </label>
-          <div id="expected-roi-picker"></div>
+          <details id="expected-text-advanced" class="advanced-options">
+            <summary>Advanced options</summary>
+            <div id="expected-roi-picker"></div>
+          </details>
           <button type="submit">Add Check</button>
           <button id="expected-text-cancel" type="button">Cancel</button>
         </form>

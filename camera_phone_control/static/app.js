@@ -56,8 +56,11 @@ let addPhoneInitialDeviceIds = new Set();
 let accountBindings = [];
 let jobCatalog = [];
 const jobCancelsInFlight = new Set();
+const jobRetriesInFlight = new Set();
 let accountSettingsDeviceId = null;
 let accountSettingsAccountId = null;
+let workflowSettingsDeviceId = null;
+let workflowSettingsData = null;
 let ocrSettingsDirty = false;
 let ocrStatusTimer = null;
 let ocrStatusInFlight = false;
@@ -97,6 +100,7 @@ function setDashboardMode(mode) {
     dashboardMode === "operate"
       ? "Start Manual Control"
       : "Enable Manual Control";
+  window.phoneRecorder?.dashboardModeChanged?.(dashboardMode);
   return dashboardMode;
 }
 
@@ -306,6 +310,19 @@ const deviceService = {
     ),
   updateCamera: (deviceId, settings) =>
     api(`/api/devices/${encodeURIComponent(deviceId)}/camera`, settings, "PUT"),
+  workflows: (deviceId) =>
+    api(
+      `/api/devices/${encodeURIComponent(deviceId)}/workflows`,
+      undefined,
+      "GET",
+      { monitor: false },
+    ),
+  updateWorkflows: (deviceId, workflowIds) =>
+    api(
+      `/api/devices/${encodeURIComponent(deviceId)}/workflows`,
+      { workflow_ids: workflowIds },
+      "PUT",
+    ),
   discoverCameras: (refresh = false) =>
     api(
       refresh ? "/api/cameras?refresh=true" : "/api/cameras",
@@ -337,7 +354,32 @@ const jobService = {
   recover: (jobId) => api(`/api/jobs/${encodeURIComponent(jobId)}/recover`, {}),
   verifyReady: (jobId) =>
     api(`/api/jobs/${encodeURIComponent(jobId)}/verify-ready`, {}),
+  markReady: (jobId) =>
+    api(`/api/jobs/${encodeURIComponent(jobId)}/mark-ready`, {}),
+  retry: (jobId, mode) =>
+    api(`/api/jobs/${encodeURIComponent(jobId)}/retry`, { mode }),
 };
+
+async function retryExternalJob(job, mode) {
+  if (jobRetriesInFlight.has(job.job_id)) return;
+  jobRetriesInFlight.add(job.job_id);
+  renderJobs();
+  try {
+    const retry = await jobService.retry(job.job_id, mode);
+    jobCatalog = [...jobCatalog, retry];
+    notice(
+      mode === "failed_step"
+        ? "Retry queued from the failed step."
+        : "Workflow restart queued from step 0.",
+    );
+  } catch (error) {
+    notice(`Could not create retry: ${error.message}`, true);
+  } finally {
+    jobRetriesInFlight.delete(job.job_id);
+    renderJobs();
+    renderDevices();
+  }
+}
 
 const ocrService = {
   settings: () =>
@@ -615,8 +657,8 @@ function cameraState(details) {
 
   if (
     !config ||
-    config.camera_source === null ||
-    config.camera_source === undefined
+    ((config.camera_source === null || config.camera_source === undefined) &&
+      !config.camera_id)
   )
     return { label: "Unassigned", className: "" };
   if (!config.enabled) return { label: "Disabled", className: "" };
@@ -825,17 +867,18 @@ function renderDevices() {
 
     if (
       camera.enabled &&
-      camera.camera_source !== null &&
-      camera.camera_source !== undefined
+      ((camera.camera_source !== null && camera.camera_source !== undefined) ||
+        camera.camera_id)
     )
       startDevicePreview(device.id, previewImage, previewPlaceholder);
 
     const summary = document.createElement("p");
     summary.className = "camera-summary admin-only";
     summary.textContent =
-      camera.camera_source === null || camera.camera_source === undefined
+      (camera.camera_source === null || camera.camera_source === undefined) &&
+      !camera.camera_id
         ? "No camera assigned"
-        : `Camera ${camera.camera_source} · ${camera.rotation ?? 0}°`;
+        : `${camera.display_name || `Camera ${camera.camera_id || camera.camera_source}`} · ${camera.rotation ?? 0}°`;
 
     const binding = accountBindings.find(
       (account) => account.device_id === device.id,
@@ -853,6 +896,35 @@ function renderDevices() {
     const accountId = document.createElement("span");
     accountId.textContent = binding?.account_id || "—";
     accountSummary.append(accountHeading, accountName, accountId);
+
+    const workflowAssignment = device.workflow_assignment || {
+      unrestricted: true,
+      assigned_workflows: [],
+      missing_workflow_ids: [],
+    };
+    const workflowSummary = document.createElement("div");
+    workflowSummary.className = "account-summary admin-only";
+    const workflowHeading = document.createElement("strong");
+    workflowHeading.textContent = "Assigned Workflow";
+    const workflowNames = document.createElement("span");
+    const assignedWorkflow = workflowAssignment.assigned_workflows?.[0];
+
+    workflowNames.textContent = workflowAssignment.unrestricted
+      ? "Not configured"
+      : assignedWorkflow
+        ? assignedWorkflow.missing
+          ? `${assignedWorkflow.id} · Missing`
+          : assignedWorkflow.name || assignedWorkflow.id
+        : "No workflow assigned";
+
+    const workflowCount = document.createElement("span");
+
+    workflowCount.textContent = workflowAssignment.unrestricted
+      ? "Choose one workflow"
+      : assignedWorkflow
+        ? assignedWorkflow.id
+        : "Execution disabled";
+    workflowSummary.append(workflowHeading, workflowNames, workflowCount);
 
     let issueSummary = null;
     if (operationalState === "needs-attention") {
@@ -914,6 +986,13 @@ function renderDevices() {
       openAccountSettings(device, binding),
     );
 
+    const workflows = document.createElement("button");
+    workflows.className = "admin-only";
+    workflows.type = "button";
+    workflows.textContent = "Assigned Workflow";
+    workflows.disabled = deviceManagementBlocked();
+    workflows.addEventListener("click", () => openWorkflowSettings(device));
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "stop admin-only";
@@ -928,9 +1007,18 @@ function renderDevices() {
       select,
       settings,
       account,
+      workflows,
       remove,
     );
-    card.append(heading, states, mac, preview, summary, accountSummary);
+    card.append(
+      heading,
+      states,
+      mac,
+      preview,
+      summary,
+      accountSummary,
+      workflowSummary,
+    );
     if (issueSummary) card.append(issueSummary);
     card.append(actions);
     return card;
@@ -955,20 +1043,53 @@ function renderDevices() {
   renderJobs();
 }
 
+function getRootJobId(job, jobsById) {
+  let current = job;
+
+  while (current?.retry_of_job_id) {
+    const parent = jobsById.get(current.retry_of_job_id);
+    if (!parent) break;
+    current = parent;
+  }
+
+  return current?.job_id || job.job_id;
+}
+
+function groupJobAttempts(jobs) {
+  const jobsById = new Map(jobs.map((job) => [job.job_id, job]));
+  const groups = new Map();
+
+  for (const job of jobs) {
+    const rootId = getRootJobId(job, jobsById);
+
+    if (!groups.has(rootId)) {
+      groups.set(rootId, []);
+    }
+
+    groups.get(rootId).push(job);
+  }
+
+  return [...groups.values()];
+}
+
 function renderJobs() {
   const jobs = Array.isArray(jobCatalog) ? jobCatalog : [];
-  $("jobs-state").textContent = jobs.length
-    ? `${jobs.length} persistent job${jobs.length === 1 ? "" : "s"}.`
+  const groups = groupJobAttempts(jobs);
+
+  $("jobs-state").textContent = groups.length
+    ? `Showing latest ${Math.min(groups.length, 10)} of ${groups.length} jobs.`
     : "No external jobs have been submitted.";
 
-  const cards = [...jobs]
+  const cards = [...groups]
     .reverse()
-    .slice(0, 50)
-    .map((job) => {
+    .slice(0, 10)
+    .map((attempts) => {
+      const rootJob = attempts[0];
+      const job = attempts[attempts.length - 1];
       const item = document.createElement("article");
       item.className = "job-item";
       const id = document.createElement("strong");
-      id.textContent = job.job_id;
+      id.textContent = rootJob.job_id;
       const account = document.createElement("span");
       account.textContent = job.bank
         ? `Account: ${job.account_id} · ${job.bank}`
@@ -994,6 +1115,12 @@ function renderJobs() {
           : "Not started";
 
       item.append(id, account, device, workflow, status, created, activity);
+
+      if (attempts.length > 1) {
+        const attemptInfo = document.createElement("span");
+        attemptInfo.textContent = `Attempts: ${attempts.length}`;
+        item.append(attemptInfo);
+      }
 
       if (job.error) {
         const error = document.createElement("span");
@@ -1029,7 +1156,10 @@ function renderJobs() {
               : "Phone state: Needs Attention";
         item.append(recovery);
       }
-      if (["FAILED", "INTERRUPTED"].includes(job.status)) {
+      const hasRetryChild = jobCatalog.some(
+        (candidate) => candidate.retry_of_job_id === job.job_id,
+      );
+      if (["FAILED", "INTERRUPTED"].includes(job.status) && !hasRetryChild) {
         const actions = document.createElement("div");
         actions.className = "job-recovery-actions";
         const recoveryAttempted =
@@ -1056,6 +1186,26 @@ function renderJobs() {
             openManualAssistance(job.job_id),
           );
           actions.append(assist);
+        }
+        if (job.recovery_status === "READY") {
+          if (Number.isInteger(job.failed_step_index)) {
+            const retryStep = document.createElement("button");
+            retryStep.type = "button";
+            retryStep.textContent = "Retry Failed Step";
+            retryStep.disabled = jobRetriesInFlight.has(job.job_id);
+            retryStep.addEventListener("click", () =>
+              retryExternalJob(job, "failed_step"),
+            );
+            actions.append(retryStep);
+          }
+          const restart = document.createElement("button");
+          restart.type = "button";
+          restart.textContent = "Restart Workflow";
+          restart.disabled = jobRetriesInFlight.has(job.job_id);
+          restart.addEventListener("click", () =>
+            retryExternalJob(job, "restart"),
+          );
+          actions.append(restart);
         }
         if (actions.children.length) item.append(actions);
       }
@@ -1088,6 +1238,22 @@ function renderJobs() {
             jobCatalog = jobCatalog.map((candidate) =>
               candidate.job_id === updated.job_id ? updated : candidate,
             );
+
+            if (updated.status === "CANCELLED") {
+              if (recoveryTargetJobId === updated.job_id) {
+                recoveryTargetJobId = null;
+                recoveryPanelOpen = false;
+                manualAssistanceOpen = false;
+                readyVerificationJobId = null;
+                readyVerificationFailedJobId = null;
+                readyVerificationMessage = "";
+                readyVerificationRestoreManual = false;
+              }
+
+              if (workflowRuntime?.device_id === updated.device_id) {
+                workflowRuntime = null;
+              }
+            }
           } catch (error) {
             notice(`Could not cancel job: ${error.message}`, true);
           } finally {
@@ -1427,8 +1593,6 @@ async function verifyPhoneReady() {
 
   if (!job?.recovery_workflow_id) {
     if (manualWorkflowIssue) {
-      // Operator confirms they have manually returned the phone
-      // to the expected state.
       workflowRuntime = null;
 
       readyVerificationJobId = null;
@@ -1447,16 +1611,44 @@ async function verifyPhoneReady() {
       return;
     }
 
-    readyVerificationMessage =
-      "Ready state cannot be verified because no recovery workflow is configured.";
-    readyVerificationRestoreManual = restoreManualOnFailure;
-    recoveryPanelOpen = true;
-    renderOperationalRecovery();
+    if (job) {
+      readyVerificationFinishInFlight = true;
+      readyVerificationMessage = "Marking phone ready…";
+      renderOperationalRecovery();
 
-    if (readyVerificationRestoreManual)
-      await restoreManualControlAfterVerificationFailure();
+      try {
+        const updated = await jobService.markReady(job.job_id);
 
-    return;
+        jobCatalog = jobCatalog.map((candidate) =>
+          candidate.job_id === updated.job_id ? updated : candidate,
+        );
+
+        readyVerificationJobId = null;
+        readyVerificationFailedJobId = null;
+        readyVerificationMessage = "";
+        readyVerificationRestoreManual = false;
+
+        manualAssistanceOpen = false;
+        recoveryPanelOpen = false;
+        recoveryTargetJobId = null;
+
+        renderJobs();
+        renderDevices();
+        renderOperationalRecovery();
+
+        notice("Phone marked ready. Failed job was not retried.");
+      } catch (error) {
+        readyVerificationMessage = `Phone could not be marked ready: ${friendlyOperationalError(error.message)}`;
+
+        if (restoreManualOnFailure)
+          await restoreManualControlAfterVerificationFailure();
+      } finally {
+        readyVerificationFinishInFlight = false;
+        renderOperationalRecovery();
+      }
+
+      return;
+    }
   }
 
   if (recoveryRequestInFlight) return;
@@ -1526,6 +1718,109 @@ function closeAccountSettings() {
   accountSettingsAccountId = null;
   $("account-settings-dialog").hidden = true;
   setAccountSettingsError();
+}
+
+function setWorkflowSettingsError(message = "") {
+  $("workflow-settings-error").textContent = message;
+  $("workflow-settings-error").hidden = !message;
+}
+
+function closeWorkflowSettings() {
+  workflowSettingsDeviceId = null;
+  workflowSettingsData = null;
+  $("workflow-settings-dialog").hidden = true;
+  $("workflow-settings-search").value = "";
+  setWorkflowSettingsError();
+}
+
+function renderWorkflowSettingsOptions() {
+  if (!workflowSettingsData) return;
+  const query = $("workflow-settings-search").value.trim().toLocaleLowerCase();
+  const allowed = workflowSettingsData.unrestricted
+    ? new Set(
+        workflowSettingsData.available_workflows.map((workflow) => workflow.id),
+      )
+    : new Set(workflowSettingsData.allowed_workflow_ids || []);
+  const available = workflowSettingsData.available_workflows.map(
+    (workflow) => ({
+      id: workflow.id,
+      name: workflow.name,
+      missing: false,
+    }),
+  );
+  for (const workflowId of workflowSettingsData.missing_workflow_ids || [])
+    available.push({ id: workflowId, name: "Missing workflow", missing: true });
+
+  const options = available
+    .filter((workflow) =>
+      `${workflow.name} ${workflow.id}`.toLocaleLowerCase().includes(query),
+    )
+    .map((workflow) => {
+      const label = document.createElement("label");
+      label.className =
+        "workflow-assignment-option" + (workflow.missing ? " missing" : "");
+      label.dataset.workflowId = workflow.id;
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = "device-workflow";
+      input.checked = allowed.has(workflow.id);
+      const text = document.createElement("span");
+      const name = document.createElement("strong");
+      name.textContent = workflow.missing
+        ? `${workflow.name} · Remove this assignment`
+        : workflow.name;
+      const id = document.createElement("small");
+      id.textContent = workflow.id;
+      text.append(name, id);
+      label.append(input, text);
+      return label;
+    });
+  $("workflow-settings-list").replaceChildren(...options);
+}
+
+async function openWorkflowSettings(device) {
+  workflowSettingsDeviceId = device.id;
+  workflowSettingsData = null;
+  $("workflow-settings-title").textContent =
+    `Assigned Workflow · ${device.name || device.id}`;
+  $("workflow-settings-help").textContent = "Loading workflows…";
+  $("workflow-settings-list").replaceChildren();
+  $("workflow-settings-dialog").hidden = false;
+  setWorkflowSettingsError();
+  try {
+    workflowSettingsData = await deviceService.workflows(device.id);
+    $("workflow-settings-help").textContent = workflowSettingsData.unrestricted
+      ? "Choose the workflow assigned to this phone."
+      : "Only the selected workflow may run on this phone.";
+    renderWorkflowSettingsOptions();
+    $("workflow-settings-search").focus();
+  } catch (error) {
+    setWorkflowSettingsError(error.message);
+  }
+}
+
+async function saveWorkflowSettings(event) {
+  event.preventDefault();
+  if (!workflowSettingsDeviceId || !workflowSettingsData) return;
+  const selected = Array.from($("workflow-settings-list").children).find(
+    (option) => option.children[0]?.checked,
+  );
+  const workflowIds = selected ? [selected.dataset.workflowId] : [];
+  const button = $("workflow-settings-save");
+  button.disabled = true;
+  setWorkflowSettingsError();
+  try {
+    await deviceService.updateWorkflows(workflowSettingsDeviceId, workflowIds);
+    closeWorkflowSettings();
+    deviceRenderSignature = null;
+    await loadDevices();
+    await window.phoneRecorder?.workflowAssignmentsChanged?.();
+    notice("Assigned workflow saved.");
+  } catch (error) {
+    setWorkflowSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function openAccountSettings(device, binding = null) {
@@ -1777,6 +2072,9 @@ async function resolveDeviceIssue(deviceId, jobId) {
   });
 }
 
+const cameraSourceNames = new Map();
+const cameraStableIds = new Map();
+
 function setCameraSettingsError(message = "") {
   $("camera-settings-error").textContent = message;
   $("camera-settings-error").hidden = !message;
@@ -1800,11 +2098,16 @@ function populateCameraSources(cameras, current) {
   const list = $("camera-source-options");
   const values = new Set();
   const options = [];
+  cameraSourceNames.clear();
+  cameraStableIds.clear();
   for (const camera of cameras || []) {
     values.add(String(camera.source));
+    if (camera.name) cameraSourceNames.set(String(camera.source), camera.name);
+    if (camera.stable_id)
+      cameraStableIds.set(String(camera.source), camera.stable_id);
     const option = document.createElement("option");
     option.value = String(camera.source);
-    option.textContent = `Camera ${camera.source} — ${camera.available ? "Available" : "Unavailable"}`;
+    option.textContent = `${camera.name || `Camera ${camera.index ?? camera.source}`} — ${camera.available ? "Available" : "Unavailable"}`;
     options.push(option);
   }
   if (
@@ -1830,10 +2133,11 @@ async function openCameraSettings(device) {
   $("camera-settings-rotation").value = String(config.rotation ?? 0);
   $("camera-settings-enabled").checked = config.enabled === true;
   $("camera-settings-status").textContent = cameraState(details).label;
-  populateCameraSources([], config.camera_source);
+  const configuredSource = config.camera_id || config.camera_source;
+  populateCameraSources([], configuredSource);
   $("camera-settings-dialog").hidden = false;
   setCameraSettingsError();
-  await refreshCameraSources(false, device.id, config.camera_source);
+  await refreshCameraSources(false, device.id, configuredSource);
 }
 
 async function refreshCameraSources(
@@ -1898,11 +2202,17 @@ async function saveDeviceCamera(event) {
   test.disabled = true;
   setCameraSettingsError();
   try {
-    const result = await deviceService.updateCamera(deviceId, {
-      camera_source: cameraSourceValue($("camera-settings-source").value),
+    const selectedSource = $("camera-settings-source").value;
+    const settings = {
+      camera_source: cameraSourceValue(selectedSource),
       rotation: Number($("camera-settings-rotation").value),
       enabled: $("camera-settings-enabled").checked,
-    });
+    };
+    if (cameraSourceNames.has(selectedSource))
+      settings.display_name = cameraSourceNames.get(selectedSource);
+    if (cameraStableIds.has(selectedSource))
+      settings.camera_id = cameraStableIds.get(selectedSource);
+    const result = await deviceService.updateCamera(deviceId, settings);
     const selected = deviceId === deviceCatalog?.selected_device;
     const selectedCameraChanged =
       result.selected_camera_changed === true || selected;
@@ -1928,6 +2238,22 @@ async function saveDeviceCamera(event) {
       notice(`Camera settings saved for ${deviceId}.`);
     }
   } catch (error) {
+    try {
+      const actual = await deviceService.camera(deviceId);
+      deviceCameraDetails = {
+        ...(deviceCameraDetails || {}),
+        [deviceId]: actual,
+      };
+      if (cameraSettingsDeviceId === deviceId && actual?.config) {
+        const config = actual.config;
+        populateCameraSources([], config.camera_id || config.camera_source);
+        $("camera-settings-rotation").value = String(config.rotation ?? 0);
+        $("camera-settings-enabled").checked = config.enabled === true;
+        $("camera-settings-status").textContent = cameraState(actual).label;
+      }
+    } catch {
+      // Keep the original failure visible if authoritative state cannot load.
+    }
     setCameraSettingsError(error.message);
   } finally {
     button.disabled = false;
@@ -3142,6 +3468,16 @@ $("account-settings-cancel").addEventListener("click", closeAccountSettings);
 $("account-settings-close").addEventListener("click", closeAccountSettings);
 $("account-settings-dialog").addEventListener("click", (event) => {
   if (event.target === $("account-settings-dialog")) closeAccountSettings();
+});
+$("workflow-settings-form").addEventListener("submit", saveWorkflowSettings);
+$("workflow-settings-search").addEventListener(
+  "input",
+  renderWorkflowSettingsOptions,
+);
+$("workflow-settings-cancel").addEventListener("click", closeWorkflowSettings);
+$("workflow-settings-close").addEventListener("click", closeWorkflowSettings);
+$("workflow-settings-dialog").addEventListener("click", (event) => {
+  if (event.target === $("workflow-settings-dialog")) closeWorkflowSettings();
 });
 $("camera-settings-form").addEventListener("submit", saveDeviceCamera);
 $("camera-settings-test").addEventListener("click", testCameraSettings);

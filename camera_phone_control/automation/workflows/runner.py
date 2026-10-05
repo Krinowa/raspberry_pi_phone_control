@@ -1,5 +1,7 @@
 """Transport-independent execution. Ownership is supplied by automation.Runner."""
 
+import time
+
 from .validation import validate_workflow, resolve_variables
 from ..context import Cancelled
 from ..input.base import UnsupportedOperation
@@ -60,17 +62,26 @@ class WorkflowRunner:
         self.timing = timing or WorkflowTiming()
         self.capture_screen = capture_screen
 
-    def run(self, workflow, variables=None):
+    def run(self, workflow, variables=None, *, start_step_index=0):
         workflow = validate_workflow(workflow)
+        if (
+            type(start_step_index) is not int
+            or start_step_index < 0
+            or start_step_index > len(workflow["steps"])
+        ):
+            raise ValueError("start_step_index is outside the workflow steps.")
         values = resolve_variables(workflow, variables)
         ctx = self.context
         ctx.state.step_count = len(workflow["steps"])
         ctx.logger.info("Workflow started.")
         self.timing.start()
         try:
-            for index, step in enumerate(workflow["steps"], 1):
+            for index, step in enumerate(
+                workflow["steps"][start_step_index:], start_step_index + 1
+            ):
                 ctx.check_cancelled()
                 ctx.state.step_index = index
+                ctx.state.step_id = step["id"]
                 ctx.state.current_step = step["type"]
                 ctx.logger.info(
                     "Workflow step %s/%s started: %s",
@@ -131,7 +142,7 @@ class WorkflowRunner:
 
     def _prepare_text_wait_baseline(self, step, following):
         """Capture a cheap pre-action frame for a following camera text wait."""
-        if not following or following["type"] != "wait_for_text":
+        if not following or following["type"] not in {"wait_for_text", "if_text"}:
             return
         physical_action = step["type"] in {"tap", "swipe", "key"} or (
             step["type"] == "input" and step.get("source") != "manual"
@@ -202,6 +213,32 @@ class WorkflowRunner:
                 roi=step.get("roi"),
             )
             ctx.logger.info("Text detected: %s", step["text"])
+        elif kind == "if_text":
+            ctx.logger.info("Evaluating text condition: %s", step["text"])
+            matched = wait_for_text(
+                self.screen_state_provider,
+                ctx,
+                step["text"],
+                step["timeout_seconds"],
+                roi=step.get("roi"),
+                required=False,
+            )
+            branch_name = "then_steps" if matched else "else_steps"
+            self.timing.annotate_current(
+                condition_result=bool(matched),
+                selected_branch="then" if matched else "else",
+            )
+            ctx.logger.info(
+                "Text condition result=%s; selected branch=%s.",
+                "true" if matched else "false",
+                "THEN" if matched else "ELSE",
+            )
+            self._execute_branch(
+                step[branch_name],
+                values or {},
+                keyboards or {},
+                "THEN" if matched else "ELSE",
+            )
         elif kind == "capture_screen":
             if self.capture_screen is None:
                 raise ScreenStateError(
@@ -229,3 +266,51 @@ class WorkflowRunner:
                     ctx.input.type_text(value)
         else:
             raise ValueError("Unsupported workflow step type.")
+
+    def _execute_branch(self, steps, values, keyboards, branch_name):
+        """Run validated nested steps through the normal step executor."""
+        for index, step in enumerate(steps, 1):
+            started = time.monotonic()
+            self.context.check_cancelled()
+            self.context.state.current_step = step["type"]
+            self.context.logger.info(
+                "%s branch step %s/%s started: %s",
+                branch_name,
+                index,
+                len(steps),
+                step["type"],
+            )
+            following = steps[index] if index < len(steps) else None
+            self._prepare_text_wait_baseline(step, following)
+            try:
+                self.execute_step(step, values, keyboards)
+                self.context.check_cancelled()
+            except Cancelled:
+                self.timing.record_nested_step(
+                    f"{branch_name}.{index}",
+                    step["type"],
+                    "cancelled",
+                    time.monotonic() - started,
+                )
+                raise
+            except Exception:
+                self.timing.record_nested_step(
+                    f"{branch_name}.{index}",
+                    step["type"],
+                    "failed",
+                    time.monotonic() - started,
+                )
+                raise
+            self.timing.record_nested_step(
+                f"{branch_name}.{index}",
+                step["type"],
+                "completed",
+                time.monotonic() - started,
+            )
+            self.context.logger.info(
+                "%s branch step %s/%s completed: %s",
+                branch_name,
+                index,
+                len(steps),
+                step["type"],
+            )

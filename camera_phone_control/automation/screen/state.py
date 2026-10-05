@@ -59,6 +59,7 @@ def wait_for_text(
     interval=0.2,
     roi=None,
     clock=time.monotonic,
+    required=True,
 ):
     """Poll a provider without coupling workflow execution to its data source."""
     if provider is None:
@@ -104,11 +105,13 @@ def wait_for_text(
                 found = provider.contains_text(expected_text)
 
             if found:
-                return
+                return True if not required else None
 
             remaining = deadline - clock()
 
             if remaining <= 0:
+                if not required:
+                    return False
                 raise ScreenStateError(
                     f'Text "{expected_text}" was not detected within '
                     f"{timeout_seconds:g} seconds."

@@ -371,10 +371,21 @@ def register_workflows(
 
     @app.get("/api/workflows")
     def list_workflows():
+        selected_device_id = (
+            state.pi_bridge.device_id
+            if state.pi_bridge is not None
+            else (service.device_id or "phone_A")
+        )
+        allowed = app.extensions["device_workflow_assignment_store"].get(
+            selected_device_id
+        )
         return jsonify(
             workflows=storage.list(),
             input_backend=backend_names()[0],
             screen_backend=backend_names()[1],
+            selected_device_id=selected_device_id,
+            allowed_workflow_ids=None if allowed is None else list(allowed),
+            workflow_access_unrestricted=allowed is None,
         )
 
     @app.post("/api/workflows")
@@ -428,6 +439,17 @@ def register_workflows(
         if set(data) - {"variables"}:
             raise ValueError("Expected variables only.")
 
+        selected_workflow = storage.read(workflow_id)
+        target_device_id = (
+            state.pi_bridge.device_id
+            if state.pi_bridge is not None
+            else (service.device_id or "phone_A")
+        )
+        if not app.extensions["device_workflow_assignment_store"].allows(
+            target_device_id, workflow_id
+        ):
+            raise ValueError(f"Workflow is not assigned to device {target_device_id}.")
+
         with lock:
             if recorder.workflow is not None:
                 raise ValueError("Save or cancel recording " "before playback.")
@@ -448,7 +470,7 @@ def register_workflows(
             return (
                 jsonify(
                     service.start(
-                        storage.read(workflow_id),
+                        selected_workflow,
                         data.get("variables"),
                     )
                 ),
@@ -694,6 +716,35 @@ def register_workflows(
         with lock:
             return jsonify(recorder.cancel_expected_text(recorder_id()))
 
+    @app.post("/api/recorder/alternate-screen/start")
+    @admin_required
+    def start_recording_alternate_screen():
+        data = payload()
+        if set(data) - {"text", "timeout_seconds", "roi", "after_step_id"}:
+            raise ValueError("Unexpected Special Case fields.")
+        with lock:
+            return jsonify(
+                recorder.start_alternate_screen(
+                    recorder_id(),
+                    data.get("text"),
+                    data.get("timeout_seconds", 0.8),
+                    data.get("roi"),
+                    data.get("after_step_id"),
+                )
+            )
+
+    @app.post("/api/recorder/alternate-screen/<operation>")
+    @admin_required
+    def recording_alternate_screen_operation(operation):
+        if payload():
+            raise ValueError("Expected an empty JSON object.")
+        with lock:
+            if operation == "finish":
+                return jsonify(recorder.finish_alternate_screen(recorder_id()))
+            if operation == "cancel":
+                return jsonify(recorder.cancel_alternate_screen(recorder_id()))
+        return jsonify(error="Unknown Special Case operation."), 404
+
     @app.post("/api/recorder/keyboard-capture/start")
     @admin_required
     def start_keyboard_capture():
@@ -786,7 +837,14 @@ def register_workflows(
             raise ValueError("Choose Bluetooth HID or a captured on-screen keyboard.")
         sample = data.get("sample", "")
         if not isinstance(sample, str) or len(sample) > 4096:
-            raise ValueError("Sample value must be text up to 4096 characters.")
+            raise ValueError("Default value must be text up to 4096 characters.")
+        if data["type_sample"] and sample == "":
+            raise ValueError("Enter a Default value before using Add & Type Now.")
+        variable = (
+            {**data["variable"], "default": sample or None}
+            if isinstance(data["variable"], dict)
+            else data["variable"]
+        )
 
         client = client_id()
         owner = recorder_id()
@@ -811,9 +869,7 @@ def register_workflows(
                     "type": "input",
                     "source": "variable",
                     "variable": (
-                        data["variable"].get("name")
-                        if isinstance(data["variable"], dict)
-                        else None
+                        variable.get("name") if isinstance(variable, dict) else None
                     ),
                     **(
                         {
@@ -824,7 +880,7 @@ def register_workflows(
                         else {}
                     ),
                 }
-                candidate = recorder.prepare(owner, step, data["variable"])
+                candidate = recorder.prepare(owner, step, variable)
                 keyboard = None
                 if method == "screen_keyboard":
                     keyboard = recorder.workflow.get("keyboards", {}).get(

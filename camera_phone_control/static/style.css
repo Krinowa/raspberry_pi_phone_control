@@ -229,6 +229,16 @@ h2 {
   gap: 22px;
   align-items: start;
 }
+.control-workspace.is-workflow-authoring {
+  grid-template-columns: minmax(0, 1fr) minmax(380px, 500px);
+}
+.control-workspace > aside {
+  min-width: 0;
+}
+.control-workspace.is-workflow-authoring > .workflow-phone-pane {
+  position: sticky;
+  top: 16px;
+}
 .viewer,
 .card {
   background: white;
@@ -258,6 +268,27 @@ h2 {
   max-height: 75vh;
 
   overflow: hidden;
+}
+#workflow-mock-preview-slot {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  place-items: center;
+  color: #dcebe3;
+  line-height: 1.5;
+  text-align: center;
+}
+#workflow-mock-preview-slot[hidden] {
+  display: none;
+}
+.workflow-phone-pane.uses-workflow-preview #video,
+.workflow-phone-pane.uses-workflow-preview #video-placeholder {
+  display: none;
+}
+#workflow-authoring-slot,
+#review-flow,
+#step-editor {
+  min-width: 0;
 }
 canvas {
   display: block;
@@ -750,6 +781,42 @@ button.primary:hover:not(:disabled) {
   color: #a22f2f !important;
   margin-bottom: 0 !important;
 }
+
+.workflow-assignment-list {
+  display: grid;
+  gap: 0.5rem;
+  max-height: min(22rem, 50vh);
+  overflow: auto;
+  padding: 0.25rem;
+  border: 1px solid #d8e0dc;
+  border-radius: 0.75rem;
+}
+
+.workflow-assignment-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: start;
+  padding: 0.55rem;
+  border-radius: 0.55rem;
+}
+
+.workflow-assignment-option:hover {
+  background: #f2f5f3;
+}
+
+.workflow-assignment-option span {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.workflow-assignment-option small {
+  overflow-wrap: anywhere;
+}
+
+.workflow-assignment-option.missing strong {
+  color: #a22f2f;
+}
 #notice {
   font-size: 13px;
   padding: 15px 18px;
@@ -788,10 +855,19 @@ footer {
   .workspace {
     grid-template-columns: 1fr;
   }
+  .control-workspace.is-workflow-authoring {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .control-workspace.is-workflow-authoring > .workflow-phone-pane {
+    position: static;
+  }
   aside {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 16px;
+  }
+  .control-workspace.is-workflow-authoring > aside {
+    grid-template-columns: minmax(0, 1fr);
   }
   .health-grid {
     grid-template-columns: repeat(3, 1fr);
@@ -894,6 +970,31 @@ label > select {
 }
 .flow-buttons input {
   width: 110px;
+}
+.duration-field > span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.duration-field input {
+  width: 110px;
+}
+.advanced-options {
+  margin: 14px 0;
+  padding: 10px 12px;
+  border: 1px solid #dfe7e2;
+  border-radius: 8px;
+  background: #fafcfb;
+}
+.advanced-options > summary {
+  cursor: pointer;
+  color: #405b4d;
+  font-size: 12px;
+  font-weight: 650;
+}
+.advanced-options[open] > summary {
+  margin-bottom: 12px;
 }
 .recording {
   color: #a42d34 !important;
@@ -998,6 +1099,31 @@ summary {
   border-radius: 8px;
   margin: 12px 0;
 }
+.condition-branches {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 4px;
+  padding-left: 14px;
+  border-left: 3px solid #9bb8a5;
+}
+.condition-branches h5 {
+  margin: 8px 0 2px;
+  color: #3d6650;
+  letter-spacing: 0.06em;
+}
+.condition-step-list {
+  margin: 0;
+  padding-left: 24px;
+}
+.review-timeline .condition-step-list > li {
+  border-bottom: 0;
+  border-top: 1px solid #dfe5e2;
+  padding: 12px 6px;
+}
+.review-timeline .condition-step-list > .condition-empty {
+  color: #68766d;
+  font-style: italic;
+}
 #step-editor {
   padding: 18px;
   margin: 16px 0;
@@ -1055,6 +1181,21 @@ summary {
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+.alternate-screen-panel {
+  flex-basis: 100%;
+  padding: 14px;
+  border: 1px solid #cddbd2;
+  border-radius: 10px;
+  background: #f4f8f5;
+}
+.alternate-screen-panel h3,
+.alternate-screen-panel p {
+  margin-top: 0;
+}
+.alternate-screen-panel.is-active {
+  border-color: #4f8a66;
+  background: #eaf5ed;
 }
 #captured-keyboard-list {
   display: grid;

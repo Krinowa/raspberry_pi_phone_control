@@ -61,6 +61,7 @@ class WorkflowService:
         *,
         device_id=None,
         cancel_event=None,
+        start_step_index=0,
     ):
         workflow = validate_workflow(workflow)
         variables = deepcopy(variables)
@@ -126,7 +127,11 @@ class WorkflowService:
                             screen_state_provider,
                             timing=item["timing"],
                             capture_screen=capture_screen,
-                        ).run(workflow, variables),
+                        ).run(
+                            workflow,
+                            variables,
+                            start_step_index=start_step_index,
+                        ),
                         cancel_event=cancel,
                         resume_event=resume,
                         device_id=target_device_id,
@@ -149,6 +154,7 @@ class WorkflowService:
         if workflow.get("id") != job.workflow:
             raise ValueError("Job workflow does not match the loaded workflow.")
         options = {"device_id": job.device_id}
+        options["start_step_index"] = job.start_step_index
         if cancel_event is not None:
             options["cancel_event"] = cancel_event
         return self.start(workflow, job.payload, **options)

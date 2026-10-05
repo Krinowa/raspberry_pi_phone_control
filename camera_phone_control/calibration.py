@@ -127,7 +127,7 @@ class CalibrationStorage:
     @staticmethod
     def _camera_details(camera, camera_info):
         return {
-            "source": camera.source,
+            "source": getattr(camera, "configured_source", camera.source),
             "rotation": camera.rotate,
             "width": camera_info["width"],
             "height": camera_info["height"],

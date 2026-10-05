@@ -30,7 +30,9 @@ from automation.auth import UserStore, admin_required, register_auth, require_ad
 from automation.context import AutomationContext
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
+from automation.jobs.storage import DeviceWorkflowAssignmentStore
 from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
+from hardware.device_config import DEFAULT_DEVICE_ID
 from hardware.raspberry_pi_input import RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
@@ -193,6 +195,14 @@ class ControlState:
 
     def refresh(self):
         errors = []
+        if self.camera_manager is not None:
+            selected_camera_device = (
+                self.pi_bridge.device_id
+                if self.pi_bridge is not None
+                else DEFAULT_DEVICE_ID
+            )
+            if selected_camera_device is not None:
+                self.camera = self.camera_manager.get_camera(selected_camera_device)
         try:
             if self.pi_bridge is not None:
                 if self.pi_connection["phone"] == "connected":
@@ -239,7 +249,7 @@ class ControlState:
         ):
             restore_key = (
                 signature,
-                self.camera.source,
+                getattr(self.camera, "configured_source", self.camera.source),
                 self.camera.rotate,
             )
             if restore_key != self.calibration_restore_key:
@@ -354,6 +364,7 @@ def create_app(
     camera_manager=None,
     account_store=None,
     job_store=None,
+    device_workflow_store=None,
     start_job_executor=False,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
@@ -441,6 +452,9 @@ def create_app(
     app.extensions["control_state"] = state
     app.extensions["camera_manager"] = camera_manager
     app.extensions["auth_user_store"] = auth_store or UserStore()
+    app.extensions["device_workflow_assignment_store"] = (
+        device_workflow_store or DeviceWorkflowAssignmentStore()
+    )
     app.config["CONTROL_TOKEN"] = token
 
     @app.before_request
@@ -594,6 +608,34 @@ def create_app(
             return state.pi_bridge.device_id
         return "phone_A"
 
+    def workflow_assignment_details(device_id, *, include_available=False):
+        store = app.extensions["device_workflow_assignment_store"]
+        allowed = store.get(device_id)
+        workflows = app.extensions["workflow_storage"].list()
+        known = {item["id"]: item for item in workflows}
+        assigned_ids = list(known) if allowed is None else list(allowed)
+        assigned = [
+            {
+                "id": workflow_id,
+                "name": known.get(workflow_id, {}).get("name"),
+                "missing": workflow_id not in known,
+            }
+            for workflow_id in assigned_ids
+        ]
+        result = {
+            "device_id": device_id,
+            "configured": allowed is not None,
+            "unrestricted": allowed is None,
+            "allowed_workflow_ids": None if allowed is None else list(allowed),
+            "assigned_workflows": assigned,
+            "missing_workflow_ids": [
+                workflow_id for workflow_id in assigned_ids if workflow_id not in known
+            ],
+        }
+        if include_available:
+            result["available_workflows"] = workflows
+        return result
+
     def camera_work_active():
         workflow_service = app.extensions.get("workflow_service")
         recorder = app.extensions.get("workflow_recorder")
@@ -647,14 +689,20 @@ def create_app(
             return denied
 
         data = payload()
-        allowed = {"camera_source", "rotation", "enabled", "display_name"}
-        if not set(data).issubset(allowed) or not {
+        allowed = {
             "camera_source",
+            "camera_id",
             "rotation",
             "enabled",
-        }.issubset(data):
+            "display_name",
+        }
+        if (
+            not set(data).issubset(allowed)
+            or not {"rotation", "enabled"}.issubset(data)
+            or not ({"camera_source", "camera_id"} & set(data))
+        ):
             raise ValueError(
-                "Expected camera_source, rotation, and enabled; display_name is optional."
+                "Expected rotation, enabled, and camera_source or camera_id; display_name is optional."
             )
         with state.lock:
             if camera_work_active():
@@ -666,14 +714,18 @@ def create_app(
             previous_selected_config = camera_manager.config(selected_device_id)
             config, affected_devices = camera_manager.reassign(
                 device_id,
-                camera_source=data["camera_source"],
+                camera_source=(
+                    data.get("camera_source") if "camera_source" in data else None
+                ),
                 rotation=data["rotation"],
                 enabled=data["enabled"],
-                display_name=data.get("display_name"),
+                display_name=data.get("display_name", previous_config.display_name),
+                camera_id=data.get("camera_id"),
             )
             changed = config != previous_config
             calibration_revalidation = (
                 config.camera_source != previous_config.camera_source
+                or config.camera_id != previous_config.camera_id
                 or config.rotation != previous_config.rotation
             )
             selected = device_id == selected_device_id
@@ -684,6 +736,7 @@ def create_app(
             )
             selected_calibration_revalidation = selected_changed and (
                 selected_config.camera_source != previous_selected_config.camera_source
+                or selected_config.camera_id != previous_selected_config.camera_id
                 or selected_config.rotation != previous_selected_config.rotation
             )
             if selected_changed:
@@ -716,6 +769,11 @@ def create_app(
         bridge = require_pi_bridge()
         result = dict(bridge.devices())
         devices = result.get("devices")
+        if isinstance(devices, list):
+            devices = [
+                dict(item) if isinstance(item, dict) else item for item in devices
+            ]
+            result["devices"] = devices
         with state.lock:
             state.pi_catalog_initialized = True
             state.update_pi_devices(result)
@@ -746,7 +804,52 @@ def create_app(
                     if workflow_service is not None:
                         workflow_service.device_id = selected
             result["selected_device"] = bridge.device_id
+        if isinstance(devices, list):
+            for item in devices:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    continue
+                item["workflow_assignment"] = workflow_assignment_details(item["id"])
         return jsonify(result)
+
+    @app.route("/api/devices/<device_id>/workflows", methods=["GET", "PUT"])
+    def device_workflows(device_id):
+        bridge, _, registered = registered_pi_devices()
+        del bridge
+        if device_id not in registered:
+            raise PiApiError(
+                f"Pi device {device_id!r} is not registered.", http_status=404
+            )
+        if request.method == "GET":
+            return jsonify(
+                workflow_assignment_details(device_id, include_available=True)
+            )
+
+        denied = require_admin()
+        if denied is not None:
+            return denied
+
+        data = payload()
+
+        if set(data) != {"workflow_ids"} or not isinstance(data["workflow_ids"], list):
+            raise ValueError("Expected workflow_ids list only.")
+
+        if len(data["workflow_ids"]) > 1:
+            raise ValueError("Only one workflow can be assigned to a phone.")
+
+        workflow_storage = app.extensions["workflow_storage"]
+
+        for workflow_id in data["workflow_ids"]:
+            try:
+                workflow_storage.read(workflow_id)
+            except FileNotFoundError:
+                raise ValueError(
+                    f"Workflow {workflow_id!r} does not exist and cannot be assigned."
+                ) from None
+
+        app.extensions["device_workflow_assignment_store"].set(
+            device_id, data["workflow_ids"]
+        )
+        return jsonify(workflow_assignment_details(device_id, include_available=True))
 
     @app.get("/api/devices/<device_id>/status")
     def pi_device_status(device_id):
@@ -874,6 +977,7 @@ def create_app(
                     if workflow_service is not None:
                         workflow_service.device_id = selected
             camera_manager.release_device(device_id)
+            app.extensions["device_workflow_assignment_store"].delete(device_id)
 
         response = dict(result)
         response.update(catalog)
@@ -895,11 +999,17 @@ def create_app(
                         409,
                     )
                 camera_manager.config(requested_device)
-                active_camera = (
-                    state.camera
-                    if requested_device == selected
-                    else camera_manager.get_camera(requested_device)
-                )
+                active_camera = camera_manager.get_camera(requested_device)
+                if (
+                    getattr(active_camera, "device_id", requested_device)
+                    != requested_device
+                ):
+                    return (
+                        jsonify(error="Camera ownership changed; request a new frame."),
+                        409,
+                    )
+                if requested_device == selected:
+                    state.camera = active_camera
                 camera_status = active_camera.status()
                 if not camera_status["ready"]:
                     return jsonify(error=camera_status["error"]), 503
@@ -973,7 +1083,12 @@ def create_app(
                     threading.active_count(),
                 )
         return Response(
-            jpeg, mimetype="image/jpeg", headers={"X-Frame-Id": str(number)}
+            jpeg,
+            mimetype="image/jpeg",
+            headers={
+                "X-Frame-Id": str(number),
+                "X-Camera-Device-Id": requested_device,
+            },
         )
 
     @app.post("/api/control")
@@ -1123,7 +1238,11 @@ def create_app(
             if state.calibration_storage is not None:
                 state.calibration_restore_key = (
                     signature,
-                    state.camera.source,
+                    getattr(
+                        state.camera,
+                        "configured_source",
+                        state.camera.source,
+                    ),
                     state.camera.rotate,
                 )
             state.message = "Calibration saved. You can enable Manual Control."

@@ -26,6 +26,7 @@ def register_jobs(
     job_store = job_store or JobStore()
     workflow_storage = app.extensions["workflow_storage"]
     workflow_service = app.extensions["workflow_service"]
+    device_workflow_store = app.extensions["device_workflow_assignment_store"]
     camera_manager = app.extensions["camera_manager"]
     readiness = DeviceEligibility(state, camera_manager, workflow_service)
     scheduler = JobScheduler(job_store, readiness)
@@ -128,6 +129,10 @@ def register_jobs(
         if not binding.enabled:
             raise RecordConflict("Account binding is disabled.")
         workflow = workflow_storage.read(data["workflow"])
+        if not device_workflow_store.allows(binding.device_id, workflow["id"]):
+            raise RecordConflict(
+                f"Workflow is not assigned to device {binding.device_id}."
+            )
         resolve_variables(workflow, data["payload"])
         job = scheduler.enqueue(
             binding,
@@ -161,5 +166,21 @@ def register_jobs(
             jsonify(scheduler.public(executor.recover(job_id, verify_only=True))),
             202,
         )
+
+    @app.post("/api/jobs/<job_id>/mark-ready")
+    def mark_job_phone_ready(job_id):
+        if payload():
+            raise ValueError("Mark Ready expects an empty JSON object.")
+
+        return jsonify(scheduler.public(scheduler.mark_ready(job_id)))
+
+    @app.post("/api/jobs/<job_id>/retry")
+    def retry_job(job_id):
+        data = payload()
+        if set(data) != {"mode"}:
+            raise ValueError("Retry expects mode only.")
+        retry = scheduler.create_retry(job_id, data["mode"])
+        executor.wake()
+        return jsonify(scheduler.public(retry)), 202
 
     return scheduler

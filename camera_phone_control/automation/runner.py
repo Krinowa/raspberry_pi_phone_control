@@ -38,6 +38,7 @@ class RunState:
     message: str = "Starting script."
     takeover_requested: bool = False
     step_index: int = 0
+    step_id: str | None = None
     step_count: int = 0
     checkpoint_message: str | None = None
 

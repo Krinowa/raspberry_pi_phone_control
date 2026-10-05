@@ -177,6 +177,43 @@ class JobScheduler:
             )
             return self.store.create(job)
 
+    def create_retry(self, job_id, mode):
+        """Create a new, device-pinned job after explicit phone recovery."""
+        with self.lock:
+            original = self.get_job(job_id)
+            if original.status not in {"FAILED", "INTERRUPTED"}:
+                raise RecordConflict("Only failed or interrupted jobs can be retried.")
+            if original.recovery_status != "READY":
+                raise RecordConflict(
+                    "The phone must be restored and marked ready before retrying."
+                )
+            if mode == "failed_step":
+                if original.failed_step_index is None:
+                    raise RecordConflict(
+                        "The failed workflow step is unavailable; restart the workflow instead."
+                    )
+                start_step_index = original.failed_step_index
+            elif mode == "restart":
+                start_step_index = 0
+            else:
+                raise ValueError("Retry mode must be failed_step or restart.")
+
+            ready = self.is_device_ready(original.device_id)["ready"]
+            retry = Job.create(
+                original.account_id,
+                original.device_id,
+                original.workflow,
+                original.payload,
+                "QUEUED" if ready else "WAITING_FOR_DEVICE",
+                external_ref=original.external_ref,
+                bank=original.bank,
+                action=original.action,
+                recovery_workflow_id=original.recovery_workflow_id,
+                retry_of_job_id=original.job_id,
+                start_step_index=start_step_index,
+            )
+            return self.store.create(retry)
+
     def get_job(self, job_id):
         return self.store.get(job_id)
 
@@ -184,9 +221,24 @@ class JobScheduler:
         return self.store.list()
 
     def is_device_ready(self, device_id):
-        return self.readiness.inspect(
+        result = self.readiness.inspect(
             device_id, reserved=device_id in self.reservations
         )
+        needs_attention = any(
+            job.device_id == device_id and job.recovery_status == "NEEDS_ATTENTION"
+            for job in self.list_jobs()
+        )
+        if not needs_attention:
+            return result
+        reasons = list(result.get("reasons", []))
+        if "needs_attention" not in reasons:
+            reasons.append("needs_attention")
+        return {
+            **result,
+            "busy": True,
+            "ready": False,
+            "reasons": reasons,
+        }
 
     def next_job_for_device(self, device_id):
         with self.lock:
@@ -267,7 +319,17 @@ class JobScheduler:
             self.reservations[device_id] = job_id
             return running
 
-    def _finish(self, job_id, status, *, error=None, result=None, screenshots=None):
+    def _finish(
+        self,
+        job_id,
+        status,
+        *,
+        error=None,
+        result=None,
+        screenshots=None,
+        failed_step_index=None,
+        failed_step_id=None,
+    ):
         with self.lock:
             job = self.get_job(job_id)
             if self.reservations.get(job.device_id) != job_id:
@@ -291,6 +353,12 @@ class JobScheduler:
                     if screenshots is not None
                     else job.screenshots
                 ),
+                failed_step_index=(
+                    failed_step_index if status == "FAILED" else job.failed_step_index
+                ),
+                failed_step_id=(
+                    failed_step_id if status == "FAILED" else job.failed_step_id
+                ),
             )
             del self.reservations[job.device_id]
             return finished
@@ -298,8 +366,23 @@ class JobScheduler:
     def complete_job(self, job_id, result=None, *, screenshots=None):
         return self._finish(job_id, "COMPLETED", result=result, screenshots=screenshots)
 
-    def fail_job(self, job_id, error, *, screenshots=None):
-        return self._finish(job_id, "FAILED", error=error, screenshots=screenshots)
+    def fail_job(
+        self,
+        job_id,
+        error,
+        *,
+        screenshots=None,
+        failed_step_index=None,
+        failed_step_id=None,
+    ):
+        return self._finish(
+            job_id,
+            "FAILED",
+            error=error,
+            screenshots=screenshots,
+            failed_step_index=failed_step_index,
+            failed_step_id=failed_step_id,
+        )
 
     def finish_cancelled(self, job_id, result=None, *, screenshots=None):
         return self._finish(job_id, "CANCELLED", result=result, screenshots=screenshots)
@@ -414,3 +497,24 @@ class JobScheduler:
 
     def public(self, job):
         return job.public(self.queue_position(job))
+
+    def mark_ready(self, job_id):
+        with self.lock:
+            job = self.store.get(job_id)
+
+            if job.status not in {"FAILED", "INTERRUPTED"}:
+                raise RecordConflict(
+                    "Only failed or interrupted jobs can be manually marked ready."
+                )
+
+            if job.recovery_status == "READY":
+                return job
+
+            updated = replace(
+                job,
+                recovery_status="READY",
+                recovered_at=now(),
+                recovery_error=None,
+            )
+
+            return self.store.replace(updated)

@@ -9,6 +9,9 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 
+from automation.workflows.validation import identifier
+from hardware.device_config import validate_device_id
+
 from .models import AccountBinding, Job
 
 DEFAULT_DATA_DIRECTORY = Path(__file__).resolve().parents[1] / "job_data"
@@ -134,6 +137,78 @@ class AccountBindingStore(_JsonStore):
 
     def _save_bindings(self, bindings):
         self._write({key: value.public() for key, value in sorted(bindings.items())})
+
+
+class DeviceWorkflowAssignmentStore(_JsonStore):
+    """Persistent workflow allowlists keyed by stable logical device ID.
+
+    A missing key intentionally means unrestricted legacy behavior. An existing
+    key with an empty list means that no workflow is allowed on that device.
+    """
+
+    def __init__(self, path=None):
+        super().__init__(path or DEFAULT_DATA_DIRECTORY / "device_workflows.json")
+
+    def _assignments(self):
+        assignments = {}
+        for device_id, value in self._read().items():
+            validate_device_id(device_id)
+            if not isinstance(value, dict) or set(value) != {"allowed_workflow_ids"}:
+                raise ValueError("Stored device workflow assignment is invalid.")
+            workflow_ids = value["allowed_workflow_ids"]
+            if not isinstance(workflow_ids, list) or len(workflow_ids) > 1:
+                raise ValueError("Only one workflow can be assigned to a phone.")
+            normalized = []
+            for workflow_id in workflow_ids:
+                workflow_id = identifier(workflow_id)
+                if workflow_id in normalized:
+                    raise ValueError("Stored workflow assignments contain duplicates.")
+                normalized.append(workflow_id)
+            assignments[device_id] = tuple(normalized)
+        return assignments
+
+    def get(self, device_id):
+        """Return a tuple allowlist, or None when the legacy device is unrestricted."""
+        validate_device_id(device_id)
+        with self.lock:
+            return self._assignments().get(device_id)
+
+    def set(self, device_id, workflow_ids):
+        validate_device_id(device_id)
+        if not isinstance(workflow_ids, list) or len(workflow_ids) > 1:
+            raise ValueError("Only one workflow can be assigned to a phone.")
+        normalized = []
+        for workflow_id in workflow_ids:
+            workflow_id = identifier(workflow_id)
+            if workflow_id in normalized:
+                raise ValueError("workflow_ids must not contain duplicates.")
+            normalized.append(workflow_id)
+        with self.lock:
+            assignments = self._assignments()
+            assignments[device_id] = tuple(normalized)
+            self._save(assignments)
+        return tuple(normalized)
+
+    def delete(self, device_id):
+        validate_device_id(device_id)
+        with self.lock:
+            assignments = self._assignments()
+            removed = assignments.pop(device_id, None)
+            if removed is not None:
+                self._save(assignments)
+            return removed is not None
+
+    def allows(self, device_id, workflow_id):
+        allowed = self.get(device_id)
+        return allowed is None or identifier(workflow_id) in allowed
+
+    def _save(self, assignments):
+        self._write(
+            {
+                device_id: {"allowed_workflow_ids": list(workflow_ids)}
+                for device_id, workflow_ids in sorted(assignments.items())
+            }
+        )
 
 
 class JobStore(_JsonStore):
