@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Phone Controller · Authentication</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="{{ url_for('static', filename='favicon.svg') }}"
+    />
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+  </head>
+  <body class="auth-page">
+    <main class="auth-shell">
+      <section class="card auth-card">
+        <p class="eyebrow">PHONE CONTROLLER</p>
+
+        {% if mode == "setup" %}
+        <h1>Set up administrator</h1>
+        <p>Create the local administrator account for this computer.</p>
+        <form method="post" action="{{ url_for('auth_setup') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <label
+            >Username<input
+              name="username"
+              autocomplete="username"
+              maxlength="80"
+              required
+              autofocus
+          /></label>
+          <label
+            >Password<input
+              name="password"
+              type="password"
+              autocomplete="new-password"
+              minlength="12"
+              required
+          /></label>
+          <label
+            >Confirm password<input
+              name="confirm_password"
+              type="password"
+              autocomplete="new-password"
+              minlength="12"
+              required
+          /></label>
+          <button class="primary" type="submit">Continue</button>
+        </form>
+
+        {% elif mode == "setup_verify" %}
+        <h1>Set up authenticator</h1>
+        <p>
+          Scan this QR code with Google Authenticator, Microsoft Authenticator,
+          or another compatible app.
+        </p>
+        <img
+          class="auth-qr"
+          src="{{ qr_data_uri }}"
+          alt="Authenticator setup QR code"
+        />
+        <p>Manual key: <code class="auth-secret">{{ manual_secret }}</code></p>
+        <form method="post" action="{{ url_for('auth_setup_verify') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <label
+            >6-digit code<input
+              name="code"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              pattern="[0-9]{6}"
+              maxlength="6"
+              required
+              autofocus
+          /></label>
+          <button class="primary" type="submit">Verify and finish setup</button>
+        </form>
+
+        {% elif mode == "recovery_codes" %}
+        <h1>{{ title }}</h1>
+        <p>
+          Store these one-time codes securely. They will not be shown again.
+        </p>
+        <ul class="recovery-code-list">
+          {% for code in recovery_codes %}
+          <li><code>{{ code }}</code></li>
+          {% endfor %}
+        </ul>
+        <a class="button primary" href="{{ url_for('index', mode='admin') }}"
+          >Continue to Admin</a
+        >
+
+        {% elif mode == "login" %}
+        <h1>Administrator login</h1>
+        <form method="post" action="{{ url_for('auth_login_page') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <label
+            >Username<input
+              name="username"
+              autocomplete="username"
+              maxlength="80"
+              required
+              autofocus
+          /></label>
+          <label
+            >Password<input
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+          /></label>
+          <button class="primary" type="submit">Continue</button>
+        </form>
+
+        {% elif mode == "verify" %}
+        <h1>Two-factor verification</h1>
+        <p>
+          Enter the current authenticator code for
+          <strong>{{ username }}</strong>.
+        </p>
+        <form method="post" action="{{ url_for('auth_verify') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <label
+            >6-digit code<input
+              name="code"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              pattern="[0-9]{6}"
+              maxlength="6"
+              required
+              autofocus
+          /></label>
+          <button class="primary" type="submit">Login</button>
+        </form>
+        <p><a href="{{ url_for('auth_recovery') }}">Use recovery code</a></p>
+
+        {% elif mode == "recovery" %}
+        <h1>Use recovery code</h1>
+        <p>
+          Enter one unused recovery code for <strong>{{ username }}</strong>.
+        </p>
+        <form method="post" action="{{ url_for('auth_recovery') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <label
+            >Recovery code<input
+              name="code"
+              autocomplete="one-time-code"
+              required
+              autofocus
+          /></label>
+          <button class="primary" type="submit">Login</button>
+        </form>
+        <p><a href="{{ url_for('auth_verify') }}">Use authenticator code</a></p>
+
+        {% else %}
+        <h1>{{ title }}</h1>
+        {% endif %} {% if error %}
+        <p class="device-error" role="alert">{{ error }}</p>
+        {% endif %}
+      </section>
+    </main>
+  </body>
+</html>

@@ -12,7 +12,17 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from types import SimpleNamespace
 
-from flask import Flask, Response, g, jsonify, render_template, request
+from flask import (
+    Flask,
+    Response,
+    g,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from werkzeug.exceptions import HTTPException
 
 from android_control import AndroidControl, DeviceError, validate_key
@@ -26,8 +36,16 @@ from camera_manager import (
 )
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
-from automation.auth import UserStore, admin_required, register_auth, require_admin
+from automation.auth import (
+    UserStore,
+    admin_required,
+    authenticated_admin,
+    load_or_create_secret_key,
+    register_auth,
+    require_admin,
+)
 from automation.context import AutomationContext
+from automation.diagnostics import install_recent_log_handler
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
 from automation.jobs.storage import DeviceWorkflowAssignmentStore
@@ -37,6 +55,7 @@ from hardware.raspberry_pi_input import RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
+DEVELOPER_MODE_KEY = "ocean"
 
 
 class ControlState:
@@ -401,20 +420,19 @@ def create_app(
             shared_camera=not isinstance(camera, Camera),
         )
     camera = camera_manager.activate(selected_camera_device)
+    auth_store = auth_store or UserStore()
     app = Flask(__name__)
-    secret_key = os.environ.get("PHONE_DASHBOARD_SECRET_KEY")
-    if not secret_key:
-        secret_key = secrets.token_bytes(32)
-        LOG.warning(
-            "PHONE_DASHBOARD_SECRET_KEY is not set; admin sessions will reset "
-            "when this process restarts."
-        )
+    secret_key = load_or_create_secret_key(auth_store.path.parent)
     app.config.update(
         MAX_CONTENT_LENGTH=1024 * 1024,
         TRUSTED_HOSTS=["localhost", "127.0.0.1"],
         SECRET_KEY=secret_key,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.environ.get("PHONE_SESSION_COOKIE_SECURE", "")
+        .strip()
+        .casefold()
+        in {"1", "true", "yes", "on"},
     )
     preview_debug = os.environ.get("CAMERA_PREVIEW_DEBUG", "").strip().casefold() in {
         "1",
@@ -451,11 +469,13 @@ def create_app(
     )
     app.extensions["control_state"] = state
     app.extensions["camera_manager"] = camera_manager
-    app.extensions["auth_user_store"] = auth_store or UserStore()
+    app.extensions["auth_user_store"] = auth_store
     app.extensions["device_workflow_assignment_store"] = (
         device_workflow_store or DeviceWorkflowAssignmentStore()
     )
     app.config["CONTROL_TOKEN"] = token
+    diagnostics = install_recent_log_handler(secrets=(token, secret_key))
+    app.extensions["recent_diagnostics"] = diagnostics
 
     @app.before_request
     def protect_local_requests():
@@ -466,13 +486,24 @@ def create_app(
         # Reject cross-site fetches/embeds, including camera requests. No CORS enabled.
         if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
             return jsonify(error="Only same-origin local requests are accepted."), 403
-        if request.method != "GET":
+        browser_auth_form = request.path in {
+            "/setup",
+            "/setup/verify",
+            "/login",
+            "/login/2fa",
+            "/login/recovery",
+            "/logout",
+        }
+        auth_api = request.path.startswith("/api/auth/")
+        if request.method != "GET" and not browser_auth_form and not auth_api:
             if not secrets.compare_digest(
                 request.headers.get("X-Control-Token", ""), token
             ):
                 return jsonify(error="Invalid control token. Reload this page."), 403
             if not request.is_json:
                 return jsonify(error="Expected a JSON request."), 415
+        if request.method != "GET" and auth_api and not request.is_json:
+            return jsonify(error="Expected a JSON request."), 415
 
     @app.after_request
     def local_headers(response):
@@ -560,16 +591,41 @@ def create_app(
 
     @app.get("/")
     def index():
+        supplied_key = request.args.get("key")
+        if (
+            authenticated_admin()
+            and isinstance(supplied_key, str)
+            and secrets.compare_digest(supplied_key, DEVELOPER_MODE_KEY)
+        ):
+            session["developer_mode"] = True
+            return redirect(url_for("index"))
         return render_template(
             "index.html",
             control_token=token,
             preview_debug=preview_debug,
+            developer_mode=(
+                authenticated_admin() and session.get("developer_mode") is True
+            ),
         )
 
     @app.get("/api/status")
     def status():
         with state.lock:
             return jsonify(state.snapshot(client_id()))
+
+    @app.get("/api/diagnostics/logs")
+    @admin_required
+    def diagnostics_logs():
+        query = request.args.get("query", "")
+        if len(query) > 100:
+            raise ValueError("Diagnostic log filter must be at most 100 characters.")
+        try:
+            limit = int(request.args.get("limit", "300"))
+        except ValueError:
+            raise ValueError("Diagnostic log limit must be an integer.") from None
+        if not 1 <= limit <= 500:
+            raise ValueError("Diagnostic log limit must be between 1 and 500.")
+        return jsonify(logs=diagnostics.recent(limit=limit, query=query))
 
     @app.get("/api/pi/status")
     def pi_status():

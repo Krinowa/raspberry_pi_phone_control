@@ -7,6 +7,11 @@
     <meta name="preview-debug" content="{{ '1' if preview_debug else '0' }}" />
     <title>Phone · Local control</title>
     <link
+      rel="icon"
+      type="image/svg+xml"
+      href="{{ url_for('static', filename='favicon.svg') }}"
+    />
+    <link
       rel="stylesheet"
       href="{{ url_for('static', filename='style.css') }}"
     />
@@ -20,7 +25,10 @@
       src="{{ url_for('static', filename='workflows.js') }}"
     ></script>
   </head>
-  <body data-dashboard-mode="operate">
+  <body
+    data-dashboard-mode="operate"
+    data-developer-tools="{{ 'enabled' if developer_mode else 'disabled' }}"
+  >
     <main>
       <header>
         <div>
@@ -40,7 +48,7 @@
         </button>
         <span id="admin-session" class="admin-session" hidden>
           Admin: <strong id="admin-session-username"></strong>
-          <button id="admin-logout" type="button">Lock Admin</button>
+          <button id="admin-logout" type="button">Logout</button>
         </span>
       </nav>
       <div
@@ -247,15 +255,49 @@
         </div>
         <p id="device-error" class="device-error" role="alert" hidden></p>
       </section>
-      <section id="jobs" class="card jobs-card operate-only" hidden>
+      <section
+        id="jobs"
+        class="card jobs-card admin-only developer-only"
+        hidden
+      >
         <div class="section-heading">
           <div>
-            <h2>Jobs</h2>
-            <p class="small">Persistent account-routed execution queues.</p>
+            <h2>Job History</h2>
+            <p class="small">Persistent job audit and diagnostic history.</p>
           </div>
         </div>
         <p id="jobs-state" role="status" aria-live="polite">Loading jobs…</p>
         <div id="jobs-list" class="jobs-list"></div>
+      </section>
+      <section
+        id="diagnostics"
+        class="card diagnostics-card admin-only developer-only"
+      >
+        <div class="section-heading">
+          <div>
+            <h2>Diagnostics / Logs</h2>
+            <p class="small">
+              Recent redacted application activity for support.
+            </p>
+          </div>
+          <button id="diagnostics-refresh" type="button">Refresh Logs</button>
+        </div>
+        <div class="diagnostics-tools">
+          <label>
+            Filter logs
+            <input
+              id="diagnostics-filter"
+              type="search"
+              maxlength="100"
+              placeholder="camera, OCR, workflow…"
+            />
+          </label>
+          <button id="diagnostics-copy" type="button">Copy</button>
+        </div>
+        <p id="diagnostics-state" class="small" role="status"></p>
+        <pre id="diagnostics-output" aria-label="Recent application logs">
+Select Refresh Logs to load recent activity.</pre
+        >
       </section>
       <section id="ocr-settings" class="card ocr-settings-card admin-only">
         <div class="section-heading">
@@ -1403,7 +1445,7 @@
             aria-label="Recent workflow activity"
           ></pre>
         </div>
-        <details id="workflow-debug" class="admin-only">
+        <details id="workflow-debug" class="admin-only developer-only">
           <summary>Advanced / Debug</summary>
           <p id="workflow-backend"></p>
           <pre id="workflow-debug-data"></pre>

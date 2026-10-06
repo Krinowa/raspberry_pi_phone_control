@@ -6,3 +6,5 @@ python-dotenv==1.2.3
 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
 paddlepaddle==3.3.0
 paddleocr>=3.3,<4
+pyotp>=2.9,<3
+qrcode[pil]>=7.4,<9

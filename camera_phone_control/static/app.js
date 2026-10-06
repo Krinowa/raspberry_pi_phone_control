@@ -73,7 +73,12 @@ const PREVIEW_INTERVAL_MS = 65;
 const PREVIEW_ERROR_RETRY_MS = 600;
 const PREVIEW_BACKGROUND_MS = 1000;
 let dashboardMode = "operate";
-let adminSession = { authenticated: false, username: null, role: null };
+let adminSession = {
+  authenticated: false,
+  username: null,
+  role: null,
+  admin_configured: false,
+};
 let recoveryPanelOpen = false;
 let recoveryRequestInFlight = false;
 let recoveryTargetJobId = null;
@@ -85,10 +90,12 @@ let readyVerificationRestoreManual = false;
 let readyVerificationRestoreInFlight = false;
 let readyVerificationRestorePromise = null;
 let readyVerificationFinishInFlight = false;
+let returnedDeviceId = null;
 let previewGesture = null;
 let suppressPreviewClick = false;
 let ocrOperationalHealthy = null;
 let workflowRuntime = null;
+let diagnosticsLogs = [];
 
 function setDashboardMode(mode) {
   dashboardMode =
@@ -114,6 +121,54 @@ function renderAdminSession() {
     : "";
 }
 
+function formatDiagnosticLog(entry) {
+  return `${entry.timestamp || "—"} ${entry.level || "INFO"} [${entry.logger || "app"}] ${entry.message || ""}`;
+}
+
+async function loadDiagnostics() {
+  const output = $("diagnostics-output");
+  const status = $("diagnostics-state");
+  const refresh = $("diagnostics-refresh");
+  refresh.disabled = true;
+  status.textContent = "Loading recent logs…";
+
+  try {
+    const filter = $("diagnostics-filter").value.trim();
+    const query = filter ? `?query=${encodeURIComponent(filter)}` : "";
+    const result = await api(
+      `/api/diagnostics/logs${query}`,
+      undefined,
+      "GET",
+      { monitor: false },
+    );
+
+    diagnosticsLogs = Array.isArray(result.logs) ? result.logs : [];
+    output.textContent = diagnosticsLogs.length
+      ? diagnosticsLogs.map(formatDiagnosticLog).join("\n")
+      : "No matching application logs.";
+
+    status.textContent = `${diagnosticsLogs.length} recent log entr${diagnosticsLogs.length === 1 ? "y" : "ies"}.`;
+    output.scrollTop = output.scrollHeight;
+  } catch (error) {
+    output.textContent =
+      "Logs are available only to an authenticated administrator.";
+    status.textContent = error.message;
+  } finally {
+    refresh.disabled = false;
+  }
+}
+
+async function copyDiagnostics() {
+  const value = $("diagnostics-output").textContent;
+  if (!navigator.clipboard?.writeText) {
+    notice("Copy is not available in this browser.", true);
+    return;
+  }
+
+  await navigator.clipboard.writeText(value);
+  $("diagnostics-state").textContent = "Logs copied.";
+}
+
 function closeAdminLogin() {
   $("admin-login-dialog").hidden = true;
   $("admin-login-password").value = "";
@@ -128,7 +183,12 @@ function openAdminLogin() {
 }
 
 function lockAdminState() {
-  adminSession = { authenticated: false, username: null, role: null };
+  adminSession = {
+    authenticated: false,
+    username: null,
+    role: null,
+    admin_configured: true,
+  };
   setDashboardMode("operate");
   renderAdminSession();
 }
@@ -140,11 +200,32 @@ async function loadAdminSession() {
     });
     adminSession = result.authenticated
       ? result
-      : { authenticated: false, username: null, role: null };
+      : {
+          authenticated: false,
+          username: null,
+          role: null,
+          admin_configured: Boolean(result.admin_configured),
+        };
   } catch {
-    adminSession = { authenticated: false, username: null, role: null };
+    adminSession = {
+      authenticated: false,
+      username: null,
+      role: null,
+      admin_configured: false,
+    };
   }
-  if (!adminSession.authenticated) setDashboardMode("operate");
+  const requestedMode =
+    typeof location !== "undefined" &&
+    /(?:^|[?&])mode=admin(?:&|$)/.test(location.search || "");
+  if (
+    adminSession.authenticated &&
+    (requestedMode || adminSession.developer_mode === true)
+  ) {
+    setDashboardMode("admin");
+    window.history?.replaceState?.(null, "", location.pathname);
+  } else if (!adminSession.authenticated) {
+    setDashboardMode("operate");
+  }
   renderAdminSession();
 }
 
@@ -359,6 +440,67 @@ const jobService = {
   retry: (jobId, mode) =>
     api(`/api/jobs/${encodeURIComponent(jobId)}/retry`, { mode }),
 };
+
+function latestRelevantJobForDevice(deviceId) {
+  const jobs = Array.isArray(jobCatalog) ? jobCatalog : [];
+  return [...jobs].reverse().find((job) => job.device_id === deviceId) || null;
+}
+
+function availableJobActions(job) {
+  if (!job) return [];
+  if (["QUEUED", "WAITING_FOR_DEVICE", "RUNNING"].includes(job.status))
+    return ["cancel"];
+  if (!["FAILED", "INTERRUPTED"].includes(job.status)) return [];
+  if (job.recovery_status === "NEEDS_ATTENTION") return ["manual_assistance"];
+  if (job.recovery_status !== "READY") return [];
+  return [
+    ...(Number.isInteger(job.failed_step_index) ? ["retry_failed_step"] : []),
+    "restart",
+  ];
+}
+
+async function cancelExternalJob(job) {
+  if (jobCancelsInFlight.has(job.job_id)) return;
+  if (
+    job.status === "RUNNING" &&
+    typeof window.confirm === "function" &&
+    !window.confirm(
+      "Cancel this running job? The physical phone may already have changed.",
+    )
+  )
+    return;
+  jobCancelsInFlight.add(job.job_id);
+  renderDevices();
+  renderJobs();
+  try {
+    const updated = await jobService.cancel(job.job_id);
+    jobCatalog = jobCatalog.map((candidate) =>
+      candidate.job_id === updated.job_id ? updated : candidate,
+    );
+
+    if (updated.status === "CANCELLED") {
+      if (recoveryTargetJobId === updated.job_id) {
+        recoveryTargetJobId = null;
+        recoveryPanelOpen = false;
+        manualAssistanceOpen = false;
+        readyVerificationJobId = null;
+        readyVerificationFailedJobId = null;
+        readyVerificationMessage = "";
+        readyVerificationRestoreManual = false;
+      }
+
+      if (workflowRuntime?.device_id === updated.device_id)
+        workflowRuntime = null;
+    }
+  } catch (error) {
+    notice(`Could not cancel job: ${error.message}`, true);
+  } finally {
+    jobCancelsInFlight.delete(job.job_id);
+    renderDevices();
+    renderJobs();
+    renderOperationalRecovery();
+  }
+}
 
 async function retryExternalJob(job, mode) {
   if (jobRetriesInFlight.has(job.job_id)) return;
@@ -727,6 +869,47 @@ function startDevicePreview(deviceId, image, placeholder) {
   image.src = `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`;
 }
 
+function createDeviceJobActions(job, deviceId) {
+  const actions = document.createElement("div");
+  actions.className = "device-job-actions";
+
+  for (const action of availableJobActions(job)) {
+    const button = document.createElement("button");
+    button.type = "button";
+
+    if (action === "manual_assistance") {
+      button.className = "primary danger-action";
+      button.textContent = "Manual Assistance";
+      button.disabled = deviceManagementBlocked();
+      button.addEventListener("click", () =>
+        resolveDeviceIssue(deviceId, job.job_id),
+      );
+    } else if (action === "retry_failed_step") {
+      button.textContent = "Retry Failed Step";
+      button.disabled = jobRetriesInFlight.has(job.job_id);
+      button.addEventListener("click", () =>
+        retryExternalJob(job, "failed_step"),
+      );
+    } else if (action === "restart") {
+      button.textContent = "Restart Workflow";
+      button.disabled = jobRetriesInFlight.has(job.job_id);
+      button.addEventListener("click", () => retryExternalJob(job, "restart"));
+    } else if (action === "cancel") {
+      button.className = "stop";
+      button.textContent = job.cancel_requested
+        ? "Cancellation requested"
+        : jobCancelsInFlight.has(job.job_id)
+          ? "Cancelling…"
+          : "Cancel";
+      button.disabled =
+        !!job.cancel_requested || jobCancelsInFlight.has(job.job_id);
+      button.addEventListener("click", () => cancelExternalJob(job));
+    }
+    actions.append(button);
+  }
+  return actions;
+}
+
 function renderDevices() {
   stopDevicePreviews();
   const devices = Array.isArray(deviceCatalog?.devices)
@@ -745,15 +928,18 @@ function renderDevices() {
     const details = deviceCameraDetails?.[device.id] || {};
     const camera = details.config || {};
     const status = cameraState(details);
-    const deviceJobs = [...jobCatalog]
-      .reverse()
-      .filter((job) => job.device_id === device.id);
-    const recoveryJob = deviceJobs.find(
-      (job) =>
-        ["FAILED", "INTERRUPTED"].includes(job.status) &&
-        job.recovery_status !== "READY",
-    );
-    const runningJob = deviceJobs.find((job) => job.status === "RUNNING");
+    const latestJob = latestRelevantJobForDevice(device.id);
+    const recoveryJob =
+      latestJob &&
+      ["FAILED", "INTERRUPTED"].includes(latestJob.status) &&
+      latestJob.recovery_status !== "READY"
+        ? latestJob
+        : null;
+    const activeJob =
+      latestJob &&
+      ["QUEUED", "WAITING_FOR_DEVICE", "RUNNING"].includes(latestJob.status)
+        ? latestJob
+        : null;
     const manualWorkflowNeedsAttention =
       workflowRuntime?.status === "failed" &&
       workflowRuntime?.device_id === device.id;
@@ -764,7 +950,7 @@ function renderDevices() {
         : "needs-attention"
       : manualWorkflowNeedsAttention
         ? "needs-attention"
-        : runningJob
+        : activeJob
           ? "running"
           : device.connected
             ? "ready"
@@ -777,13 +963,16 @@ function renderDevices() {
         : "") +
       (device.id === selected ? " selected" : "");
     card.dataset.state = operationalState;
+    card.dataset.deviceId = device.id;
+    if (device.id === returnedDeviceId)
+      card.className += " device-card--returned";
 
     const heading = document.createElement("div");
     heading.className = "device-item-heading";
     const name = document.createElement("h3");
     name.textContent = device.name || device.id;
     const logicalId = document.createElement("span");
-    logicalId.className = "device-logical-id";
+    logicalId.className = "device-logical-id admin-only";
     logicalId.textContent = device.id;
     const badges = document.createElement("div");
     badges.className = "device-badges";
@@ -805,7 +994,7 @@ function renderDevices() {
     operationalBadge.className = `badge device-state-badge device-state-badge--${operationalState}`;
     operationalBadge.textContent =
       operationalState === "needs-attention"
-        ? "Needs Attention"
+        ? "⚠ Needs Attention"
         : operationalState === "recovering"
           ? "Recovering"
           : operationalState === "running"
@@ -894,6 +1083,7 @@ function renderDevices() {
         }`
       : "No account assigned";
     const accountId = document.createElement("span");
+    accountId.className = "admin-only";
     accountId.textContent = binding?.account_id || "—";
     accountSummary.append(accountHeading, accountName, accountId);
 
@@ -926,27 +1116,41 @@ function renderDevices() {
         : "Execution disabled";
     workflowSummary.append(workflowHeading, workflowNames, workflowCount);
 
-    let issueSummary = null;
-    if (operationalState === "needs-attention") {
-      issueSummary = document.createElement("p");
-      issueSummary.className = "device-issue-summary";
+    let jobSummary = null;
+    if (latestJob) {
+      jobSummary = document.createElement("div");
+      jobSummary.className = "device-job-summary";
 
+      const phoneState = document.createElement("strong");
+      phoneState.textContent =
+        latestJob.recovery_status === "NEEDS_ATTENTION"
+          ? "Phone state: Needs Attention"
+          : latestJob.recovery_status === "RECOVERING"
+            ? "Phone state: Recovering"
+            : "Phone state: Ready";
+
+      const jobState = document.createElement("span");
+      jobState.textContent = `${activeJob ? "Current" : "Last"} job: ${latestJob.status}`;
+      jobSummary.append(phoneState, jobState);
+      const reason =
+        latestJob.recovery_error || latestJob.error || latestJob.result;
+
+      if (reason) {
+        const message = document.createElement("span");
+        message.className = latestJob.error ? "job-error" : "job-result";
+        message.textContent = `Reason: ${friendlyOperationalError(String(reason))}`;
+        jobSummary.append(message);
+      }
+    } else if (manualWorkflowNeedsAttention) {
+      jobSummary = document.createElement("div");
+      jobSummary.className = "device-job-summary device-issue-summary";
       const issueLabel = document.createElement("strong");
-      issueLabel.textContent = "Last issue:";
-
+      issueLabel.textContent = "Phone state: Needs Attention";
       const issueMessage = document.createElement("span");
-      const manualWorkflowMessage =
-        workflowRuntime?.device_id === device.id
-          ? workflowRuntime?.message
-          : null;
-
       issueMessage.textContent = friendlyOperationalError(
-        recoveryJob?.recovery_error ||
-          recoveryJob?.error ||
-          manualWorkflowMessage ||
-          "This phone needs attention.",
+        workflowRuntime?.message || "This phone needs attention.",
       );
-      issueSummary.append(issueLabel, issueMessage);
+      jobSummary.append(issueLabel, issueMessage);
     }
 
     const actions = document.createElement("div");
@@ -958,16 +1162,17 @@ function renderDevices() {
     select.disabled = device.id === selected || deviceManagementBlocked();
     select.addEventListener("click", () => selectDashboardDevice(device.id));
 
-    let resolve = null;
-    if (operationalState === "needs-attention") {
-      resolve = document.createElement("button");
-      resolve.type = "button";
-      resolve.className = "primary device-resolve";
-      resolve.textContent = "Resolve";
-      resolve.disabled = deviceManagementBlocked();
-      resolve.addEventListener("click", () =>
-        resolveDeviceIssue(device.id, recoveryJob?.job_id || null),
+    const jobActions = createDeviceJobActions(latestJob, device.id);
+    if (!latestJob && manualWorkflowNeedsAttention) {
+      const assist = document.createElement("button");
+      assist.type = "button";
+      assist.className = "primary danger-action";
+      assist.textContent = "Manual Assistance";
+      assist.disabled = deviceManagementBlocked();
+      assist.addEventListener("click", () =>
+        resolveDeviceIssue(device.id, null),
       );
+      jobActions.append(assist);
     }
 
     const settings = document.createElement("button");
@@ -1003,7 +1208,7 @@ function renderDevices() {
       deviceDeletesInFlight.has(device.id) || deviceManagementBlocked();
     remove.addEventListener("click", () => deleteDevice(device, remove));
     actions.append(
-      ...(resolve ? [resolve] : []),
+      ...(jobActions.children.length ? [jobActions] : []),
       select,
       settings,
       account,
@@ -1019,7 +1224,7 @@ function renderDevices() {
       accountSummary,
       workflowSummary,
     );
-    if (issueSummary) card.append(issueSummary);
+    if (jobSummary) card.append(jobSummary);
     card.append(actions);
     return card;
   });
@@ -1156,113 +1361,6 @@ function renderJobs() {
               : "Phone state: Needs Attention";
         item.append(recovery);
       }
-      const hasRetryChild = jobCatalog.some(
-        (candidate) => candidate.retry_of_job_id === job.job_id,
-      );
-      if (["FAILED", "INTERRUPTED"].includes(job.status) && !hasRetryChild) {
-        const actions = document.createElement("div");
-        actions.className = "job-recovery-actions";
-        const recoveryAttempted =
-          !!job.recovery_run_id || !!job.recovery_error || !!job.recovered_at;
-        if (job.recovery_workflow_id && !recoveryAttempted) {
-          const recover = document.createElement("button");
-          recover.type = "button";
-          recover.className = "primary";
-          recover.textContent = "Recover Phone";
-          recover.disabled = recoveryRequestInFlight;
-          recover.addEventListener("click", () =>
-            startPhoneRecovery(job.job_id),
-          );
-          actions.append(recover);
-        }
-        if (
-          !job.recovery_workflow_id ||
-          (job.recovery_status === "NEEDS_ATTENTION" && recoveryAttempted)
-        ) {
-          const assist = document.createElement("button");
-          assist.type = "button";
-          assist.textContent = "Manual Assistance";
-          assist.addEventListener("click", () =>
-            openManualAssistance(job.job_id),
-          );
-          actions.append(assist);
-        }
-        if (job.recovery_status === "READY") {
-          if (Number.isInteger(job.failed_step_index)) {
-            const retryStep = document.createElement("button");
-            retryStep.type = "button";
-            retryStep.textContent = "Retry Failed Step";
-            retryStep.disabled = jobRetriesInFlight.has(job.job_id);
-            retryStep.addEventListener("click", () =>
-              retryExternalJob(job, "failed_step"),
-            );
-            actions.append(retryStep);
-          }
-          const restart = document.createElement("button");
-          restart.type = "button";
-          restart.textContent = "Restart Workflow";
-          restart.disabled = jobRetriesInFlight.has(job.job_id);
-          restart.addEventListener("click", () =>
-            retryExternalJob(job, "restart"),
-          );
-          actions.append(restart);
-        }
-        if (actions.children.length) item.append(actions);
-      }
-      if (["QUEUED", "WAITING_FOR_DEVICE", "RUNNING"].includes(job.status)) {
-        const cancel = document.createElement("button");
-        cancel.type = "button";
-        cancel.className = "job-cancel stop";
-        const cancellationPending =
-          job.cancel_requested || jobCancelsInFlight.has(job.job_id);
-        cancel.textContent = job.cancel_requested
-          ? "Cancellation requested"
-          : jobCancelsInFlight.has(job.job_id)
-            ? "Cancelling…"
-            : "Cancel";
-        cancel.disabled = cancellationPending;
-        cancel.addEventListener("click", async () => {
-          if (jobCancelsInFlight.has(job.job_id)) return;
-          if (
-            job.status === "RUNNING" &&
-            typeof window.confirm === "function" &&
-            !window.confirm(
-              "Cancel this running job? The physical phone may already have changed.",
-            )
-          )
-            return;
-          jobCancelsInFlight.add(job.job_id);
-          renderJobs();
-          try {
-            const updated = await jobService.cancel(job.job_id);
-            jobCatalog = jobCatalog.map((candidate) =>
-              candidate.job_id === updated.job_id ? updated : candidate,
-            );
-
-            if (updated.status === "CANCELLED") {
-              if (recoveryTargetJobId === updated.job_id) {
-                recoveryTargetJobId = null;
-                recoveryPanelOpen = false;
-                manualAssistanceOpen = false;
-                readyVerificationJobId = null;
-                readyVerificationFailedJobId = null;
-                readyVerificationMessage = "";
-                readyVerificationRestoreManual = false;
-              }
-
-              if (workflowRuntime?.device_id === updated.device_id) {
-                workflowRuntime = null;
-              }
-            }
-          } catch (error) {
-            notice(`Could not cancel job: ${error.message}`, true);
-          } finally {
-            jobCancelsInFlight.delete(job.job_id);
-            renderJobs();
-          }
-        });
-        item.append(cancel);
-      }
       return item;
     });
 
@@ -1367,12 +1465,10 @@ function currentOperationalIssue() {
       recommendation:
         targetJob.recovery_status === "NEEDS_ATTENTION" && recoveryAttempted
           ? "Resolve the phone issue and verify the expected starting screen before further work."
-          : targetJob.recovery_workflow_id
-            ? "Run the configured recovery workflow. The failed job will not be retried."
-            : "No recovery workflow is configured. Resolve the phone issue manually or open Admin to configure one.",
+          : "Use Manual Assistance to restore the phone, then verify its expected starting screen.",
       state: "Needs Attention",
-      recoverAvailable: !!targetJob.recovery_workflow_id && !recoveryAttempted,
-      manualAvailable: !targetJob.recovery_workflow_id || recoveryAttempted,
+      recoverAvailable: false,
+      manualAvailable: true,
     };
   }
   if (ocrOperationalHealthy === false)
@@ -1436,6 +1532,7 @@ function renderOperationalRecovery() {
         "Ready screen detected. Releasing manual control…";
       void finishSuccessfulReadyVerification(recoveryJob.job_id);
     } else {
+      const recoveredDeviceId = recoveryJob.device_id;
       readyVerificationJobId = null;
       readyVerificationFailedJobId = null;
       readyVerificationMessage = "";
@@ -1443,7 +1540,7 @@ function renderOperationalRecovery() {
       manualAssistanceOpen = false;
       recoveryPanelOpen = false;
       recoveryTargetJobId = null;
-      renderDevices();
+      returnToDeviceCard(recoveredDeviceId);
       issue = currentOperationalIssue();
     }
   } else if (
@@ -1633,10 +1730,8 @@ async function verifyPhoneReady() {
         recoveryTargetJobId = null;
 
         renderJobs();
-        renderDevices();
+        returnToDeviceCard(updated.device_id);
         renderOperationalRecovery();
-
-        notice("Phone marked ready. Failed job was not retried.");
       } catch (error) {
         readyVerificationMessage = `Phone could not be marked ready: ${friendlyOperationalError(error.message)}`;
 
@@ -1690,12 +1785,31 @@ async function closeManualAssistance() {
   renderOperationalRecovery();
 }
 
+function returnToDeviceCard(deviceId) {
+  if (!deviceId) return;
+  returnedDeviceId = deviceId;
+  deviceRenderSignature = null;
+  renderDevices();
+  const card = Array.from($("device-list").children || []).find(
+    (candidate) => candidate.dataset?.deviceId === deviceId,
+  );
+  card?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+  notice("Phone restored and ready.");
+  void loadDevices();
+  setTimeout(() => {
+    if (returnedDeviceId !== deviceId) return;
+    returnedDeviceId = null;
+    card?.classList?.remove?.("device-card--returned");
+  }, 2400);
+}
+
 function viewOperationalDetails() {
   const issue = currentOperationalIssue();
   if (issue?.kind === "job") {
-    const details = $("jobs-list").querySelector?.("details");
-    if (details) details.open = true;
-    $("jobs").scrollIntoView?.({ block: "start", behavior: "smooth" });
+    const card = Array.from($("device-list").children || []).find(
+      (candidate) => candidate.dataset?.deviceId === issue.job.device_id,
+    );
+    card?.scrollIntoView?.({ block: "center", behavior: "smooth" });
     return;
   }
   if (issue?.kind === "workflow") {
@@ -2062,7 +2176,7 @@ async function resolveDeviceIssue(deviceId, jobId) {
   readyVerificationMessage = "";
   readyVerificationRestoreManual = false;
   const issue = currentOperationalIssue();
-  manualAssistanceOpen = !!issue?.manualAvailable;
+  manualAssistanceOpen = !!jobId || !!issue?.manualAvailable;
   renderOperationalRecovery();
   $(
     manualAssistanceOpen ? "manual-control-card" : "operate-recovery",
@@ -2915,11 +3029,13 @@ async function restoreManualControlAfterVerificationFailure() {
 async function finishSuccessfulReadyVerification(jobId) {
   if (readyVerificationFinishInFlight) return;
   readyVerificationFinishInFlight = true;
+  let recoveredDeviceId = null;
   try {
     if (readyVerificationRestorePromise) await readyVerificationRestorePromise;
     if (manual) await disable();
     const verified = jobCatalog.find((job) => job.job_id === jobId);
     if (verified?.recovery_status !== "READY") return;
+    recoveredDeviceId = verified.device_id;
 
     readyVerificationJobId = null;
     readyVerificationFailedJobId = null;
@@ -2937,7 +3053,8 @@ async function finishSuccessfulReadyVerification(jobId) {
     notice(error.message, true);
   } finally {
     readyVerificationFinishInFlight = false;
-    renderDevices();
+    if (recoveredDeviceId) returnToDeviceCard(recoveredDeviceId);
+    else renderDevices();
     renderOperationalRecovery();
   }
 }
@@ -3327,7 +3444,7 @@ $("dashboard-operate").addEventListener("click", () =>
 
 $("dashboard-admin").addEventListener("click", () => {
   if (adminSession.authenticated) setDashboardMode("admin");
-  else openAdminLogin();
+  else location.assign(adminSession.admin_configured ? "/login" : "/setup");
 });
 $("admin-login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -3336,7 +3453,7 @@ $("admin-login-form").addEventListener("submit", async (event) => {
   submit.disabled = true;
   error.hidden = true;
   try {
-    adminSession = await api(
+    const loginResult = await api(
       "/api/auth/login",
       {
         username: $("admin-login-username").value.trim(),
@@ -3345,6 +3462,11 @@ $("admin-login-form").addEventListener("submit", async (event) => {
       "POST",
       { monitor: false },
     );
+    if (loginResult.requires_2fa) {
+      location.assign("/login/2fa");
+      return;
+    }
+    adminSession = loginResult;
     closeAdminLogin();
     renderAdminSession();
     setDashboardMode("admin");
@@ -3365,12 +3487,26 @@ $("admin-logout").addEventListener("click", async () => {
   try {
     await api("/api/auth/logout", {}, "POST", { monitor: false });
   } catch (error) {
-    notice(`Could not lock Admin: ${error.message}`, true);
+    notice(`Could not log out: ${error.message}`, true);
     await loadAdminSession();
     return;
   }
   lockAdminState();
 });
+$("diagnostics-refresh").addEventListener(
+  "click",
+  () => void loadDiagnostics(),
+);
+$("diagnostics-filter").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    void loadDiagnostics();
+  }
+});
+$("diagnostics-copy").addEventListener(
+  "click",
+  () => void copyDiagnostics().catch((error) => notice(error.message, true)),
+);
 $("operate-resolve-issue").addEventListener("click", () => {
   const issue = currentOperationalIssue();
   if (issue?.job) recoveryTargetJobId = issue.job.job_id;
