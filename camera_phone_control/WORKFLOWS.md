@@ -604,6 +604,51 @@ fails clearly instead of falling back to a fixed delay.
 
 ## Optional ROI-first text waits
 
+### Read Balance and receipt outputs
+
+In the workflow review/editor, **Read Balance** reuses the calibrated **Region OCR**
+picker. Select the displayed balance, test the crop, choose the `currency` parser,
+and set the output name to `payer_balance`. Save the step at the selected insert
+position. This adds an instruction; it does not read the balance until playback.
+
+```json
+{
+  "type": "ocr_value",
+  "label": "Read balance",
+  "roi": { "x": 0.12, "y": 0.18, "width": 0.65, "height": 0.1 },
+  "parser": "currency",
+  "output": "payer_balance"
+}
+```
+
+The ROI above is illustrative: measure it on the actual calibrated phone screen.
+The step passes only that crop to the existing OCR provider and worker pool. It
+requires one unambiguous amount with two decimal places, optionally prefixed by
+`RM`, `MYR`, `Balance`, or `Available Balance`. Malformed or multiple amounts fail
+the step. Monetary parsing uses `Decimal`; run outputs serialize the value as a
+decimal string, such as `"8230.50"`. Outputs belong to the individual run and are
+separate from workflow input variables.
+
+**Insert Screenshot** and screenshot editing have an optional output name. Set
+it to `receipt_path` to retain the saved image's absolute local path in run
+outputs. The existing color calibrated image, JPEG encoding, daily directories,
+and screenshot metadata remain unchanged. Omitting the output name preserves
+ordinary screenshot behavior.
+
+```json
+{ "type": "capture_screen", "label": "Receipt", "output_key": "receipt_path" }
+```
+
+Successful external jobs persist their run outputs internally. A screenshot or
+a successful balance read alone does not prove a payment succeeded.
+
+Withdraw Bot v2 uses these run outputs only after an administrator enables a
+device's separately configured integration, balance workflow, and main payment
+workflow. The bot will not lock work without a valid balance read, and it never
+replays an interrupted payment.
+
+### Text-wait ROI behavior
+
 Only `wait_for_text` uses ROI. The same Region OCR component is mounted in the
 live recording expected-text dialog, the recording review **Insert Wait for
 Text** panel, and the saved-step editor. Enter or select the target text, click

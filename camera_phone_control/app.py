@@ -2,7 +2,6 @@
 
 import argparse
 import base64
-import getpass
 import logging
 import os
 import secrets
@@ -36,19 +35,12 @@ from camera_manager import (
 )
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
-from automation.auth import (
-    UserStore,
-    admin_required,
-    authenticated_admin,
-    load_or_create_secret_key,
-    register_auth,
-    require_admin,
-)
 from automation.context import AutomationContext
 from automation.diagnostics import install_recent_log_handler
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
 from automation.jobs.storage import DeviceWorkflowAssignmentStore
+from automation.integrations.withdraw_v2.manager import register_withdraw
 from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
 from hardware.device_config import DEFAULT_DEVICE_ID
 from hardware.raspberry_pi_input import RaspberryPiInputBridge
@@ -56,6 +48,15 @@ from hardware.raspberry_pi_input import RaspberryPiInputBridge
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
 DEVELOPER_MODE_KEY = "ocean"
+
+
+def local_dashboard_access(view):
+    """Admin is a local dashboard view; mutations remain token protected."""
+    return view
+
+
+def allow_local_dashboard():
+    return None
 
 
 class ControlState:
@@ -385,6 +386,7 @@ def create_app(
     job_store=None,
     device_workflow_store=None,
     start_job_executor=False,
+    start_withdraw_workers=None,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
     auth_store=None,
@@ -420,13 +422,12 @@ def create_app(
             shared_camera=not isinstance(camera, Camera),
         )
     camera = camera_manager.activate(selected_camera_device)
-    auth_store = auth_store or UserStore()
     app = Flask(__name__)
-    secret_key = load_or_create_secret_key(auth_store.path.parent)
+    session_secret = os.environ.get("PHONE_SESSION_SECRET") or secrets.token_hex(32)
     app.config.update(
         MAX_CONTENT_LENGTH=1024 * 1024,
         TRUSTED_HOSTS=["localhost", "127.0.0.1"],
-        SECRET_KEY=secret_key,
+        SECRET_KEY=session_secret,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.environ.get("PHONE_SESSION_COOKIE_SECURE", "")
@@ -469,12 +470,11 @@ def create_app(
     )
     app.extensions["control_state"] = state
     app.extensions["camera_manager"] = camera_manager
-    app.extensions["auth_user_store"] = auth_store
     app.extensions["device_workflow_assignment_store"] = (
         device_workflow_store or DeviceWorkflowAssignmentStore()
     )
     app.config["CONTROL_TOKEN"] = token
-    diagnostics = install_recent_log_handler(secrets=(token, secret_key))
+    diagnostics = install_recent_log_handler(secrets=(token, session_secret))
     app.extensions["recent_diagnostics"] = diagnostics
 
     @app.before_request
@@ -486,24 +486,13 @@ def create_app(
         # Reject cross-site fetches/embeds, including camera requests. No CORS enabled.
         if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
             return jsonify(error="Only same-origin local requests are accepted."), 403
-        browser_auth_form = request.path in {
-            "/setup",
-            "/setup/verify",
-            "/login",
-            "/login/2fa",
-            "/login/recovery",
-            "/logout",
-        }
-        auth_api = request.path.startswith("/api/auth/")
-        if request.method != "GET" and not browser_auth_form and not auth_api:
+        if request.method != "GET":
             if not secrets.compare_digest(
                 request.headers.get("X-Control-Token", ""), token
             ):
                 return jsonify(error="Invalid control token. Reload this page."), 403
             if not request.is_json:
                 return jsonify(error="Expected a JSON request."), 415
-        if request.method != "GET" and auth_api and not request.is_json:
-            return jsonify(error="Expected a JSON request."), 415
 
     @app.after_request
     def local_headers(response):
@@ -587,15 +576,11 @@ def create_app(
             raise ValueError("Missing browser identifier. Reload the page.")
         return client
 
-    register_auth(app, payload, app.extensions["auth_user_store"])
-
     @app.get("/")
     def index():
         supplied_key = request.args.get("key")
-        if (
-            authenticated_admin()
-            and isinstance(supplied_key, str)
-            and secrets.compare_digest(supplied_key, DEVELOPER_MODE_KEY)
+        if isinstance(supplied_key, str) and secrets.compare_digest(
+            supplied_key, DEVELOPER_MODE_KEY
         ):
             session["developer_mode"] = True
             return redirect(url_for("index"))
@@ -603,9 +588,7 @@ def create_app(
             "index.html",
             control_token=token,
             preview_debug=preview_debug,
-            developer_mode=(
-                authenticated_admin() and session.get("developer_mode") is True
-            ),
+            developer_mode=session.get("developer_mode") is True,
         )
 
     @app.get("/api/status")
@@ -614,8 +597,9 @@ def create_app(
             return jsonify(state.snapshot(client_id()))
 
     @app.get("/api/diagnostics/logs")
-    @admin_required
     def diagnostics_logs():
+        if session.get("developer_mode") is not True:
+            return jsonify(error="Developer mode required."), 403
         query = request.args.get("query", "")
         if len(query) > 100:
             raise ValueError("Diagnostic log filter must be at most 100 characters.")
@@ -716,7 +700,7 @@ def create_app(
         return jsonify(result)
 
     @app.post("/api/cameras/test")
-    @admin_required
+    @local_dashboard_access
     def test_camera():
         data = payload()
         if set(data) != {"camera_source", "rotation"}:
@@ -740,7 +724,7 @@ def create_app(
             status = camera_manager.status(device_id, open_camera=True)
             return jsonify({**status, "selected": selected})
 
-        denied = require_admin()
+        denied = allow_local_dashboard()
         if denied is not None:
             return denied
 
@@ -880,7 +864,7 @@ def create_app(
                 workflow_assignment_details(device_id, include_available=True)
             )
 
-        denied = require_admin()
+        denied = allow_local_dashboard()
         if denied is not None:
             return denied
 
@@ -902,9 +886,16 @@ def create_app(
                     f"Workflow {workflow_id!r} does not exist and cannot be assigned."
                 ) from None
 
+        withdraw_manager = app.extensions.get("withdraw_manager")
+        if withdraw_manager is not None:
+            withdraw_manager.workflow_assignment_changed(
+                device_id, data["workflow_ids"]
+            )
         app.extensions["device_workflow_assignment_store"].set(
             device_id, data["workflow_ids"]
         )
+        if withdraw_manager is not None:
+            withdraw_manager.reload_after_workflow_assignment(device_id)
         return jsonify(workflow_assignment_details(device_id, include_available=True))
 
     @app.get("/api/devices/<device_id>/status")
@@ -940,7 +931,7 @@ def create_app(
         return jsonify(require_pi_bridge().enrollment())
 
     @app.post("/api/enrollment/start")
-    @admin_required
+    @local_dashboard_access
     def start_pi_enrollment():
         data = payload()
         if set(data) != {"target_device_id"}:
@@ -953,7 +944,7 @@ def create_app(
         return jsonify(bridge.start_enrollment(data["target_device_id"]))
 
     @app.post("/api/enrollment/stop")
-    @admin_required
+    @local_dashboard_access
     def stop_pi_enrollment():
         data = payload()
         if data:
@@ -961,7 +952,7 @@ def create_app(
         return jsonify(require_pi_bridge().stop_enrollment())
 
     @app.post("/api/devices/<device_id>/replace")
-    @admin_required
+    @local_dashboard_access
     def replace_pi_device(device_id):
         data = payload()
         if data:
@@ -974,7 +965,7 @@ def create_app(
         return jsonify(bridge.replace_device(device_id))
 
     @app.delete("/api/devices/<device_id>")
-    @admin_required
+    @local_dashboard_access
     def delete_pi_device(device_id):
         data = payload()
         if data:
@@ -1181,7 +1172,7 @@ def create_app(
             ), (202 if state.pending else 200)
 
     @app.post("/api/takeover")
-    @admin_required
+    @local_dashboard_access
     def takeover():
         data, client = payload(), client_id()
         if data:
@@ -1246,7 +1237,7 @@ def create_app(
             )
 
     @app.route("/api/calibration", methods=["POST", "DELETE"])
-    @admin_required
+    @local_dashboard_access
     def calibrate():
         data = payload()
         with state.lock:
@@ -1513,8 +1504,8 @@ def create_app(
         device_id=device_id,
         ocr_settings_storage=ocr_settings_storage,
         ocr_resource_provider=ocr_resource_provider,
-        admin_required=admin_required,
-        require_admin=require_admin,
+        admin_required=local_dashboard_access,
+        require_admin=allow_local_dashboard,
     )
     register_jobs(
         app,
@@ -1523,20 +1514,25 @@ def create_app(
         account_store=account_store,
         job_store=job_store,
         start_executor=start_job_executor,
-        admin_required=admin_required,
-        require_admin=require_admin,
+        admin_required=local_dashboard_access,
+        require_admin=allow_local_dashboard,
+    )
+    # Keep workers off in embedded/test applications unless explicitly
+    # requested. The normal server starts them beside the job executor.
+    if start_withdraw_workers is None:
+        start_withdraw_workers = start_job_executor
+    register_withdraw(
+        app,
+        payload,
+        admin_required=local_dashboard_access,
+        ensure_registered_device=app.extensions["ensure_registered_device"],
+        start_workers=start_withdraw_workers,
     )
     return app
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-
-    parser.add_argument(
-        "--create-admin",
-        action="store_true",
-        help="Create a local dashboard administrator and exit",
-    )
 
     parser.add_argument(
         "--camera",
@@ -1579,19 +1575,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    if args.create_admin:
-        username = input("Admin username: ").strip()
-        password = getpass.getpass("Admin password: ")
-        confirmation = getpass.getpass("Confirm password: ")
-        if password != confirmation:
-            parser.error("Passwords do not match.")
-        try:
-            user = UserStore().create_admin(username, password)
-        except ValueError as exc:
-            parser.error(str(exc))
-        print(f"Created admin user {user['username']!r}.")
-        return
 
     if (
         args.camera < 0
@@ -1655,6 +1638,9 @@ def main():
         )
 
     finally:
+        withdraw_manager = app.extensions.get("withdraw_manager")
+        if withdraw_manager is not None:
+            withdraw_manager.close()
         job_executor = app.extensions.get("job_executor")
         if job_executor is not None:
             job_executor.close()

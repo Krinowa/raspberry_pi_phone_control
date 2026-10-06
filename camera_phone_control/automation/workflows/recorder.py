@@ -579,6 +579,7 @@ class Recorder:
                 "wait_for_text",
                 "if_text",
                 "capture_screen",
+                "ocr_value",
                 "manual_checkpoint",
             }:
                 raise ValueError("Choose a supported step type.")
@@ -641,7 +642,8 @@ class Recorder:
                     "wait_until_stable": {"stable_ms", "timeout_seconds"},
                     "wait_for_text": {"text", "timeout_seconds", "roi"},
                     "if_text": {"text", "timeout_seconds", "roi"},
-                    "capture_screen": set(),
+                    "capture_screen": {"output_key"},
+                    "ocr_value": {"roi", "parser", "output"},
                     "manual_checkpoint": {"message"},
                 }.get(old["type"], set())
                 changes = data.get("fields")

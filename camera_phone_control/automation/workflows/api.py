@@ -16,6 +16,7 @@ from flask import jsonify, request
 from ..backends import backend_names, select_device
 from ..context import AutomationContext
 from ..coordinates import normalized_roi
+from .values import parse_currency
 from .timing import WorkflowTiming
 from ..input.base import UnsupportedOperation
 from ..screen.accessibility import AccessibilityScreenStateProvider
@@ -182,7 +183,10 @@ def register_workflows(
         data = payload()
         roi = normalized_roi(data.get("roi"))
         text = data.get("text")
-        if not isinstance(text, str) or not text.strip() or len(text) > 500:
+        value_test = data.get("parser") == "currency"
+        if not value_test and (
+            not isinstance(text, str) or not text.strip() or len(text) > 500
+        ):
             raise ValueError("Text to detect must be between 1 and 500 characters.")
         token = data.get("token")
         if not isinstance(token, str):
@@ -196,7 +200,7 @@ def register_workflows(
         timing.begin_step(1, "Test ROI OCR")
         try:
             crop = screen_state_provider._crop_roi(saved[1], roi)
-            expected = " ".join(text.split()).casefold()
+            expected = "" if value_test else " ".join(text.split()).casefold()
             # Share pool dispatch, but never overwrite a running device's caches.
             provider = screen_state_provider.for_screen(external_screen)
             candidates = provider._recognize_candidates(
@@ -212,6 +216,13 @@ def register_workflows(
         return jsonify(
             found=found,
             texts=[item["text"] for item in candidates],
+            value=(
+                format(
+                    parse_currency(" ".join(item["text"] for item in candidates)), ".2f"
+                )
+                if value_test
+                else None
+            ),
             timing=timing.snapshot(),
         )
 

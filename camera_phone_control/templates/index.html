@@ -44,62 +44,9 @@
           Operate
         </button>
         <button id="dashboard-admin" type="button" aria-selected="false">
-          Admin 🔒
+          Admin
         </button>
-        <span id="admin-session" class="admin-session" hidden>
-          Admin: <strong id="admin-session-username"></strong>
-          <button id="admin-logout" type="button">Logout</button>
-        </span>
       </nav>
-      <div
-        id="admin-login-dialog"
-        class="modal-backdrop"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="admin-login-title"
-        hidden
-      >
-        <form id="admin-login-form" class="modal-panel auth-modal">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">RESTRICTED SETTINGS</p>
-              <h2 id="admin-login-title">Admin login</h2>
-            </div>
-          </div>
-          <label>
-            Username
-            <input
-              id="admin-login-username"
-              name="username"
-              autocomplete="username"
-              maxlength="80"
-              required
-            />
-          </label>
-          <label>
-            Password
-            <input
-              id="admin-login-password"
-              name="password"
-              type="password"
-              autocomplete="current-password"
-              required
-            />
-          </label>
-          <p
-            id="admin-login-error"
-            class="device-error"
-            role="alert"
-            hidden
-          ></p>
-          <div class="flow-buttons">
-            <button id="admin-login-submit" class="primary" type="submit">
-              Login
-            </button>
-            <button id="admin-login-cancel" type="button">Cancel</button>
-          </div>
-        </form>
-      </div>
       <section
         class="card operate-only operate-health"
         aria-labelledby="operate-health-title"
@@ -387,75 +334,6 @@ Select Refresh Logs to load recent activity.</pre
         <div id="ocr-workers" class="ocr-workers"></div>
       </section>
       <div
-        id="account-settings-dialog"
-        class="modal-backdrop admin-only"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="account-settings-title"
-        hidden
-      >
-        <form id="account-settings-form" class="modal-panel">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">ACCOUNT ROUTING</p>
-              <h2 id="account-settings-title">Assigned Account</h2>
-            </div>
-            <button
-              id="account-settings-close"
-              type="button"
-              aria-label="Close"
-            >
-              ×
-            </button>
-          </div>
-          <label>
-            Account ID
-            <input
-              id="account-settings-id"
-              maxlength="80"
-              pattern="[A-Za-z][A-Za-z0-9_-]{0,79}"
-              required
-            />
-          </label>
-          <label>
-            Display name
-            <input id="account-settings-name" maxlength="160" required />
-          </label>
-          <label>
-            Provider / bank
-            <input id="account-settings-provider" maxlength="80" />
-          </label>
-          <label>
-            Assigned phone
-            <select id="account-settings-device"></select>
-          </label>
-          <label class="check">
-            <input id="account-settings-enabled" type="checkbox" checked />
-            Enabled
-          </label>
-          <p
-            id="account-settings-error"
-            class="device-error"
-            role="alert"
-            hidden
-          ></p>
-          <div class="flow-buttons">
-            <button id="account-settings-save" class="primary" type="submit">
-              Save Assignment
-            </button>
-            <button
-              id="account-settings-remove"
-              class="stop"
-              type="button"
-              hidden
-            >
-              Remove Assignment
-            </button>
-            <button id="account-settings-cancel" type="button">Cancel</button>
-          </div>
-        </form>
-      </div>
-      <div
         id="camera-settings-dialog"
         class="modal-backdrop admin-only"
         role="dialog"
@@ -524,6 +402,79 @@ Select Refresh Logs to load recent activity.</pre
               Save
             </button>
             <button id="camera-settings-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
+      <div
+        id="withdraw-settings-dialog"
+        class="modal-backdrop admin-only"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="withdraw-settings-title"
+        hidden
+      >
+        <form id="withdraw-settings-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">EXTERNAL WITHDRAW BOT</p>
+              <h2 id="withdraw-settings-title">Withdraw Account</h2>
+            </div>
+            <button
+              id="withdraw-settings-close"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <strong id="withdraw-settings-status"
+            >Account Status: Not Assigned</strong
+          >
+          <p id="withdraw-settings-identity" class="small"></p>
+          <label>
+            Username
+            <input
+              id="withdraw-settings-username"
+              autocomplete="username"
+              maxlength="200"
+              required
+            />
+          </label>
+          <label>
+            Password
+            <input
+              id="withdraw-settings-password"
+              type="password"
+              autocomplete="new-password"
+              maxlength="4096"
+              required
+            />
+          </label>
+          <label>
+            Google 2FA Secret
+            <input
+              id="withdraw-settings-totp"
+              type="password"
+              autocomplete="off"
+              maxlength="256"
+              required
+            />
+          </label>
+          <p class="small">
+            The current verification code is generated securely by the server.
+            Saved credentials are never shown in the dashboard.
+          </p>
+          <p
+            id="withdraw-settings-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+          <div class="flow-buttons">
+            <button id="withdraw-settings-submit" class="primary" type="submit">
+              Login &amp; Assign
+            </button>
+            <button id="withdraw-settings-cancel" type="button">Cancel</button>
           </div>
         </form>
       </div>
@@ -666,6 +617,9 @@ Select Refresh Logs to load recent activity.</pre
                   <button id="record-expect-current">
                     Expect Current Screen
                   </button>
+                  <button id="record-read-value" type="button">
+                    Read Balance
+                  </button>
                   <button id="record-screenshot-here" type="button">
                     Mark Screenshot Here
                   </button>
@@ -780,9 +734,19 @@ Select Refresh Logs to load recent activity.</pre
                   <h3>Input Variable</h3>
                   <label>
                     Variable
+                    <select id="record-variable-name">
+                      <option value="account_number">Account Number</option>
+                      <option value="amount">Amount</option>
+                      <option value="__custom__">
+                        Custom workflow variable…
+                      </option>
+                    </select>
+                  </label>
+                  <label id="record-variable-custom-field" hidden>
+                    Custom variable name
                     <input
-                      id="record-variable-name"
-                      placeholder="account_no"
+                      id="record-variable-custom-name"
+                      placeholder="customer_name"
                       maxlength="80"
                     />
                   </label>
@@ -820,6 +784,45 @@ Select Refresh Logs to load recent activity.</pre
                     <button id="record-variable-cancel" type="button">
                       Cancel
                     </button>
+                  </div>
+                </form>
+                <form id="record-read-value-form" hidden>
+                  <h3>Read Balance</h3>
+                  <label>
+                    Read
+                    <select id="live-value-preset">
+                      <option value="balance">Balance</option>
+                      <option value="custom">Custom Value</option>
+                    </select>
+                  </label>
+                  <label>
+                    Name
+                    <input
+                      id="live-value-name"
+                      value="Available Balance"
+                      maxlength="160"
+                      readonly
+                    />
+                  </label>
+                  <label>
+                    Parser
+                    <select id="live-value-parser" disabled>
+                      <option value="currency">Currency</option>
+                    </select>
+                  </label>
+                  <label>
+                    Output
+                    <input
+                      id="live-value-output"
+                      value="payer_balance"
+                      maxlength="64"
+                      readonly
+                    />
+                  </label>
+                  <div id="live-value-roi-picker"></div>
+                  <div class="flow-buttons">
+                    <button id="live-value-save" type="button">Save</button>
+                    <button id="live-value-cancel" type="button">Cancel</button>
                   </div>
                 </form>
                 <div id="live-timeline-slot"></div>
@@ -1174,6 +1177,32 @@ Select Refresh Logs to load recent activity.</pre
               </label>
             </div>
 
+            <div id="step-screenshot-options" hidden>
+              <label
+                >Output variable (optional)
+                <input
+                  id="step-screenshot-output"
+                  placeholder="receipt_path"
+                  maxlength="64"
+                />
+              </label>
+            </div>
+            <div id="step-value-options" hidden>
+              <label
+                >Parser
+                <select id="step-value-parser">
+                  <option value="currency">Currency</option>
+                </select></label
+              >
+              <label
+                >Output variable
+                <input
+                  id="step-value-output"
+                  value="payer_balance"
+                  maxlength="64"
+              /></label>
+              <div id="value-roi-picker"></div>
+            </div>
             <div id="step-text-options" hidden>
               <label
                 >Text
@@ -1224,9 +1253,22 @@ Select Refresh Logs to load recent activity.</pre
 
               <div id="variable-fields" hidden>
                 <label>
-                  Variable name
-
-                  <input id="variable-name" placeholder="customer_name" />
+                  Variable
+                  <select id="variable-name">
+                    <option value="account_number">Account Number</option>
+                    <option value="amount">Amount</option>
+                    <option value="__custom__">
+                      Custom workflow variable…
+                    </option>
+                  </select>
+                </label>
+                <label id="variable-custom-field" hidden>
+                  Custom variable name
+                  <input
+                    id="variable-custom-name"
+                    placeholder="customer_name"
+                    maxlength="80"
+                  />
                 </label>
                 <label>
                   Default value
@@ -1305,9 +1347,49 @@ Select Refresh Logs to load recent activity.</pre
             </details>
             <button id="record-text">Insert Wait for Text</button>
             <h4>Screenshot</h4>
+            <label
+              >Output variable (optional)
+              <input
+                id="record-screenshot-output"
+                placeholder="receipt_path"
+                maxlength="64"
+              />
+            </label>
             <button id="record-screenshot" type="button">
               Insert Screenshot
             </button>
+            <h4>Read Balance</h4>
+            <label
+              >Read
+              <select id="record-value-preset">
+                <option value="balance">Balance</option>
+                <option value="custom">Custom Value</option>
+              </select></label
+            >
+            <label
+              >Step name
+              <input
+                id="record-value-name"
+                value="Available Balance"
+                maxlength="160"
+                readonly
+            /></label>
+            <label
+              >Parser
+              <select id="record-value-parser">
+                <option value="currency">Currency</option>
+              </select></label
+            >
+            <label
+              >Output variable
+              <input
+                id="record-value-output"
+                value="payer_balance"
+                maxlength="64"
+                readonly
+            /></label>
+            <div id="record-value-roi-picker"></div>
+            <button id="record-value" type="button">Insert Read Balance</button>
             <h4>Wait</h4>
             <div class="flow-buttons">
               <input
@@ -1362,11 +1444,11 @@ Select Refresh Logs to load recent activity.</pre
               OCR</label
             >
             <p>
-              Optional. Select on the calibrated OCR snapshot; refresh after the
-              phone screen changes.
+              Select on the calibrated current screen snapshot; refresh after
+              the phone screen changes.
             </p>
             <button data-roi-control="refresh" type="button">
-              Select OCR Region
+              Select on Current Screen
             </button>
             <button data-roi-control="clear" type="button">
               Clear OCR Region

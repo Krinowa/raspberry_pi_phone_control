@@ -153,7 +153,12 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
         assignments = {}
         for device_id, value in self._read().items():
             validate_device_id(device_id)
-            if not isinstance(value, dict) or set(value) != {"allowed_workflow_ids"}:
+            if (
+                not isinstance(value, dict)
+                or "allowed_workflow_ids" not in value
+                or set(value)
+                - {"allowed_workflow_ids", "balance_workflow_id", "withdraw_api"}
+            ):
                 raise ValueError("Stored device workflow assignment is invalid.")
             workflow_ids = value["allowed_workflow_ids"]
             if not isinstance(workflow_ids, list) or len(workflow_ids) > 1:
@@ -177,6 +182,7 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
         validate_device_id(device_id)
         if not isinstance(workflow_ids, list) or len(workflow_ids) > 1:
             raise ValueError("Only one workflow can be assigned to a phone.")
+
         normalized = []
         for workflow_id in workflow_ids:
             workflow_id = identifier(workflow_id)
@@ -202,10 +208,58 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
         allowed = self.get(device_id)
         return allowed is None or identifier(workflow_id) in allowed
 
+    def integration(self, device_id):
+        from automation.integrations.withdraw_v2.config import validate_configuration
+
+        validate_device_id(device_id)
+        with self.lock:
+            value = self._read().get(device_id, {})
+            return validate_configuration(
+                {
+                    key: value[key]
+                    for key in ("balance_workflow_id", "withdraw_api")
+                    if key in value
+                }
+            )
+
+    def integrations(self):
+        with self.lock:
+            return {
+                device_id: self.integration(device_id) for device_id in self._read()
+            }
+
+    def set_integration(self, device_id, data):
+        from automation.integrations.withdraw_v2.config import validate_configuration
+
+        validate_device_id(device_id)
+        value = validate_configuration(data)
+        with self.lock:
+            records = self._read()
+            for other, record in records.items():
+                api = record.get("withdraw_api", {})
+                current = value["withdraw_api"]
+                if (
+                    other != device_id
+                    and current.get("enabled")
+                    and api.get("enabled")
+                    and api.get("base_url") == current.get("base_url")
+                    and api.get("operator_id") == current.get("operator_id")
+                ):
+                    raise RecordConflict(
+                        "External operator is already assigned to another device."
+                    )
+            records.setdefault(device_id, {"allowed_workflow_ids": []}).update(value)
+            self._write(records)
+        return value
+
     def _save(self, assignments):
+        previous = self._read()
         self._write(
             {
-                device_id: {"allowed_workflow_ids": list(workflow_ids)}
+                device_id: {
+                    **previous.get(device_id, {}),
+                    "allowed_workflow_ids": list(workflow_ids),
+                }
                 for device_id, workflow_ids in sorted(assignments.items())
             }
         )

@@ -196,6 +196,7 @@ class Job:
     retry_of_job_id: str | None = None
     start_step_index: int = 0
     screenshots: list = field(default_factory=list)
+    outputs: dict = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -276,17 +277,21 @@ class Job:
             "retry_of_job_id",
             "start_step_index",
             "screenshots",
+            "outputs",
         }
         required_fields = fields - optional_fields
         if set(data) - fields or not required_fields.issubset(data):
             raise ValueError("Stored job record is invalid.")
+
         data = {
             **{
                 field: None
-                for field in optional_fields - {"screenshots", "start_step_index"}
+                for field in optional_fields
+                - {"screenshots", "start_step_index", "outputs"}
             },
             "start_step_index": 0,
             "screenshots": [],
+            "outputs": {},
             **data,
         }
 
@@ -319,6 +324,7 @@ class Job:
         _plain_text(data.get("bank"), "bank", 80, required=False)
         _plain_text(data.get("action"), "action", 80, required=False)
         recovery_workflow_id = data.get("recovery_workflow_id")
+
         if recovery_workflow_id is not None:
             identifier(recovery_workflow_id)
         if data.get("recovery_status") not in {
@@ -329,11 +335,14 @@ class Job:
         }:
             raise ValueError("Stored recovery status is invalid.")
         recovery_run_id = data.get("recovery_run_id")
+
         if recovery_run_id is not None:
             identifier(recovery_run_id)
+
         _plain_text(data.get("recovery_error"), "recovery_error", 500, required=False)
         _plain_text(data.get("recovered_at"), "recovered_at", 80, required=False)
         failed_step_index = data.get("failed_step_index")
+
         if failed_step_index is not None and (
             type(failed_step_index) is not int or failed_step_index < 0
         ):
@@ -346,7 +355,14 @@ class Job:
             or data["start_step_index"] < 0
         ):
             raise ValueError("Stored start step index is invalid.")
+
         data["screenshots"] = _screenshot_metadata(data.get("screenshots"))
+
+        if not isinstance(data["outputs"], dict) or len(data["outputs"]) > 1000:
+            raise ValueError("Stored workflow outputs must be an object.")
+        for key, value in data["outputs"].items():
+            identifier(key)
+            _plain_text(value, "workflow output", 4096)
         return cls(**deepcopy(data))
 
     def stored(self):

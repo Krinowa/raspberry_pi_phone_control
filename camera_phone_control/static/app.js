@@ -53,14 +53,14 @@ let deviceStatusStale = false;
 let addPhonePanelOpen = false;
 let addPhoneEnrollmentTarget = null;
 let addPhoneInitialDeviceIds = new Set();
-let accountBindings = [];
+let deviceWithdrawDetails = {};
 let jobCatalog = [];
 const jobCancelsInFlight = new Set();
 const jobRetriesInFlight = new Set();
-let accountSettingsDeviceId = null;
-let accountSettingsAccountId = null;
 let workflowSettingsDeviceId = null;
 let workflowSettingsData = null;
+let withdrawSettingsDeviceId = null;
+let withdrawSettingsAssigned = false;
 let ocrSettingsDirty = false;
 let ocrStatusTimer = null;
 let ocrStatusInFlight = false;
@@ -73,12 +73,6 @@ const PREVIEW_INTERVAL_MS = 65;
 const PREVIEW_ERROR_RETRY_MS = 600;
 const PREVIEW_BACKGROUND_MS = 1000;
 let dashboardMode = "operate";
-let adminSession = {
-  authenticated: false,
-  username: null,
-  role: null,
-  admin_configured: false,
-};
 let recoveryPanelOpen = false;
 let recoveryRequestInFlight = false;
 let recoveryTargetJobId = null;
@@ -98,8 +92,7 @@ let workflowRuntime = null;
 let diagnosticsLogs = [];
 
 function setDashboardMode(mode) {
-  dashboardMode =
-    mode === "admin" && adminSession.authenticated ? "admin" : "operate";
+  dashboardMode = mode === "admin" ? "admin" : "operate";
   if (document.body) document.body.dataset.dashboardMode = dashboardMode;
   $("dashboard-operate").ariaSelected = String(dashboardMode === "operate");
   $("dashboard-admin").ariaSelected = String(dashboardMode === "admin");
@@ -109,16 +102,6 @@ function setDashboardMode(mode) {
       : "Enable Manual Control";
   window.phoneRecorder?.dashboardModeChanged?.(dashboardMode);
   return dashboardMode;
-}
-
-function renderAdminSession() {
-  const authenticated =
-    adminSession.authenticated && adminSession.role === "admin";
-  $("dashboard-admin").textContent = authenticated ? "Admin" : "Admin 🔒";
-  $("admin-session").hidden = !authenticated;
-  $("admin-session-username").textContent = authenticated
-    ? adminSession.username
-    : "";
 }
 
 function formatDiagnosticLog(entry) {
@@ -150,8 +133,7 @@ async function loadDiagnostics() {
     status.textContent = `${diagnosticsLogs.length} recent log entr${diagnosticsLogs.length === 1 ? "y" : "ies"}.`;
     output.scrollTop = output.scrollHeight;
   } catch (error) {
-    output.textContent =
-      "Logs are available only to an authenticated administrator.";
+    output.textContent = "Logs are available only in developer mode.";
     status.textContent = error.message;
   } finally {
     refresh.disabled = false;
@@ -167,66 +149,6 @@ async function copyDiagnostics() {
 
   await navigator.clipboard.writeText(value);
   $("diagnostics-state").textContent = "Logs copied.";
-}
-
-function closeAdminLogin() {
-  $("admin-login-dialog").hidden = true;
-  $("admin-login-password").value = "";
-  $("admin-login-error").hidden = true;
-  $("admin-login-error").textContent = "";
-}
-
-function openAdminLogin() {
-  $("admin-login-dialog").hidden = false;
-  $("admin-login-error").hidden = true;
-  $("admin-login-username").focus();
-}
-
-function lockAdminState() {
-  adminSession = {
-    authenticated: false,
-    username: null,
-    role: null,
-    admin_configured: true,
-  };
-  setDashboardMode("operate");
-  renderAdminSession();
-}
-
-async function loadAdminSession() {
-  try {
-    const result = await api("/api/auth/session", undefined, "GET", {
-      monitor: false,
-    });
-    adminSession = result.authenticated
-      ? result
-      : {
-          authenticated: false,
-          username: null,
-          role: null,
-          admin_configured: Boolean(result.admin_configured),
-        };
-  } catch {
-    adminSession = {
-      authenticated: false,
-      username: null,
-      role: null,
-      admin_configured: false,
-    };
-  }
-  const requestedMode =
-    typeof location !== "undefined" &&
-    /(?:^|[?&])mode=admin(?:&|$)/.test(location.search || "");
-  if (
-    adminSession.authenticated &&
-    (requestedMode || adminSession.developer_mode === true)
-  ) {
-    setDashboardMode("admin");
-    window.history?.replaceState?.(null, "", location.pathname);
-  } else if (!adminSession.authenticated) {
-    setDashboardMode("operate");
-  }
-  renderAdminSession();
 }
 
 function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
@@ -418,15 +340,18 @@ const deviceService = {
       "POST",
       { monitor: false },
     ),
-};
-
-const accountService = {
-  list: () => api("/api/accounts", undefined, "GET", { monitor: false }),
-  create: (binding) => api("/api/accounts", binding),
-  update: (accountId, changes) =>
-    api(`/api/accounts/${encodeURIComponent(accountId)}`, changes, "PATCH"),
-  remove: (accountId) =>
-    api(`/api/accounts/${encodeURIComponent(accountId)}`, {}, "DELETE"),
+  withdraw: (deviceId) =>
+    api(
+      `/api/devices/${encodeURIComponent(deviceId)}/withdraw`,
+      undefined,
+      "GET",
+      { monitor: false },
+    ),
+  loginWithdraw: (deviceId, credentials) =>
+    api(
+      `/api/devices/${encodeURIComponent(deviceId)}/withdraw/login-assign`,
+      credentials,
+    ),
 };
 
 const jobService = {
@@ -1069,24 +994,6 @@ function renderDevices() {
         ? "No camera assigned"
         : `${camera.display_name || `Camera ${camera.camera_id || camera.camera_source}`} · ${camera.rotation ?? 0}°`;
 
-    const binding = accountBindings.find(
-      (account) => account.device_id === device.id,
-    );
-    const accountSummary = document.createElement("div");
-    accountSummary.className = "account-summary";
-    const accountHeading = document.createElement("strong");
-    accountHeading.textContent = "Assigned Account";
-    const accountName = document.createElement("span");
-    accountName.textContent = binding
-      ? `${binding.provider ? `${binding.provider} · ` : ""}${binding.display_name}${
-          binding.enabled ? "" : " · Disabled"
-        }`
-      : "No account assigned";
-    const accountId = document.createElement("span");
-    accountId.className = "admin-only";
-    accountId.textContent = binding?.account_id || "—";
-    accountSummary.append(accountHeading, accountName, accountId);
-
     const workflowAssignment = device.workflow_assignment || {
       unrestricted: true,
       assigned_workflows: [],
@@ -1115,6 +1022,37 @@ function renderDevices() {
         ? assignedWorkflow.id
         : "Execution disabled";
     workflowSummary.append(workflowHeading, workflowNames, workflowCount);
+
+    const withdraw = deviceWithdrawDetails?.[device.id] || {};
+    const withdrawApi = withdraw.withdraw_api || {};
+    const withdrawAssigned =
+      withdraw.assigned === true ||
+      (Number.isInteger(withdrawApi.operator_id) && !!withdrawApi.username);
+    const withdrawSummary = document.createElement("div");
+    withdrawSummary.className =
+      "account-summary withdraw-account-summary admin-only";
+    const withdrawHeading = document.createElement("strong");
+    withdrawHeading.textContent = "Withdraw Account";
+    const withdrawStatus = document.createElement("span");
+    withdrawStatus.textContent = `Account Status: ${withdrawAssigned ? "Assigned" : "Not Assigned"}`;
+    withdrawSummary.append(withdrawHeading, withdrawStatus);
+    if (withdrawAssigned) {
+      const identity = document.createElement("span");
+      identity.textContent = `Username: ${withdrawApi.username} · Account ID: ${withdrawApi.operator_id}`;
+      const records = document.createElement("span");
+      records.textContent = `Payment Records: ${withdrawApi.payment_records?.length ? withdrawApi.payment_records.join(", ") : "None"}`;
+      withdrawSummary.append(identity, records);
+    }
+    const withdrawButton = document.createElement("button");
+    withdrawButton.type = "button";
+    withdrawButton.textContent = withdrawAssigned
+      ? "Change Account"
+      : "Login & Assign";
+    withdrawButton.disabled = deviceManagementBlocked();
+    withdrawButton.addEventListener("click", () =>
+      openWithdrawSettings(device, withdraw),
+    );
+    withdrawSummary.append(withdrawButton);
 
     let jobSummary = null;
     if (latestJob) {
@@ -1182,15 +1120,6 @@ function renderDevices() {
     settings.disabled = deviceManagementBlocked();
     settings.addEventListener("click", () => openCameraSettings(device));
 
-    const account = document.createElement("button");
-    account.className = "admin-only";
-    account.type = "button";
-    account.textContent = binding ? "Account Settings" : "Assign Account";
-    account.disabled = deviceManagementBlocked();
-    account.addEventListener("click", () =>
-      openAccountSettings(device, binding),
-    );
-
     const workflows = document.createElement("button");
     workflows.className = "admin-only";
     workflows.type = "button";
@@ -1211,7 +1140,6 @@ function renderDevices() {
       ...(jobActions.children.length ? [jobActions] : []),
       select,
       settings,
-      account,
       workflows,
       remove,
     );
@@ -1221,8 +1149,8 @@ function renderDevices() {
       mac,
       preview,
       summary,
-      accountSummary,
       workflowSummary,
+      withdrawSummary,
     );
     if (jobSummary) card.append(jobSummary);
     card.append(actions);
@@ -1822,18 +1750,6 @@ function viewOperationalDetails() {
   setDashboardMode("admin");
 }
 
-function setAccountSettingsError(message = "") {
-  $("account-settings-error").textContent = message;
-  $("account-settings-error").hidden = !message;
-}
-
-function closeAccountSettings() {
-  accountSettingsDeviceId = null;
-  accountSettingsAccountId = null;
-  $("account-settings-dialog").hidden = true;
-  setAccountSettingsError();
-}
-
 function setWorkflowSettingsError(message = "") {
   $("workflow-settings-error").textContent = message;
   $("workflow-settings-error").hidden = !message;
@@ -1845,6 +1761,87 @@ function closeWorkflowSettings() {
   $("workflow-settings-dialog").hidden = true;
   $("workflow-settings-search").value = "";
   setWorkflowSettingsError();
+}
+
+function setWithdrawSettingsError(message = "") {
+  $("withdraw-settings-error").textContent = message;
+  $("withdraw-settings-error").hidden = !message;
+}
+
+function closeWithdrawSettings() {
+  withdrawSettingsDeviceId = null;
+  withdrawSettingsAssigned = false;
+  $("withdraw-settings-password").value = "";
+  $("withdraw-settings-totp").value = "";
+  $("withdraw-settings-dialog").hidden = true;
+  setWithdrawSettingsError();
+}
+
+function openWithdrawSettings(device, details = {}) {
+  const api = details.withdraw_api || {};
+  withdrawSettingsDeviceId = device.id;
+  withdrawSettingsAssigned =
+    details.assigned === true ||
+    (Number.isInteger(api.operator_id) && !!api.username);
+  $("withdraw-settings-title").textContent =
+    `Withdraw Account · ${device.name || device.id}`;
+  $("withdraw-settings-status").textContent = withdrawSettingsAssigned
+    ? "Account Status: Assigned"
+    : "Account Status: Not Assigned";
+  $("withdraw-settings-identity").textContent = withdrawSettingsAssigned
+    ? `Username: ${api.username} · Account ID: ${api.operator_id} · Payment Records: ${api.payment_records?.length ? api.payment_records.join(", ") : "None"}`
+    : "Login with the external operator account assigned to this phone.";
+  $("withdraw-settings-username").value = api.username || "";
+  $("withdraw-settings-password").value = "";
+  $("withdraw-settings-password").placeholder = details.credentials_saved
+    ? "Saved — enter a new password to change account"
+    : "";
+  $("withdraw-settings-totp").value = "";
+  $("withdraw-settings-totp").placeholder = details.credentials_saved
+    ? "Saved — enter a new secret to change account"
+    : "";
+  $("withdraw-settings-submit").textContent = withdrawSettingsAssigned
+    ? "Change Account"
+    : "Login & Assign";
+  $("withdraw-settings-dialog").hidden = false;
+  setWithdrawSettingsError();
+  $("withdraw-settings-username").focus();
+}
+
+async function saveWithdrawSettings(event) {
+  event.preventDefault();
+  if (!withdrawSettingsDeviceId) return;
+  const button = $("withdraw-settings-submit");
+  button.disabled = true;
+  setWithdrawSettingsError();
+  try {
+    const result = await deviceService.loginWithdraw(withdrawSettingsDeviceId, {
+      username: $("withdraw-settings-username").value.trim(),
+      password: $("withdraw-settings-password").value,
+      totp_secret: $("withdraw-settings-totp").value.trim(),
+    });
+    const deviceId = withdrawSettingsDeviceId;
+    deviceWithdrawDetails[deviceId] = {
+      ...(deviceWithdrawDetails[deviceId] || {}),
+      assigned: true,
+      credentials_saved: true,
+      withdraw_api: {
+        ...(deviceWithdrawDetails[deviceId]?.withdraw_api || {}),
+        operator_id: result.operator_id,
+        username: result.username,
+        payment_records: result.payment_records || [],
+      },
+    };
+    closeWithdrawSettings();
+    deviceRenderSignature = null;
+    renderDevices();
+    notice("Withdraw account assigned to this phone.");
+    await loadDevices();
+  } catch (error) {
+    setWithdrawSettingsError(error.message);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function renderWorkflowSettingsOptions() {
@@ -1937,79 +1934,6 @@ async function saveWorkflowSettings(event) {
   }
 }
 
-function openAccountSettings(device, binding = null) {
-  accountSettingsDeviceId = device.id;
-  accountSettingsAccountId = binding?.account_id || null;
-  $("account-settings-title").textContent =
-    `Assigned Account · ${device.name || device.id}`;
-  $("account-settings-id").value = binding?.account_id || "";
-  $("account-settings-id").readOnly = !!binding;
-  $("account-settings-name").value = binding?.display_name || "";
-  $("account-settings-provider").value = binding?.provider || "";
-  $("account-settings-enabled").checked = binding?.enabled ?? true;
-  const options = (deviceCatalog?.devices || []).map((candidate) => {
-    const option = document.createElement("option");
-    option.value = candidate.id;
-    option.textContent = candidate.name || candidate.id;
-    return option;
-  });
-  $("account-settings-device").replaceChildren(...options);
-  $("account-settings-device").value = binding?.device_id || device.id;
-  $("account-settings-remove").hidden = !binding;
-  $("account-settings-dialog").hidden = false;
-  setAccountSettingsError();
-  $(binding ? "account-settings-name" : "account-settings-id").focus();
-}
-
-async function saveAccountSettings(event) {
-  event.preventDefault();
-  const binding = {
-    display_name: $("account-settings-name").value.trim(),
-    provider: $("account-settings-provider").value.trim() || null,
-    device_id: $("account-settings-device").value,
-    enabled: $("account-settings-enabled").checked,
-  };
-  const button = $("account-settings-save");
-  button.disabled = true;
-  setAccountSettingsError();
-  try {
-    if (accountSettingsAccountId) {
-      await accountService.update(accountSettingsAccountId, binding);
-    } else {
-      await accountService.create({
-        account_id: $("account-settings-id").value.trim(),
-        ...binding,
-      });
-    }
-    closeAccountSettings();
-    deviceRenderSignature = null;
-    await loadDevices();
-    notice("Account assignment saved.");
-  } catch (error) {
-    setAccountSettingsError(error.message);
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function removeAccountSettings() {
-  if (!accountSettingsAccountId) return;
-  const button = $("account-settings-remove");
-  button.disabled = true;
-  setAccountSettingsError();
-  try {
-    await accountService.remove(accountSettingsAccountId);
-    closeAccountSettings();
-    deviceRenderSignature = null;
-    await loadDevices();
-    notice("Account assignment removed.");
-  } catch (error) {
-    setAccountSettingsError(error.message);
-  } finally {
-    button.disabled = false;
-  }
-}
-
 function reconcileAddPhonePanel(devices, enrollment) {
   const registered = new Set(devices.map((device) => device.id));
   const typedDeviceId = String($("device-enrollment-id").value || "").trim();
@@ -2051,7 +1975,7 @@ async function loadDevices() {
       ? nextCatalog.devices
       : [];
     reconcileAddPhonePanel(devices, nextCatalog.enrollment);
-    const [cameraEntries, accountResult, jobResult] = await Promise.all([
+    const [cameraEntries, withdrawEntries, jobResult] = await Promise.all([
       Promise.all(
         devices.map(async (device) => {
           try {
@@ -2072,13 +1996,21 @@ async function loadDevices() {
           }
         }),
       ),
-      accountService.list().catch(() => ({ accounts: accountBindings })),
+      Promise.all(
+        devices.map(async (device) => {
+          try {
+            return [device.id, await deviceService.withdraw(device.id)];
+          } catch {
+            return [device.id, deviceWithdrawDetails?.[device.id] || null];
+          }
+        }),
+      ),
       jobService.list().catch(() => ({ jobs: jobCatalog })),
     ]);
     const nextCameras = Object.fromEntries(cameraEntries);
-    accountBindings = Array.isArray(accountResult.accounts)
-      ? accountResult.accounts
-      : accountBindings;
+    deviceWithdrawDetails = Object.fromEntries(
+      withdrawEntries.filter(([, value]) => value),
+    );
     jobCatalog = Array.isArray(jobResult.jobs) ? jobResult.jobs : jobCatalog;
     const nextSignature = JSON.stringify({
       devices: nextCatalog.devices,
@@ -2086,7 +2018,7 @@ async function loadDevices() {
       default_device: nextCatalog.default_device,
       selected_device: nextCatalog.selected_device,
       cameras: nextCameras,
-      accounts: accountBindings,
+      withdraw: deviceWithdrawDetails,
       jobs: jobCatalog,
       status_unavailable: false,
     });
@@ -3442,57 +3374,7 @@ $("dashboard-operate").addEventListener("click", () =>
   setDashboardMode("operate"),
 );
 
-$("dashboard-admin").addEventListener("click", () => {
-  if (adminSession.authenticated) setDashboardMode("admin");
-  else location.assign(adminSession.admin_configured ? "/login" : "/setup");
-});
-$("admin-login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const submit = $("admin-login-submit");
-  const error = $("admin-login-error");
-  submit.disabled = true;
-  error.hidden = true;
-  try {
-    const loginResult = await api(
-      "/api/auth/login",
-      {
-        username: $("admin-login-username").value.trim(),
-        password: $("admin-login-password").value,
-      },
-      "POST",
-      { monitor: false },
-    );
-    if (loginResult.requires_2fa) {
-      location.assign("/login/2fa");
-      return;
-    }
-    adminSession = loginResult;
-    closeAdminLogin();
-    renderAdminSession();
-    setDashboardMode("admin");
-  } catch (loginError) {
-    error.textContent = loginError.message;
-    error.hidden = false;
-    $("admin-login-password").select();
-  } finally {
-    submit.disabled = false;
-  }
-});
-$("admin-login-cancel").addEventListener("click", closeAdminLogin);
-$("admin-login-dialog").addEventListener("click", (event) => {
-  if (event.target === $("admin-login-dialog")) closeAdminLogin();
-});
-$("admin-logout").addEventListener("click", async () => {
-  setDashboardMode("operate");
-  try {
-    await api("/api/auth/logout", {}, "POST", { monitor: false });
-  } catch (error) {
-    notice(`Could not log out: ${error.message}`, true);
-    await loadAdminSession();
-    return;
-  }
-  lockAdminState();
-});
+$("dashboard-admin").addEventListener("click", () => setDashboardMode("admin"));
 $("diagnostics-refresh").addEventListener(
   "click",
   () => void loadDiagnostics(),
@@ -3598,13 +3480,6 @@ $("device-enrollment-stop").addEventListener("click", async () => {
     setDeviceError(error.message);
   }
 });
-$("account-settings-form").addEventListener("submit", saveAccountSettings);
-$("account-settings-remove").addEventListener("click", removeAccountSettings);
-$("account-settings-cancel").addEventListener("click", closeAccountSettings);
-$("account-settings-close").addEventListener("click", closeAccountSettings);
-$("account-settings-dialog").addEventListener("click", (event) => {
-  if (event.target === $("account-settings-dialog")) closeAccountSettings();
-});
 $("workflow-settings-form").addEventListener("submit", saveWorkflowSettings);
 $("workflow-settings-search").addEventListener(
   "input",
@@ -3614,6 +3489,12 @@ $("workflow-settings-cancel").addEventListener("click", closeWorkflowSettings);
 $("workflow-settings-close").addEventListener("click", closeWorkflowSettings);
 $("workflow-settings-dialog").addEventListener("click", (event) => {
   if (event.target === $("workflow-settings-dialog")) closeWorkflowSettings();
+});
+$("withdraw-settings-form").addEventListener("submit", saveWithdrawSettings);
+$("withdraw-settings-cancel").addEventListener("click", closeWithdrawSettings);
+$("withdraw-settings-close").addEventListener("click", closeWithdrawSettings);
+$("withdraw-settings-dialog").addEventListener("click", (event) => {
+  if (event.target === $("withdraw-settings-dialog")) closeWithdrawSettings();
 });
 $("camera-settings-form").addEventListener("submit", saveDeviceCamera);
 $("camera-settings-test").addEventListener("click", testCameraSettings);
@@ -3645,8 +3526,6 @@ window.addEventListener("pageshow", (event) => {
 });
 
 setDashboardMode(dashboardMode);
-renderAdminSession();
-loadAdminSession();
 render();
 loadStatus();
 videoLoop();

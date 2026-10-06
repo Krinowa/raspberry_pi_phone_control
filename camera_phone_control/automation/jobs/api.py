@@ -71,6 +71,8 @@ def register_jobs(
         if not registered:
             raise RecordConflict("Device is not registered.")
 
+    app.extensions["ensure_registered_device"] = ensure_registered_device
+
     @app.get("/api/accounts")
     def list_accounts():
         return jsonify(accounts=[item.public() for item in account_store.list()])

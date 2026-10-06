@@ -65,6 +65,7 @@ class DeviceEligibility:
                 connected = registered and details.get("connected") is True
                 runtime_healthy = self.state.pi_connection.get("api") == "online"
                 lock_identity = "pi-api:" + self.state.pi_bridge.client.base_url
+
                 if device_id != "phone_A":
                     lock_identity += "#" + device_id
                 manual_busy = self.state.pi_bridge.device_id == device_id and (
@@ -79,6 +80,7 @@ class DeviceEligibility:
                     self.state.device.serial if self.state.device is not None else None
                 )
                 manual_busy = self.state.owner is not None or self.state.pending
+
         lock_busy = (
             lock_identity is not None
             and self.state.device_locks.owner(lock_identity) is not None
@@ -93,6 +95,7 @@ class DeviceEligibility:
         available = camera["status"].get("ready") is True
         workflow_busy = self.workflow_service.has_active_run(device_id)
         reasons = []
+
         if not registered:
             reasons.append("not_registered")
         if not connected:
@@ -136,6 +139,7 @@ class JobScheduler:
         self.readiness = readiness
         self.lock = threading.RLock()
         self.reservations = {}
+        self.integration_gate = None
         self.recover_pending_jobs()
 
     def recover_pending_jobs(self):
@@ -181,6 +185,11 @@ class JobScheduler:
         """Create a new, device-pinned job after explicit phone recovery."""
         with self.lock:
             original = self.get_job(job_id)
+
+            if original.action == "withdraw_v2":
+                raise RecordConflict(
+                    "Withdraw Bot payments cannot be retried locally. Reconcile the external transaction first."
+                )
             if original.status not in {"FAILED", "INTERRUPTED"}:
                 raise RecordConflict("Only failed or interrupted jobs can be retried.")
             if original.recovery_status != "READY":
@@ -228,11 +237,17 @@ class JobScheduler:
             job.device_id == device_id and job.recovery_status == "NEEDS_ATTENTION"
             for job in self.list_jobs()
         )
-        if not needs_attention:
+        integration_blocked = (
+            self.integration_gate is not None and self.integration_gate(device_id)
+        )
+        if not needs_attention and not integration_blocked:
             return result
         reasons = list(result.get("reasons", []))
-        if "needs_attention" not in reasons:
+
+        if needs_attention and "needs_attention" not in reasons:
             reasons.append("needs_attention")
+        if integration_blocked:
+            reasons.append("withdraw_reconciliation_required")
         return {
             **result,
             "busy": True,
@@ -279,7 +294,9 @@ class JobScheduler:
                 for item in self.list_jobs()
             ):
                 return None
+
             readiness = self.is_device_ready(device_id)
+
             if not readiness["ready"]:
                 if job.status != "WAITING_FOR_DEVICE":
                     self._transition(job, "WAITING_FOR_DEVICE")
@@ -304,10 +321,12 @@ class JobScheduler:
             ):
                 raise RecordConflict("Device already has a running job.")
             job = self.get_job(job_id)
+
             if job.device_id != device_id:
                 raise ValueError("A job cannot be moved to another device.")
             if job.status not in PENDING_JOB_STATES:
                 raise RecordConflict("Job is not waiting in the device queue.")
+
             next_job = self.next_job_for_device(device_id)
             if next_job is None or next_job.job_id != job_id:
                 raise RecordConflict("An earlier job is waiting for this device.")
@@ -329,11 +348,13 @@ class JobScheduler:
         screenshots=None,
         failed_step_index=None,
         failed_step_id=None,
+        outputs=None,
     ):
         with self.lock:
             job = self.get_job(job_id)
             if self.reservations.get(job.device_id) != job_id:
                 raise RecordConflict("Job does not own this device reservation.")
+
             error = self._summary(error)
             result = self._summary(result)
             finished = self._transition(
@@ -342,6 +363,7 @@ class JobScheduler:
                 finished_at=now(),
                 error=error,
                 result=result,
+                outputs=deepcopy(outputs) if outputs is not None else job.outputs,
                 cancel_requested=job.cancel_requested or status == "CANCELLED",
                 recovery_status=(
                     "NEEDS_ATTENTION"
@@ -363,8 +385,10 @@ class JobScheduler:
             del self.reservations[job.device_id]
             return finished
 
-    def complete_job(self, job_id, result=None, *, screenshots=None):
-        return self._finish(job_id, "COMPLETED", result=result, screenshots=screenshots)
+    def complete_job(self, job_id, result=None, *, screenshots=None, outputs=None):
+        return self._finish(
+            job_id, "COMPLETED", result=result, screenshots=screenshots, outputs=outputs
+        )
 
     def fail_job(
         self,
@@ -430,9 +454,11 @@ class JobScheduler:
                 for item in self.list_jobs()
             ):
                 raise RecordConflict("Device already has running work.")
+
             readiness = self.readiness.inspect(job.device_id, reserved=False)
             if not readiness["ready"]:
                 raise RecordConflict("Device is not ready to start recovery.")
+
             reservation = "recovery:" + job.job_id
             self.reservations[job.device_id] = reservation
             try:
@@ -464,8 +490,10 @@ class JobScheduler:
         with self.lock:
             job = self.get_job(job_id)
             reservation = "recovery:" + job_id
+
             if self.reservations.get(job.device_id) != reservation:
                 raise RecordConflict("Recovery does not own this device reservation.")
+
             finished = self.store.replace(
                 replace(
                     job,

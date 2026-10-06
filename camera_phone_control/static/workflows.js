@@ -82,6 +82,8 @@
       return `Wait for Text — “${step.text}” · Wait up to ${step.timeout_seconds} sec`;
 
     if (step.type === "if_text") return `Special Case — “${step.text}”`;
+    if (step.type === "ocr_value")
+      return `Read Balance — ${step.label || step.output}`;
 
     if (step.type === "capture_screen") {
       const label = typeof suffix === "string" ? suffix.trim() : "";
@@ -149,6 +151,7 @@
     expectedOriginalROI = null,
     keyboardSetupOpen = false,
     variableInputOpen = false,
+    readValueOpen = false,
     returnToVariableInput = false,
     alternateSetupOpen = false,
     specialCaseAfterStepId = null,
@@ -160,6 +163,7 @@
     keyboardSetupOpen ||
     !!recording.keyboard_capture ||
     variableInputOpen ||
+    readValueOpen ||
     alternateSetupOpen;
 
   function keyboardOptions(select, captureOption = false) {
@@ -767,6 +771,7 @@
     $("record-stop").hidden = reviewSpecialCase;
 
     $("record-expect-current").disabled = stopping || annotationBusy();
+    $("record-read-value").disabled = stopping || annotationBusy();
     $("record-capture-keyboard").disabled = stopping || annotationBusy();
     $("review-capture-keyboard").disabled = annotationBusy();
     $("record-input-variable").disabled = stopping || annotationBusy();
@@ -783,6 +788,7 @@
     $("record-screenshot-here").disabled =
       working || stopping || annotationBusy();
     $("record-variable-input").hidden = !variableInputOpen;
+    $("record-read-value-form").hidden = !readValueOpen;
 
     const sharedPhysicalBusy =
       externalPhysicalBusy || !!window.phoneConnection?.isPhysicalBusy?.();
@@ -888,6 +894,23 @@
       source === "manual" || $("input-method").value !== "screen_keyboard";
   }
 
+  function variableName(selectId, customId) {
+    const choice = $(selectId).value;
+    return choice === "__custom__" ? $(customId).value.trim() : choice;
+  }
+
+  function variableChoiceFields(selectId, customFieldId, customId, name) {
+    const predefined = ["account_number", "amount"];
+    if (name === "__custom__") {
+      $(selectId).value = name;
+      $(customFieldId).hidden = false;
+      return;
+    }
+    $(selectId).value = predefined.includes(name) ? name : "__custom__";
+    $(customId).value = predefined.includes(name) ? "" : name || "";
+    $(customFieldId).hidden = $(selectId).value !== "__custom__";
+  }
+
   function openEditor(step, source) {
     editingId = step.id;
 
@@ -911,6 +934,15 @@
     setSectionVisible("step-wait-options", step.type === "wait");
 
     setSectionVisible("step-stable-options", step.type === "wait_until_stable");
+    setSectionVisible("step-value-options", step.type === "ocr_value");
+    setSectionVisible(
+      "step-screenshot-options",
+      step.type === "capture_screen",
+    );
+    $("step-screenshot-output").value = step.output_key || "";
+    $("step-value-parser").value = step.parser || "currency";
+    $("step-value-output").value = step.output || "payer_balance";
+    valueROIPicker.reset(step.type === "ocr_value" ? step.roi : null);
 
     setSectionVisible(
       "step-text-options",
@@ -968,7 +1000,12 @@
       $("input-value").placeholder = "";
     }
 
-    $("variable-name").value = definition?.name || "";
+    variableChoiceFields(
+      "variable-name",
+      "variable-custom-field",
+      "variable-custom-name",
+      definition?.name,
+    );
     $("variable-default").value = definition?.default ?? "";
     $("input-method").value = step.input_method || "hid";
 
@@ -984,6 +1021,12 @@
   }
 
   $("input-source").addEventListener("change", sourceFields);
+  $("variable-name").addEventListener(
+    "change",
+    () =>
+      ($("variable-custom-field").hidden =
+        $("variable-name").value !== "__custom__"),
+  );
   $("input-method").addEventListener("change", sourceFields);
 
   $("step-close").addEventListener("click", () => {
@@ -1038,7 +1081,7 @@
       const previousDefinition = recording.workflow.variables.find(
         (definition) => definition.name === old.variable,
       );
-      const name = $("variable-name").value.trim();
+      const name = variableName("variable-name", "variable-custom-name");
       const enteredDefault = $("variable-default").value;
       const defaultValue =
         enteredDefault !== "" || previousDefinition?.default === ""
@@ -1145,6 +1188,21 @@
         });
       }
 
+      if (old.type === "ocr_value") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: valueFields("step", valueROIPicker),
+        });
+      }
+      if (old.type === "capture_screen") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: { output_key: $("step-screenshot-output").value.trim() },
+        });
+      }
+
       if (["wait_for_text", "if_text"].includes(old.type)) {
         await review({
           operation: "fields",
@@ -1217,7 +1275,7 @@
     $(`${prefix}-roi-picker`).append(fragment);
   }
 
-  function createRegionOCRPicker(prefix, textPrefix) {
+  function createRegionOCRPicker(prefix, textPrefix, parser = null) {
     mountRegionOCR(prefix);
     const canvas = $(`${prefix}-roi-canvas`);
     let image = null,
@@ -1362,16 +1420,19 @@
       task(async () => {
         if (!token) throw new Error("Select an OCR region snapshot first.");
         const testedGeneration = generation;
-        const text = $(`${textPrefix}-text-value`).value.trim();
+        const text = parser ? "" : $(`${textPrefix}-text-value`).value.trim();
         const result = await api("/api/ocr/roi-test", {
           token,
           roi: read(),
           text,
+          ...(parser ? { parser } : {}),
         });
         if (testedGeneration !== generation) return;
-        $(`${prefix}-roi-result`).textContent = result.found
-          ? `Target detected in selected snapshot crop · ${result.texts.join(" | ")}`
-          : `Target not detected in selected snapshot crop · ${result.texts.join(" | ") || "No text read"}`;
+        $(`${prefix}-roi-result`).textContent = parser
+          ? `Read Balance: ${result.value}`
+          : result.found
+            ? `Target detected in selected snapshot crop · ${result.texts.join(" | ")}`
+            : `Target not detected in selected snapshot crop · ${result.texts.join(" | ") || "No text read"}`;
       }),
     );
 
@@ -1382,6 +1443,19 @@
   const recordROIPicker = createRegionOCRPicker("record", "record");
   const conditionROIPicker = createRegionOCRPicker("condition", "condition");
   const expectedROIPicker = createRegionOCRPicker("expected", "expected");
+  const valueROIPicker = createRegionOCRPicker("value", null, "currency");
+  const recordValueROIPicker = createRegionOCRPicker(
+    "record-value",
+    null,
+    "currency",
+  );
+  const liveValueROIPicker = createRegionOCRPicker(
+    "live-value",
+    null,
+    "currency",
+  );
+  liveValueROIPicker.reset(null);
+  recordValueROIPicker.reset(null);
   recordROIPicker.reset(null);
   conditionROIPicker.reset(null);
 
@@ -1442,9 +1516,100 @@
     ),
   );
 
+  function valueFields(prefix, picker) {
+    const fields = picker.fields();
+    if (!fields.roi) throw new Error("Select a calibrated OCR region first.");
+    return {
+      ...fields,
+      parser: "currency",
+      output: $(`${prefix}-value-output`).value.trim(),
+    };
+  }
+
+  function applyValuePreset(prefix) {
+    const balance = $(`${prefix}-value-preset`).value === "balance";
+    const name = $(`${prefix}-value-name`);
+    const output = $(`${prefix}-value-output`);
+    $(`${prefix}-value-parser`).value = "currency";
+    name.readOnly = balance;
+    output.readOnly = balance;
+    if (balance) {
+      name.value = "Available Balance";
+      output.value = "payer_balance";
+    } else {
+      if (name.value === "Available Balance") name.value = "";
+      if (output.value === "payer_balance") output.value = "";
+    }
+  }
+
+  $("record-value-preset").addEventListener("change", () =>
+    applyValuePreset("record"),
+  );
+
+  $("record-value").addEventListener("click", () =>
+    task(() =>
+      review(
+        insertionPayload({
+          type: "ocr_value",
+          label: $("record-value-name").value.trim() || "Read Balance",
+          ...valueFields("record", recordValueROIPicker),
+        }),
+      ),
+    ),
+  );
+
+  $("record-read-value").addEventListener("click", () =>
+    task(async () => {
+      await pendingManual;
+      await flushText();
+      readValueOpen = true;
+      $("live-value-preset").value = "balance";
+      applyValuePreset("live");
+      liveValueROIPicker.reset(null);
+    }),
+  );
+
+  $("live-value-preset").addEventListener("change", () =>
+    applyValuePreset("live"),
+  );
+
+  $("live-value-save").addEventListener("click", () =>
+    task(async () => {
+      if (!recording.active || stopping) return;
+      await pendingManual;
+      await flushText();
+      const step = {
+        type: "ocr_value",
+        label: $("live-value-name").value.trim() || "Read Balance",
+        ...valueFields("live", liveValueROIPicker),
+      };
+      recording = await api("/api/recorder/step", {
+        capture: false,
+        step,
+      });
+      readValueOpen = false;
+      liveValueROIPicker.reset(null);
+      show("Read Balance step added. Recording continues.");
+    }),
+  );
+
+  $("live-value-cancel").addEventListener("click", () => {
+    readValueOpen = false;
+    liveValueROIPicker.reset(null);
+    renderRecording();
+  });
+
   $("record-screenshot").addEventListener("click", () =>
     task(() =>
-      review(insertionPayload({ type: "capture_screen", label: "Screenshot" })),
+      review(
+        insertionPayload({
+          type: "capture_screen",
+          label: "Screenshot",
+          ...($("record-screenshot-output").value.trim()
+            ? { output_key: $("record-screenshot-output").value.trim() }
+            : {}),
+        }),
+      ),
     ),
   );
 
@@ -1760,10 +1925,22 @@
       ? current
       : keyboards[0]?.id || "__capture__";
     variableMethodFields();
+    variableChoiceFields(
+      "record-variable-name",
+      "record-variable-custom-field",
+      "record-variable-custom-name",
+      $("record-variable-name").value,
+    );
     renderRecording();
   });
 
   $("record-variable-method").addEventListener("change", variableMethodFields);
+  $("record-variable-name").addEventListener(
+    "change",
+    () =>
+      ($("record-variable-custom-field").hidden =
+        $("record-variable-name").value !== "__custom__"),
+  );
   $("record-variable-keyboard").addEventListener("change", () => {
     if ($("record-variable-keyboard").value !== "__capture__") return;
     returnToVariableInput = true;
@@ -1778,7 +1955,10 @@
   async function addVariableInput(typeNow) {
     await pendingManual;
     await flushText();
-    const name = $("record-variable-name").value.trim();
+    const name = variableName(
+      "record-variable-name",
+      "record-variable-custom-name",
+    );
     if (!name) throw new Error("Enter a variable name.");
     const defaultValue = $("record-variable-default").value;
     if (typeNow && defaultValue === "")
@@ -1794,7 +1974,9 @@
       api("/api/recorder/variable-input", {
         variable: {
           name,
-          label: name.replaceAll("_", " "),
+          label:
+            { account_number: "Account Number", amount: "Amount" }[name] ||
+            name.replaceAll("_", " "),
           type: "text",
           required: true,
           default: defaultValue === "" ? null : defaultValue,
@@ -1927,6 +2109,7 @@
       try {
         keyboardSetupOpen = false;
         variableInputOpen = false;
+        readValueOpen = false;
         returnToVariableInput = false;
         alternateSetupOpen = false;
         specialCaseAfterStepId = null;
@@ -1972,6 +2155,7 @@
         recording = await api("/api/recorder/stop", {});
         keyboardSetupOpen = false;
         variableInputOpen = false;
+        readValueOpen = false;
         returnToVariableInput = false;
         alternateSetupOpen = false;
         specialCaseAfterStepId = null;
@@ -2007,6 +2191,7 @@
       recording = await api("/api/recorder/cancel", {});
       keyboardSetupOpen = false;
       variableInputOpen = false;
+      readValueOpen = false;
       returnToVariableInput = false;
       alternateSetupOpen = false;
       specialCaseAfterStepId = null;

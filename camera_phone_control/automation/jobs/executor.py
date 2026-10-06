@@ -126,7 +126,10 @@ class BackgroundJobExecutor:
             screenshots = snapshot.get("screenshots", [])
             if status == "passed":
                 self.scheduler.complete_job(
-                    job.job_id, "Workflow completed.", screenshots=screenshots
+                    job.job_id,
+                    "Workflow completed.",
+                    screenshots=screenshots,
+                    outputs=snapshot.get("outputs", {}),
                 )
             elif status == "cancelled":
                 self.scheduler.finish_cancelled(

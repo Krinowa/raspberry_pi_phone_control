@@ -12,6 +12,7 @@ from ..screen.state import (
 )
 from ..screen.stability import wait_until_stable
 from .timing import WorkflowTiming
+from .values import read_currency
 
 SCREEN_KEYBOARD_KEY_DELAY = 0.08
 
@@ -51,6 +52,7 @@ class WorkflowRunner:
         screen_state_provider=None,
         timing=None,
         capture_screen=None,
+        output_callback=None,
     ):
         self.context = context
         self.external_screen = external_screen
@@ -61,6 +63,7 @@ class WorkflowRunner:
         )
         self.timing = timing or WorkflowTiming()
         self.capture_screen = capture_screen
+        self.output_callback = output_callback
 
     def run(self, workflow, variables=None, *, start_step_index=0):
         workflow = validate_workflow(workflow)
@@ -239,6 +242,11 @@ class WorkflowRunner:
                 keyboards or {},
                 "THEN" if matched else "ELSE",
             )
+        elif kind == "ocr_value":
+            value = read_currency(self.screen_state_provider, step["roi"], ctx)
+            if self.output_callback is not None:
+                self.output_callback(step["output"], format(value, ".2f"))
+            ctx.logger.info("OCR value extracted.")
         elif kind == "capture_screen":
             if self.capture_screen is None:
                 raise ScreenStateError(

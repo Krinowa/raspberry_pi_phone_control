@@ -13,6 +13,7 @@ STEP_TYPES = {
     "wait_for_text",
     "if_text",
     "capture_screen",
+    "ocr_value",
     "manual_checkpoint",
 }
 VARIABLE_TYPES = {"text", "number"}

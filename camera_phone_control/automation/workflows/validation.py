@@ -223,6 +223,7 @@ def validate_workflow(workflow, *, allow_empty=False):
         raise ValueError("Unsupported workflow version.")
     if type(workflow.get("financial", False)) is not bool:
         raise ValueError("financial must be a boolean.")
+
     recovery_workflow_id = workflow.get("recovery_workflow_id")
     if recovery_workflow_id is not None:
         identifier(recovery_workflow_id)
@@ -338,7 +339,8 @@ def validate_workflow(workflow, *, allow_empty=False):
                 "then_steps",
                 "else_steps",
             },
-            "capture_screen": set(),
+            "capture_screen": {"output_key"},
+            "ocr_value": {"roi", "parser", "output"},
             "manual_checkpoint": {"message"},
         }[kind]
 
@@ -432,6 +434,21 @@ def validate_workflow(workflow, *, allow_empty=False):
                 raise ValueError(
                     "timeout_seconds must allow the requested stability window."
                 )
+        elif kind == "capture_screen":
+            if "output_key" in step:
+                if step["output_key"] == "":
+                    step.pop("output_key")
+                else:
+                    identifier(step["output_key"])
+        elif kind == "ocr_value":
+            if step.get("parser") != "currency":
+                raise ValueError(
+                    "Read Balance currently supports the currency parser only."
+                )
+            identifier(step.get("output"))
+            step["roi"] = dict(
+                zip(("x", "y", "width", "height"), normalized_roi(step.get("roi")))
+            )
         elif kind in {"wait_for_text", "if_text"}:
             expected = text(step.get("text"), "Text to detect", 500).strip()
             if not expected:

@@ -97,6 +97,7 @@ class WorkflowService:
                 "timing": WorkflowTiming(),
                 "completed": completed,
                 "screenshots": [],
+                "outputs": {},
             }
 
             external_screen = self.external_screen
@@ -115,7 +116,17 @@ class WorkflowService:
                 )
                 with self.lock:
                     item["screenshots"].append(artifact)
+                    if step.get("output_key"):
+                        item["outputs"][step["output_key"]] = str(
+                            (
+                                self.screenshot_store.root / artifact["relative_path"]
+                            ).resolve()
+                        )
                 return artifact
+
+            def store_output(name, value):
+                with self.lock:
+                    item["outputs"][name] = value
 
             def execute():
                 try:
@@ -127,6 +138,7 @@ class WorkflowService:
                             screen_state_provider,
                             timing=item["timing"],
                             capture_screen=capture_screen,
+                            output_callback=store_output,
                         ).run(
                             workflow,
                             variables,
@@ -241,6 +253,7 @@ class WorkflowService:
                 logs=logs,
                 timing=item["timing"].snapshot(),
                 screenshots=deepcopy(item["screenshots"]),
+                outputs=deepcopy(item["outputs"]),
             )
             index = result.get("step_index", 0)
             result["preview"] = deepcopy(item["steps"][index - 1]) if index else None
