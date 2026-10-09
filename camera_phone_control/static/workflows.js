@@ -11,12 +11,18 @@
     running = null,
     working = false,
     gesture = null;
+  let availableFlows = [];
+  let flowLoadGeneration = 0;
   let editingId = null,
     timelineSignature = "",
     timelineWasLive = false,
     stopping = false;
   let externalPhysicalBusy = false,
     reconnectRefreshInFlight = false;
+  let runPollTimer = null,
+    runPollInFlight = false,
+    workflowPollingStopped = false,
+    runStateSignature = "";
   let textBuffer = "",
     textTimer = null,
     captureQueue = Promise.resolve(),
@@ -30,6 +36,13 @@
     $("workflow-notice").textContent = message;
     $("workflow-notice").classList.toggle("error", error);
   };
+
+  // Recording and review use one control pane so the phone surface remains
+  // beside the timeline, temporary setup panels, and step editor.
+  $("workflow-authoring-slot").append(
+    $("review-flow"),
+    $("expected-text-editor"),
+  );
 
   async function task(fn) {
     if (working) return;
@@ -48,22 +61,44 @@
   function describe(step, index = 0) {
     const suffix = step.label;
     if (step.type === "tap") return `Tap${suffix ? " — " + suffix : ""}`;
+
     if (step.type === "swipe") {
       const dx = step.end[0] - step.start[0],
         dy = step.end[1] - step.start[1];
       return `Swipe ${Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "Right" : "Left") : dy > 0 ? "Down" : "Up"}${step.label ? " — " + step.label : ""}`;
     }
+
     if (step.type === "input") {
       const variable = recording.workflow?.variables.find(
         (v) => v.name === step.variable,
       );
-      return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}`;
+      const format =
+        step.variable === "amount"
+          ? {
+              implied_cents: "Implied cents",
+              whole_number: "Whole amount only",
+            }[step.amount_format]
+          : null;
+      return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}${format ? " · " + format : ""}`;
     }
+
     if (step.type === "wait_until_stable")
       return `Wait for Screen to Settle — Stable for ${step.stable_ms} ms · Max ${step.timeout_seconds} sec`;
+
     if (step.type === "wait_for_text")
-      return `Wait for Text — “${step.text}” · Max ${step.timeout_seconds} sec`;
+      return `Wait for Text — “${step.text}” · Wait up to ${step.timeout_seconds} sec`;
+
+    if (step.type === "if_text") return `Special Case — “${step.text}”`;
+    if (step.type === "ocr_value")
+      return `Read Balance — ${step.label || step.output}`;
+
+    if (step.type === "capture_screen") {
+      const label = typeof suffix === "string" ? suffix.trim() : "";
+      return `Capture Screenshot${label && !["screenshot", "receipt screenshot"].includes(label.toLocaleLowerCase()) ? " — " + label : ""}`;
+    }
+
     if (step.type === "wait") return `Wait ${step.seconds} seconds`;
+
     if (step.type === "key")
       return (
         step.label ||
@@ -82,6 +117,34 @@
     return `Manual checkpoint${step.label ? " — " + step.label : ""}`;
   }
 
+  function allWorkflowSteps(steps = recording.workflow?.steps || []) {
+    const result = [];
+    for (const step of steps) {
+      result.push(step);
+      if (step.type === "if_text") {
+        result.push(...allWorkflowSteps(step.then_steps));
+        result.push(...allWorkflowSteps(step.else_steps));
+      }
+    }
+    return result;
+  }
+
+  function findWorkflowStep(stepId) {
+    return allWorkflowSteps().find((step) => step.id === stepId);
+  }
+
+  function setSectionVisible(id, visible) {
+    const section = $(id);
+
+    section.hidden = !visible;
+
+    section
+      .querySelectorAll("input, select, textarea, button")
+      .forEach((control) => {
+        control.disabled = !visible;
+      });
+  }
+
   function button(label, fn) {
     const element = document.createElement("button");
     element.type = "button";
@@ -92,16 +155,23 @@
 
   let expectedActionId = null,
     expectedMode = null,
+    expectedOriginalROI = null,
     keyboardSetupOpen = false,
     variableInputOpen = false,
-    returnToVariableInput = false;
+    readValueOpen = false,
+    returnToVariableInput = false,
+    alternateSetupOpen = false,
+    specialCaseAfterStepId = null,
+    enabledManualForReviewSpecialCase = false;
 
   const annotationBusy = () =>
     !!expectedMode ||
     !!recording.expected_text_pending ||
     keyboardSetupOpen ||
     !!recording.keyboard_capture ||
-    variableInputOpen;
+    variableInputOpen ||
+    readValueOpen ||
+    alternateSetupOpen;
 
   function keyboardOptions(select, captureOption = false) {
     const keyboards = Object.values(recording.workflow?.keyboards || {});
@@ -112,8 +182,10 @@
           keyboard.id,
         ),
     );
+
     if (captureOption)
       options.push(new Option("+ Capture New Keyboard", "__capture__"));
+
     select.replaceChildren(...options);
     return keyboards;
   }
@@ -143,12 +215,16 @@
       if ($("keyboard-numeric-backspace").checked) keys.push("BACKSPACE");
       return keys;
     }
+
     if (kind === "alphabetic") {
-      const keys = Array.from("abcdefghijklmnopqrstuvwxyz");
+      const keys = Array.from("qwertyuiopasdfghjklzxcvbnm");
+
       if ($("keyboard-include-space").checked) keys.push(" ");
       if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
+
       return keys;
     }
+
     return $("keyboard-custom-keys")
       .value.split(",")
       .map((label) => label.trim());
@@ -166,15 +242,55 @@
     );
   }
 
+  function isUsefulExpectedText(text) {
+    const value = String(text || "").trim();
+
+    if (value.length < 2) return false;
+
+    const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    const keyboardPatterns = [
+      "qwertyuiop",
+      "asdfghjkl",
+      "zxcvbnm",
+      "1234567890",
+    ];
+
+    if (
+      keyboardPatterns.some(
+        (pattern) => pattern.includes(compact) || compact.includes(pattern),
+      )
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
   async function openExpectedText(step, wait, mode = "review") {
     expectedActionId = step?.id || null;
     expectedMode = mode;
+
     $("expected-text-editor").hidden = false;
+
+    requestAnimationFrame(() => {
+      $("expected-text-editor").scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+
     $("expected-text-title").textContent = step
       ? `Choose expected text after ${describe(step)}`
       : "Choose expected text for the current screen";
+
     $("expected-text-value").value = wait?.text || "";
+
     $("expected-text-timeout").value = wait?.timeout_seconds ?? 10;
+
+    expectedOriginalROI = wait?.roi || null;
+    expectedROIPicker.reset(expectedOriginalROI);
+    $("expected-text-advanced").open = !!expectedOriginalROI;
     $("expected-suggestions").replaceChildren();
     $("expected-text-status").textContent = "Reading current phone screen…";
     renderRecording();
@@ -185,12 +301,24 @@
         "/api/recorder/text-suggestions",
         mode === "current" ? { current: true } : { step_id: step.id },
       );
+
       if (
         expectedMode !== targetMode ||
         expectedActionId !== (step?.id || null)
       )
         return;
-      const choices = (result.suggestions || []).slice(0, 5);
+
+      const choices = (result.suggestions || [])
+        .map((text) => String(text || "").trim())
+        .filter(isUsefulExpectedText)
+        .filter(
+          (text, index, list) =>
+            list.findIndex(
+              (item) => item.toLowerCase() === text.toLowerCase(),
+            ) === index,
+        )
+        .slice(0, 5);
+
       $("expected-suggestions").replaceChildren(
         ...choices.map((text) => {
           const label = document.createElement("label");
@@ -218,11 +346,29 @@
     renderRecording();
   }
 
-  function closeExpectedText() {
+  function closeExpectedText(scrollBack = false) {
     expectedActionId = null;
     expectedMode = null;
+    expectedOriginalROI = null;
+
+    expectedROIPicker.reset(null);
+    $("expected-text-advanced").open = false;
     $("expected-text-editor").hidden = true;
+
     render();
+
+    if (scrollBack) {
+      requestAnimationFrame(() => {
+        const returnTarget = recording.active
+          ? $("record-live")
+          : $("review-flow");
+
+        returnTarget?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      });
+    }
   }
 
   async function openPendingExpectedText() {
@@ -254,21 +400,47 @@
         recording = await api("/api/recorder/expected-text", {
           ...textWaitFields("expected"),
         });
-      closeExpectedText();
+
+      closeExpectedText(true);
     });
   });
+
   $("expected-text-cancel").addEventListener("click", () =>
     task(async () => {
       if (expectedMode && expectedMode !== "review")
         recording = await api("/api/recorder/expected-text/cancel", {});
-      closeExpectedText();
+
+      closeExpectedText(true);
     }),
   );
+
   $("expected-text-manual").addEventListener("click", () => {
     for (const radio of $("expected-suggestions").querySelectorAll("input"))
       radio.checked = false;
     $("expected-text-value").focus();
   });
+
+  function renderInsertPositions(steps = recording.workflow?.steps || []) {
+    const positions = [new Option("At the beginning", "0")];
+    steps.forEach((step, index) =>
+      positions.push(
+        new Option(
+          `After ${index + 1}. ${describe(step, index)}`,
+          String(index + 1),
+        ),
+      ),
+    );
+    $("insert-position").replaceChildren(...positions);
+    $("insert-position").value = String(steps.length);
+  }
+
+  function insertionPayload(step) {
+    return {
+      operation: "insert",
+      index: Number($("insert-position").value),
+      step,
+    };
+  }
 
   function renderTimeline() {
     const draft = recording.workflow;
@@ -289,110 +461,206 @@
       return;
     }
 
-    $("flow-name").value = draft.name;
-    $("flow-financial").checked = !!draft.financial;
-    const positions = [new Option("At the beginning", "0")];
-    const rows = draft.steps.map((step, index) => {
-      const row = document.createElement("li"),
-        title = document.createElement("strong");
-      title.textContent = describe(step, index);
-      row.append(title);
+    $("flow-name").value = draft.name === "New Recording" ? "" : draft.name;
+    $("flow-purpose").value = draft.purpose || "payment";
+    const renderRows = (steps, nested = false) =>
+      steps.map((step, index) => {
+        const row = document.createElement("li"),
+          title = document.createElement("strong");
+        row.dataset ||= {};
+        row.dataset.stepId = step.id;
+        title.textContent = describe(step, index);
+        row.append(title);
 
-      if (step.type === "tap") {
-        const detail = document.createElement("p");
-        detail.textContent = `X ${Math.round(step.x * 100)}% • Y ${Math.round(step.y * 100)}%`;
-        row.append(detail);
-      }
-      if (step.preview) {
-        const image = document.createElement("img");
-        image.src = "data:image/png;base64," + step.preview;
-        image.alt = "Target preview before the tap";
-        image.width = 96;
-        image.height = 96;
-        row.append(image);
-      }
-      const actions = document.createElement("div");
-      actions.className = "flow-buttons";
-      actions.append(button("Edit", () => openEditor(step)));
-      if (step.type === "input") {
-        const value = document.createElement("p");
-        value.textContent =
-          step.source === "fixed"
-            ? "“" + step.value + "”"
-            : "Ask for: " +
-              (draft.variables.find((v) => v.name === step.variable)?.label ||
-                "Input");
-        row.append(value);
-      }
-      actions.append(
-        button("Delete", () =>
-          review({ operation: "delete", step_id: step.id }),
-        ),
-      );
-      if (index > 0)
+        if (step.critical === true) {
+          const warning = document.createElement("p");
+          warning.className = "small";
+          warning.textContent = "Irreversible payment submission";
+          row.append(warning);
+        }
+
+        if (step.type === "tap") {
+          const detail = document.createElement("p");
+          detail.textContent = `X ${Math.round(step.x * 100)}% • Y ${Math.round(step.y * 100)}%`;
+          row.append(detail);
+        }
+
+        if (step.preview) {
+          const image = document.createElement("img");
+          image.src = "data:image/png;base64," + step.preview;
+          image.alt = "Target preview before the tap";
+          image.width = 96;
+          image.height = 96;
+          row.append(image);
+        }
+
+        if (!recording.active && step.recording_screenshot?.image) {
+          const wrap = document.createElement("div");
+          wrap.className = "recording-step-preview";
+
+          const image = document.createElement("img");
+
+          const format =
+            step.recording_screenshot.format === "png" ? "png" : "jpeg";
+
+          image.src =
+            `data:image/${format};base64,` + step.recording_screenshot.image;
+
+          image.alt = `Screen before ${describe(step, index)}`;
+
+          wrap.append(image);
+
+          if (step.type === "tap") {
+            const marker = document.createElement("span");
+            marker.className = "recording-tap-marker";
+
+            marker.style.left = `${step.x * 100}%`;
+            marker.style.top = `${step.y * 100}%`;
+
+            wrap.append(marker);
+          }
+
+          if (step.type === "swipe") {
+            const start = document.createElement("span");
+            start.className = "recording-swipe-start";
+            start.style.left = `${step.start[0] * 100}%`;
+            start.style.top = `${step.start[1] * 100}%`;
+
+            const end = document.createElement("span");
+            end.className = "recording-swipe-end";
+            end.style.left = `${step.end[0] * 100}%`;
+            end.style.top = `${step.end[1] * 100}%`;
+
+            wrap.append(start, end);
+          }
+
+          row.append(wrap);
+        }
+
+        const actions = document.createElement("div");
+        actions.className = "flow-buttons";
+        actions.append(button("Edit", () => openEditor(step)));
+
+        if (step.type === "input") {
+          const value = document.createElement("p");
+          value.textContent =
+            step.source === "fixed"
+              ? "“" + step.value + "”"
+              : "Variable: " +
+                (draft.variables.find((v) => v.name === step.variable)?.label ||
+                  "Input");
+          row.append(value);
+        }
         actions.append(
-          button("Move Up", () =>
-            review({ operation: "move", step_id: step.id, index: index - 1 }),
+          button("Delete", () =>
+            review({ operation: "delete", step_id: step.id }),
           ),
         );
-      if (index < draft.steps.length - 1)
-        actions.append(
-          button("Move Down", () =>
-            review({ operation: "move", step_id: step.id, index: index + 1 }),
-          ),
-        );
-      if (!recording.active && canExpectText(step)) {
-        const next = draft.steps[index + 1];
-        const wait = next?.type === "wait_for_text" ? next : null;
-        const expected = document.createElement("p");
-        expected.textContent = `Expected text: ${wait?.text || "Not configured"}`;
-        row.append(expected);
-        actions.append(
-          button(wait ? "Change" : "Add Expected Text", () =>
-            openExpectedText(step, wait),
-          ),
-        );
-        if (wait)
+
+        if (index > 0)
           actions.append(
-            button("Remove", () =>
-              review({
-                operation: "remove_expected_text",
-                step_id: step.id,
-              }),
+            button("Move Up", () =>
+              review({ operation: "move", step_id: step.id, index: index - 1 }),
             ),
           );
-      }
-      if (!recording.active) row.append(actions);
-      positions.push(
-        new Option(
-          `After ${index + 1}. ${describe(step, index)}`,
-          String(index + 1),
-        ),
-      );
-      return row;
-    });
+
+        if (index < steps.length - 1)
+          actions.append(
+            button("Move Down", () =>
+              review({ operation: "move", step_id: step.id, index: index + 1 }),
+            ),
+          );
+
+        if (!nested && !recording.active && canExpectText(step)) {
+          const next = draft.steps[index + 1];
+          const wait = next?.type === "wait_for_text" ? next : null;
+          const expected = document.createElement("p");
+          expected.textContent = `Expected text: ${wait?.text || "Not configured"}`;
+          row.append(expected);
+          actions.append(
+            button(wait ? "Change" : "Add Expected Text", () =>
+              openExpectedText(step, wait),
+            ),
+          );
+
+          if (wait)
+            actions.append(
+              button("Remove", () =>
+                review({
+                  operation: "remove_expected_text",
+                  step_id: step.id,
+                }),
+              ),
+            );
+        }
+
+        if (!nested && !recording.active)
+          actions.append(
+            button("+ Add Special Case", () => openSpecialCaseSetup(step.id)),
+          );
+
+        if (step.type === "if_text") {
+          const branches = document.createElement("div");
+          branches.className = "condition-branches";
+          const summary = document.createElement("p");
+          summary.textContent = `Looking for: “${step.text}” · ${step.then_steps.length} recorded ${step.then_steps.length === 1 ? "action" : "actions"} · If not shown: Continue normally`;
+          branches.append(summary);
+          const configuredBranches = [
+            ["Actions when shown", "then_steps"],
+            ...(step.else_steps.length
+              ? [["Actions when not shown", "else_steps"]]
+              : []),
+          ];
+          for (const [label, branch] of configuredBranches) {
+            const section = document.createElement("section"),
+              heading = document.createElement("h5"),
+              list = document.createElement("ol");
+            heading.textContent = label;
+            list.className = "condition-step-list";
+            const childRows = renderRows(step[branch], true);
+            list.replaceChildren(...childRows);
+            if (!childRows.length) {
+              const empty = document.createElement("li");
+              empty.className = "condition-empty";
+              empty.textContent = "No steps recorded";
+              list.append(empty);
+            }
+            section.append(heading, list);
+            branches.append(section);
+          }
+          row.append(branches);
+        }
+
+        if (!recording.active) row.append(actions);
+        return row;
+      });
+
+    const rows = renderRows(draft.steps);
 
     $("record-steps").replaceChildren(...rows);
     if (enteringReview) $("record-steps").scrollTop = 0;
     if (recording.active) rows.at(-1)?.scrollIntoView?.({ block: "nearest" });
-    $("insert-position").replaceChildren(...positions);
-    $("insert-position").value = String(draft.steps.length);
+    renderInsertPositions(draft.steps);
     $("workflow-debug-data").textContent = JSON.stringify(
       draft,
       (key, value) =>
-        ["value", "default", "preview"].includes(key) ? "(hidden)" : value,
+        ["value", "default", "preview", "image"].includes(key)
+          ? "(hidden)"
+          : value,
       2,
     );
   }
 
   function renderCapturedKeyboards() {
     const keyboards = Object.values(recording.workflow?.keyboards || {});
+
     $("captured-keyboards").hidden = !recording.workflow || !keyboards.length;
     const referenced = new Set(
-      (recording.workflow?.steps || [])
+      allWorkflowSteps()
         .filter((step) => step.input_method === "screen_keyboard")
         .map((step) => step.keyboard_id),
     );
+
     $("captured-keyboard-list").replaceChildren(
       ...keyboards.map((keyboard) => {
         const row = document.createElement("li"),
@@ -413,7 +681,7 @@
         const kind =
           keyboard.kind.charAt(0).toUpperCase() + keyboard.kind.slice(1);
         detail.textContent = `${kind} · ${Object.keys(keyboard.keys).length} keys`;
-        const uses = (recording.workflow?.steps || []).filter(
+        const uses = allWorkflowSteps().filter(
           (step) =>
             step.input_method === "screen_keyboard" &&
             step.keyboard_id === keyboard.id,
@@ -440,10 +708,27 @@
     );
   }
 
+  function renderDeviceAvailability() {
+    $("flow-run").disabled =
+      working ||
+      !selected ||
+      !!recording.workflow ||
+      (piManual() && !window.selectedPiDeviceConnected?.()) ||
+      (running && !terminal.has(running.status));
+  }
+
   function renderRecording() {
     const draft = recording.workflow,
       live = recording.active,
-      editingExisting = !!recording.editing_existing;
+      editingExisting = !!recording.editing_existing,
+      reviewSpecialCase = recording.alternate_screen?.return_mode === "review";
+
+    $("control-workspace").classList.toggle("is-workflow-authoring", !!draft);
+    $("workflow-phone-pane").classList.toggle(
+      "uses-workflow-preview",
+      backend === "mock",
+    );
+    $("workflow-mock-preview-slot").hidden = backend !== "mock";
 
     $("record-new").hidden = !!draft;
     $("record-guidance").hidden = !!draft;
@@ -485,46 +770,78 @@
 
     $("record-status").textContent = stopping
       ? "Finishing recording…"
-      : `● Recording • ${draft?.steps.length || 0} ${
-          draft?.steps.length === 1 ? "step" : "steps"
-        }`;
+      : recording.alternate_screen
+        ? "● Recording Special Case"
+        : `● Recording • ${draft?.steps.length || 0} ${
+            draft?.steps.length === 1 ? "step" : "steps"
+          }`;
 
-    $("record-count").textContent = "Taps, swipes and typing appear below.";
+    $("record-count").textContent = recording.alternate_screen
+      ? `Looking for: “${recording.alternate_screen.text}”`
+      : "Taps, swipes and typing appear below.";
 
     $("record-start").disabled = working || !!draft;
 
     $("record-stop").disabled = stopping;
+    $("record-stop").hidden = reviewSpecialCase;
 
-    $("record-mark-next").textContent = recording.mark_next_screen
-      ? "✓ Next Screen Will Be Checked"
-      : "Mark Next Screen: OFF";
-    $("record-mark-next").disabled = stopping || annotationBusy();
     $("record-expect-current").disabled = stopping || annotationBusy();
+    $("record-read-value").disabled = stopping || annotationBusy();
     $("record-capture-keyboard").disabled = stopping || annotationBusy();
     $("review-capture-keyboard").disabled = annotationBusy();
     $("record-input-variable").disabled = stopping || annotationBusy();
+    $("record-alternate-screen").hidden =
+      alternateSetupOpen || !!recording.alternate_screen;
+    $("record-alternate-screen").disabled = stopping || annotationBusy();
+    $("alternate-screen-setup").hidden = !alternateSetupOpen;
+    $("alternate-screen-active").hidden = !recording.alternate_screen;
+    $("alternate-screen-finish").disabled = stopping || annotationBusy();
+    $("alternate-screen-cancel").disabled = stopping || annotationBusy();
+    $("alternate-screen-status").textContent = recording.alternate_screen
+      ? `Looking for: “${recording.alternate_screen.text}” · ${recording.alternate_screen.step_count} recorded ${recording.alternate_screen.step_count === 1 ? "action" : "actions"}`
+      : "";
+    $("record-screenshot-here").disabled =
+      working || stopping || annotationBusy();
     $("record-variable-input").hidden = !variableInputOpen;
+    $("record-read-value-form").hidden = !readValueOpen;
+
     const sharedPhysicalBusy =
       externalPhysicalBusy || !!window.phoneConnection?.isPhysicalBusy?.();
+
     $("record-variable-type").disabled =
       working ||
       sharedPhysicalBusy ||
       !!window.phoneConnection?.isReconnecting?.();
     $("record-variable-type").textContent = sharedPhysicalBusy
-      ? "Typing sample..."
-      : "Add & Type Sample";
+      ? "Typing now..."
+      : "Add & Type Now";
     $("keyboard-capture").hidden =
       !keyboardSetupOpen && !recording.keyboard_capture;
+
     const keyboardCaptureSlot = live ? $("record-live") : $("review-flow");
     if ($("keyboard-capture").parentElement !== keyboardCaptureSlot)
       keyboardCaptureSlot.append($("keyboard-capture"));
+
     const captureKey = currentKeyboardKey();
-    if (recording.keyboard_capture) {
-      const done = Object.keys(recording.keyboard_capture.keys || {});
-      $("keyboard-capture-instruction").textContent = captureKey
-        ? `Currently capturing “${displayKeyboardKey(captureKey)}”. Click that key on the phone preview. Captured: ${done.map(displayKeyboardKey).join(", ") || "none"}.`
-        : "All selected keys are captured. Save the keyboard or cancel.";
+    const overlay = $("keyboard-capture-overlay");
+    const overlayKey = $("keyboard-capture-overlay-key");
+
+    if (recording.keyboard_capture && captureKey) {
+      const label = displayKeyboardKey(captureKey);
+
+      overlay.hidden = false;
+      overlayKey.textContent = label;
+
+      $("keyboard-capture-instruction").textContent =
+        `Tap ${label} on the phone preview.`;
+    } else {
+      overlay.hidden = true;
+
+      $("keyboard-capture-instruction").textContent = recording.keyboard_capture
+        ? "All selected keys are captured. Save the keyboard or cancel."
+        : "Choose keys, then start capture.";
     }
+
     $("keyboard-capture-start").hidden = !!recording.keyboard_capture;
     $("keyboard-capture-save").hidden =
       !recording.keyboard_capture || !!captureKey;
@@ -532,7 +849,9 @@
     $("record-undo").disabled =
       stopping ||
       annotationBusy() ||
-      !draft?.steps.length ||
+      !(recording.alternate_screen
+        ? recording.alternate_screen.step_count
+        : draft?.steps.length) ||
       queued > 0 ||
       !!textBuffer;
 
@@ -546,11 +865,7 @@
       ? "Cancel Editing"
       : "Discard Recording";
 
-    $("flow-run").disabled =
-      working ||
-      !selected ||
-      !!draft ||
-      (running && !terminal.has(running.status));
+    renderDeviceAvailability();
 
     $("mock-recording-preview").hidden =
       piManual() || backend !== "mock" || !live;
@@ -592,6 +907,30 @@
     $("input-method-fields").hidden = source === "manual";
     $("input-keyboard-field").hidden =
       source === "manual" || $("input-method").value !== "screen_keyboard";
+    $("amount-format-field").hidden =
+      source !== "variable" || $("variable-name").value !== "amount";
+  }
+
+  function recordAmountFormatFields() {
+    $("record-amount-format-field").hidden =
+      $("record-variable-name").value !== "amount";
+  }
+
+  function variableName(selectId, customId) {
+    const choice = $(selectId).value;
+    return choice === "__custom__" ? $(customId).value.trim() : choice;
+  }
+
+  function variableChoiceFields(selectId, customFieldId, customId, name) {
+    const predefined = ["account_number", "amount", "bank_name"];
+    if (name === "__custom__") {
+      $(selectId).value = name;
+      $(customFieldId).hidden = false;
+      return;
+    }
+    $(selectId).value = predefined.includes(name) ? name : "__custom__";
+    $(customId).value = predefined.includes(name) ? "" : name || "";
+    $(customFieldId).hidden = $(selectId).value !== "__custom__";
   }
 
   function openEditor(step, source) {
@@ -600,23 +939,42 @@
     $("step-editor").hidden = false;
     $("step-editor-title").textContent = describe(
       step,
-      recording.workflow.steps.indexOf(step),
+      allWorkflowSteps(recording.workflow.steps).indexOf(step),
     );
 
     $("step-name").value = step.label || "";
+    $("step-critical").checked = step.critical === true;
 
     // Show/hide step-specific controls.
-    $("step-tap-options").hidden = step.type !== "tap";
-    $("step-swipe-options").hidden = step.type !== "swipe";
-    $("step-key-options").hidden = step.type !== "key";
-    $("step-input-options").hidden = step.type !== "input";
-    $("step-wait-options").hidden = step.type !== "wait";
-    $("step-stable-options").hidden = step.type !== "wait_until_stable";
-    $("step-text-options").hidden = step.type !== "wait_for_text";
+    setSectionVisible("step-tap-options", step.type === "tap");
+
+    setSectionVisible("step-swipe-options", step.type === "swipe");
+
+    setSectionVisible("step-key-options", step.type === "key");
+
+    setSectionVisible("step-input-options", step.type === "input");
+
+    setSectionVisible("step-wait-options", step.type === "wait");
+
+    setSectionVisible("step-stable-options", step.type === "wait_until_stable");
+    setSectionVisible("step-value-options", step.type === "ocr_value");
+    $("step-value-parser").value = step.parser || "currency";
+    $("step-value-output").value = step.output || "payer_balance";
+    valueROIPicker.reset(step.type === "ocr_value" ? step.roi : null);
+
+    setSectionVisible(
+      "step-text-options",
+      ["wait_for_text", "if_text"].includes(step.type),
+    );
+
     $("step-stable-ms").value = step.stable_ms ?? 700;
     $("step-stable-timeout").value = step.timeout_seconds ?? 10;
     $("step-text-value").value = step.text ?? "";
     $("step-text-timeout").value = step.timeout_seconds ?? 10;
+    $("step-text-timeout").min = step.type === "if_text" ? "0.1" : "0.5";
+
+    stepROIPicker.reset(step.roi);
+    $("step-text-advanced").open = !!step.roi;
 
     // Tap
     if (step.type === "tap") {
@@ -660,12 +1018,16 @@
       $("input-value").placeholder = "";
     }
 
-    $("variable-name").value = definition?.name || "";
-    $("variable-label").value = definition?.label || step.label || "";
-    $("variable-required").checked = definition?.required ?? true;
+    variableChoiceFields(
+      "variable-name",
+      "variable-custom-field",
+      "variable-custom-name",
+      definition?.name,
+    );
     $("variable-default").value = definition?.default ?? "";
-    $("variable-ask").checked = definition?.ask_when_running ?? true;
+    $("amount-format").value = step.amount_format || "raw";
     $("input-method").value = step.input_method || "hid";
+
     const keyboards = keyboardOptions($("input-keyboard"));
     $("input-keyboard").value = step.keyboard_id || keyboards[0]?.id || "";
 
@@ -678,6 +1040,11 @@
   }
 
   $("input-source").addEventListener("change", sourceFields);
+  $("variable-name").addEventListener("change", () => {
+    $("variable-custom-field").hidden =
+      $("variable-name").value !== "__custom__";
+    sourceFields();
+  });
   $("input-method").addEventListener("change", sourceFields);
 
   $("step-close").addEventListener("click", () => {
@@ -691,7 +1058,7 @@
     const step_id = editingId;
     const label = $("step-name").value;
 
-    const old = recording.workflow.steps.find((step) => step.id === step_id);
+    const old = findWorkflowStep(step_id);
 
     if (!old) {
       show("Step no longer exists.", true);
@@ -729,14 +1096,28 @@
     }
 
     if (source === "variable") {
-      input.variable = {
-        name: $("variable-name").value,
-        label: $("variable-label").value,
-        type: "text",
-        required: $("variable-required").checked,
-        default: $("variable-default").value || null,
-        ask_when_running: $("variable-ask").checked,
-      };
+      const previousDefinition = recording.workflow.variables.find(
+        (definition) => definition.name === old.variable,
+      );
+      const name = variableName("variable-name", "variable-custom-name");
+      const enteredDefault = $("variable-default").value;
+      const defaultValue =
+        enteredDefault !== "" || previousDefinition?.default === ""
+          ? enteredDefault
+          : null;
+      const variable = previousDefinition
+        ? { name, default: defaultValue }
+        : {
+            name,
+            label: name.replaceAll("_", " "),
+            type: "text",
+            required: true,
+            default: defaultValue,
+            ask_when_running: true,
+          };
+      input.variable = variable;
+      if (name === "amount")
+        input.amount_format = $("amount-format").value || "raw";
     }
 
     task(async () => {
@@ -827,7 +1208,14 @@
         });
       }
 
-      if (old.type === "wait_for_text") {
+      if (old.type === "ocr_value") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: valueFields("step", valueROIPicker),
+        });
+      }
+      if (["wait_for_text", "if_text"].includes(old.type)) {
         await review({
           operation: "fields",
           step_id,
@@ -848,13 +1236,18 @@
       }
 
       await review({
+        operation: "set_critical",
+        step_id,
+        critical: $("step-critical").checked,
+      });
+
+      await review({
         operation: "rename_step",
         step_id,
         label,
       });
 
       $("input-value").value = "";
-      $("variable-default").value = "";
 
       editingId = null;
       $("step-editor").hidden = true;
@@ -866,16 +1259,6 @@
   $("flow-rename").addEventListener("click", () =>
     task(() =>
       review({ operation: "rename_flow", name: $("flow-name").value }),
-    ),
-  );
-
-  $("flow-financial").addEventListener("change", () =>
-    task(() =>
-      review({
-        operation: "rename_flow",
-        name: $("flow-name").value,
-        financial: $("flow-financial").checked,
-      }),
     ),
   );
 
@@ -897,50 +1280,352 @@
     return { stable_ms, timeout_seconds };
   }
 
+  const roiKeys = ["x", "y", "width", "height"];
+
+  function mountRegionOCR(prefix) {
+    const template = $("region-ocr-template");
+    if (!template?.content) return;
+    const fragment = template.content.cloneNode(true);
+    for (const control of fragment.querySelectorAll("[data-roi-control]")) {
+      control.id = `${prefix}-roi-${control.dataset.roiControl}`;
+      control.removeAttribute("data-roi-control");
+    }
+    $(`${prefix}-roi-picker`).append(fragment);
+  }
+
+  function createRegionOCRPicker(prefix, textPrefix, parser = null) {
+    mountRegionOCR(prefix);
+    const canvas = $(`${prefix}-roi-canvas`);
+    let image = null,
+      token = null,
+      start = null,
+      generation = 0;
+
+    function hasValues() {
+      return roiKeys.every((key) => $(`${prefix}-roi-${key}`).value !== "");
+    }
+
+    function read(validate = true) {
+      const roi = Object.fromEntries(
+        roiKeys.map((key) => [key, Number($(`${prefix}-roi-${key}`).value)]),
+      );
+      if (
+        validate &&
+        (roiKeys.some(
+          (key) =>
+            $(`${prefix}-roi-${key}`).value === "" ||
+            !Number.isFinite(roi[key]) ||
+            roi[key] < 0 ||
+            roi[key] > 1,
+        ) ||
+          roi.width <= 0 ||
+          roi.height <= 0 ||
+          roi.x + roi.width > 1 + 1e-12 ||
+          roi.y + roi.height > 1 + 1e-12)
+      )
+        throw new Error(
+          "ROI must have positive size and fit inside the calibrated screen.",
+        );
+      return roi;
+    }
+
+    function setValues(roi) {
+      roiKeys.forEach((key, index) => {
+        $(`${prefix}-roi-${key}`).value =
+          (Array.isArray(roi) ? roi[index] : roi?.[key]) ?? "";
+      });
+    }
+
+    function draw() {
+      const roi = read(false);
+      $(`${prefix}-roi-values`).textContent = hasValues()
+        ? roiKeys.map((key) => `${key}: ${roi[key].toFixed(4)}`).join(" · ")
+        : "No OCR region selected.";
+      $(`${prefix}-roi-result`).textContent = "";
+      if (!image) return;
+      const context = canvas.getContext("2d");
+      context.drawImage(image, 0, 0);
+      if (!hasValues()) return;
+      context.strokeStyle = "#ff3b30";
+      context.lineWidth = Math.max(2, canvas.width / 200);
+      context.strokeRect(
+        roi.x * canvas.width,
+        roi.y * canvas.height,
+        roi.width * canvas.width,
+        roi.height * canvas.height,
+      );
+    }
+
+    function reset(roi) {
+      generation++;
+      image = token = start = null;
+      canvas.hidden = true;
+      $(`${prefix}-roi-enabled`).checked = !!roi;
+      setValues(roi);
+      draw();
+    }
+
+    function clear() {
+      generation++;
+      start = null;
+      $(`${prefix}-roi-enabled`).checked = false;
+      setValues(null);
+      draw();
+    }
+
+    function fields(existingROI = null) {
+      if ($(`${prefix}-roi-enabled`).checked) return { roi: read() };
+      return existingROI ? { roi: null } : {};
+    }
+
+    function point(event) {
+      const bounds = canvas.getBoundingClientRect();
+      return [
+        Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+        Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
+      ];
+    }
+
+    roiKeys.forEach((key) =>
+      $(`${prefix}-roi-${key}`).addEventListener("input", draw),
+    );
+    $(`${prefix}-roi-refresh`).addEventListener("click", () =>
+      task(async () => {
+        const selectedGeneration = ++generation;
+        const result = await api("/api/ocr/roi-preview", {});
+        const nextImage = new Image();
+        await new Promise((resolve, reject) => {
+          nextImage.onload = resolve;
+          nextImage.onerror = reject;
+          nextImage.src = result.image;
+        });
+        if (selectedGeneration !== generation) return;
+        image = nextImage;
+        token = result.token;
+        canvas.width = result.width;
+        canvas.height = result.height;
+        canvas.hidden = false;
+        draw();
+      }),
+    );
+    $(`${prefix}-roi-clear`).addEventListener("click", clear);
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!image || event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      start = point(event);
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!start) return;
+      const [x, y] = point(event);
+      setValues(
+        [
+          Math.min(x, start[0]),
+          Math.min(y, start[1]),
+          Math.abs(x - start[0]),
+          Math.abs(y - start[1]),
+        ].map((value) => Number(value.toFixed(6))),
+      );
+      $(`${prefix}-roi-enabled`).checked = true;
+      draw();
+    });
+    for (const name of ["pointerup", "pointercancel", "lostpointercapture"])
+      canvas.addEventListener(name, () => {
+        start = null;
+      });
+    $(`${prefix}-roi-test`).addEventListener("click", () =>
+      task(async () => {
+        if (!token) throw new Error("Select an OCR region snapshot first.");
+        const testedGeneration = generation;
+        const text = parser ? "" : $(`${textPrefix}-text-value`).value.trim();
+        const result = await api("/api/ocr/roi-test", {
+          token,
+          roi: read(),
+          text,
+          ...(parser ? { parser } : {}),
+        });
+        if (testedGeneration !== generation) return;
+        $(`${prefix}-roi-result`).textContent = parser
+          ? `Read Balance: ${result.value}`
+          : result.found
+            ? `Target detected in selected snapshot crop · ${result.texts.join(" | ")}`
+            : `Target not detected in selected snapshot crop · ${result.texts.join(" | ") || "No text read"}`;
+      }),
+    );
+
+    return { fields, reset };
+  }
+
+  const stepROIPicker = createRegionOCRPicker("step", "step");
+  const recordROIPicker = createRegionOCRPicker("record", "record");
+  const conditionROIPicker = createRegionOCRPicker("condition", "condition");
+  const expectedROIPicker = createRegionOCRPicker("expected", "expected");
+  const valueROIPicker = createRegionOCRPicker("value", null, "currency");
+  const recordValueROIPicker = createRegionOCRPicker(
+    "record-value",
+    null,
+    "currency",
+  );
+  const liveValueROIPicker = createRegionOCRPicker(
+    "live-value",
+    null,
+    "currency",
+  );
+  liveValueROIPicker.reset(null);
+  recordValueROIPicker.reset(null);
+  recordROIPicker.reset(null);
+  conditionROIPicker.reset(null);
+
   function textWaitFields(prefix) {
     const text = $(`${prefix}-text-value`).value.trim();
     const timeout_seconds = Number($(`${prefix}-text-timeout`).value);
+    const minimumTimeout =
+      prefix === "condition" ||
+      (prefix === "step" && findWorkflowStep(editingId)?.type === "if_text")
+        ? 0.1
+        : 0.5;
     if (!text || text.length > 500)
       throw new Error("Text to detect must be between 1 and 500 characters.");
     if (
       !Number.isFinite(timeout_seconds) ||
-      timeout_seconds < 0.5 ||
+      timeout_seconds < minimumTimeout ||
       timeout_seconds > 300
     )
-      throw new Error("Maximum wait must be between 0.5 and 300 seconds.");
-    return { text, timeout_seconds };
+      throw new Error(
+        `Wait time must be between ${minimumTimeout} and 300 seconds.`,
+      );
+    const fields = { text, timeout_seconds };
+    if (prefix === "step")
+      Object.assign(
+        fields,
+        stepROIPicker.fields(findWorkflowStep(editingId)?.roi),
+      );
+    else if (prefix === "record")
+      Object.assign(fields, recordROIPicker.fields());
+    else if (prefix === "condition")
+      Object.assign(fields, conditionROIPicker.fields());
+    else if (prefix === "expected")
+      Object.assign(fields, expectedROIPicker.fields(expectedOriginalROI));
+    return fields;
   }
 
   $("record-text").addEventListener("click", () =>
-    task(() =>
-      review({
-        operation: "insert",
-        index: Number($("insert-position").value),
-        step: { type: "wait_for_text", ...textWaitFields("record") },
-      }),
-    ),
+    task(async () => {
+      await review(
+        insertionPayload({
+          type: "wait_for_text",
+          ...textWaitFields("record"),
+        }),
+      );
+      recordROIPicker.reset(null);
+      $("record-text-advanced").open = false;
+    }),
   );
 
   $("record-wait").addEventListener("click", () =>
     task(() =>
-      review({
-        operation: "insert",
-        index: Number($("insert-position").value),
-        step: { type: "wait", seconds: Number($("record-wait-seconds").value) },
-      }),
+      review(
+        insertionPayload({
+          type: "wait",
+          seconds: Number($("record-wait-seconds").value),
+        }),
+      ),
     ),
   );
 
-  $("record-checkpoint").addEventListener("click", () =>
+  function valueFields(prefix, picker) {
+    const fields = picker.fields();
+    if (!fields.roi) throw new Error("Select a calibrated OCR region first.");
+    return {
+      ...fields,
+      parser: "currency",
+      output: $(`${prefix}-value-output`).value.trim(),
+    };
+  }
+
+  function applyValuePreset(prefix) {
+    const balance = $(`${prefix}-value-preset`).value === "balance";
+    const name = $(`${prefix}-value-name`);
+    const output = $(`${prefix}-value-output`);
+    $(`${prefix}-value-parser`).value = "currency";
+    name.readOnly = balance;
+    output.readOnly = balance;
+    if (balance) {
+      name.value = "Available Balance";
+      output.value = "payer_balance";
+    } else {
+      if (name.value === "Available Balance") name.value = "";
+      if (output.value === "payer_balance") output.value = "";
+    }
+  }
+
+  $("record-value-preset").addEventListener("change", () =>
+    applyValuePreset("record"),
+  );
+
+  $("record-value").addEventListener("click", () =>
     task(() =>
-      review({
-        operation: "insert",
-        index: Number($("insert-position").value),
-        step: {
-          type: "manual_checkpoint",
-          message: $("checkpoint-message").value,
-        },
-      }),
+      review(
+        insertionPayload({
+          type: "ocr_value",
+          label: $("record-value-name").value.trim() || "Read Balance",
+          ...valueFields("record", recordValueROIPicker),
+        }),
+      ),
+    ),
+  );
+
+  $("record-read-value").addEventListener("click", () =>
+    task(async () => {
+      await pendingManual;
+      await flushText();
+      readValueOpen = true;
+      $("live-value-preset").value = "balance";
+      applyValuePreset("live");
+      liveValueROIPicker.reset(null);
+    }),
+  );
+
+  $("live-value-preset").addEventListener("change", () =>
+    applyValuePreset("live"),
+  );
+
+  $("live-value-save").addEventListener("click", () =>
+    task(async () => {
+      if (!recording.active || stopping) return;
+      await pendingManual;
+      await flushText();
+      const step = {
+        type: "ocr_value",
+        label: $("live-value-name").value.trim() || "Read Balance",
+        ...valueFields("live", liveValueROIPicker),
+      };
+      recording = await api("/api/recorder/step", {
+        capture: false,
+        step,
+      });
+      readValueOpen = false;
+      liveValueROIPicker.reset(null);
+      show("Read Balance step added. Recording continues.");
+    }),
+  );
+
+  $("live-value-cancel").addEventListener("click", () => {
+    readValueOpen = false;
+    liveValueROIPicker.reset(null);
+    renderRecording();
+  });
+
+  $("record-screenshot").addEventListener("click", () =>
+    task(() =>
+      review(
+        insertionPayload({
+          type: "capture_screen",
+          label: "Screenshot",
+          output_key: "receipt_path",
+        }),
+      ),
     ),
   );
 
@@ -963,6 +1648,8 @@
       closeExpectedText();
 
       if (backend !== "mock") disable().catch(() => {});
+      enabledManualForReviewSpecialCase = false;
+
       try {
         await api("/api/recorder/stop", {});
         recording = await api("/api/recorder", undefined, "GET");
@@ -980,7 +1667,7 @@
     renderRecording();
   }
 
-  function enqueue(step, extra = {}) {
+  function enqueueRecording(operation) {
     if (!recording.active || annotationBusy()) return captureQueue;
     if (queued >= 32) {
       textBuffer = "";
@@ -988,6 +1675,8 @@
       recording.active = false;
 
       if (backend !== "mock") disable().catch(() => {});
+      enabledManualForReviewSpecialCase = false;
+
       captureQueue = captureQueue.then(async () => {
         try {
           recording = await api("/api/recorder/stop", {});
@@ -1005,15 +1694,20 @@
       return captureQueue;
     }
     queued++;
-    captureQueue = captureQueue.then(async () => {
+    const queuedOperation = captureQueue.then(async () => {
       try {
-        if (recording.active) await capture(step, extra);
+        if (recording.active) await operation();
       } finally {
         queued--;
         renderRecording();
       }
     });
-    return captureQueue;
+    captureQueue = queuedOperation.catch(() => {});
+    return queuedOperation;
+  }
+
+  function enqueue(step, extra = {}) {
+    return enqueueRecording(() => capture(step, extra));
   }
 
   function flushText() {
@@ -1063,15 +1757,146 @@
 
   $("record-new").addEventListener("click", () => $("record-start").click());
 
-  $("record-mark-next").addEventListener("click", () =>
+  async function openSpecialCaseSetup(afterStepId = null) {
+    if (alternateSetupOpen) {
+      show("Finish or cancel the current Special Case setup first.", true);
+      return;
+    }
+
+    if (recording.alternate_screen) {
+      show("Finish the current Special Case before adding another one.", true);
+      return;
+    }
+
+    const startedFromReview = !!afterStepId;
+
+    enabledManualForReviewSpecialCase = false;
+
+    if (startedFromReview && (piManual() || backend !== "mock") && !active()) {
+      const enabled = await enableManualControl();
+
+      if (!enabled) {
+        throw new Error(
+          "Manual Control could not be enabled. Special Case setup was not opened.",
+        );
+      }
+
+      enabledManualForReviewSpecialCase = true;
+    }
+
+    specialCaseAfterStepId = afterStepId;
+    alternateSetupOpen = true;
+
+    conditionROIPicker.reset(null);
+    $("condition-text-advanced").open = false;
+
+    renderRecording();
+    $("condition-text-value").focus();
+
+    if (startedFromReview) {
+      show(
+        "Special Case setup opened. Manual Control is enabled so you can position the phone.",
+      );
+    }
+  }
+
+  $("record-alternate-screen").addEventListener("click", () =>
+    task(() => openSpecialCaseSetup()),
+  );
+
+  $("alternate-screen-setup-cancel").addEventListener("click", () =>
+    task(async () => {
+      if (enabledManualForReviewSpecialCase) {
+        try {
+          await disable();
+        } finally {
+          enabledManualForReviewSpecialCase = false;
+        }
+      }
+
+      alternateSetupOpen = false;
+      specialCaseAfterStepId = null;
+
+      conditionROIPicker.reset(null);
+      $("condition-text-advanced").open = false;
+
+      renderRecording();
+    }),
+  );
+
+  $("alternate-screen-start").addEventListener("click", () =>
     task(async () => {
       await pendingManual;
       await flushText();
-      recording = await api("/api/recorder/mark-next-screen", {});
+
+      recording = await api("/api/recorder/alternate-screen/start", {
+        ...textWaitFields("condition"),
+        ...(specialCaseAfterStepId
+          ? { after_step_id: specialCaseAfterStepId }
+          : {}),
+      });
+
+      specialCaseAfterStepId = null;
+      alternateSetupOpen = false;
+      conditionROIPicker.reset(null);
+      $("condition-text-advanced").open = false;
+
+      show("Recording Special Case actions.");
+    }),
+  );
+
+  $("alternate-screen-finish").addEventListener("click", () =>
+    task(async () => {
+      await pendingManual;
+      await flushText();
+      await captureQueue;
+      const conditionId = recording.alternate_screen?.condition_id;
+      const returnMode = recording.alternate_screen?.return_mode;
+      recording = await api("/api/recorder/alternate-screen/finish", {});
+
+      if (returnMode === "review" && enabledManualForReviewSpecialCase) {
+        try {
+          await disable();
+        } finally {
+          enabledManualForReviewSpecialCase = false;
+        }
+      }
+
+      renderRecording();
+
       show(
-        recording.mark_next_screen
-          ? "The next tap, swipe, Home or Back action will be checked."
-          : "Next-screen check cancelled.",
+        returnMode === "review"
+          ? "Special Case saved. Review continues."
+          : "Special Case saved. Main recording continues.",
+      );
+      if (returnMode === "review" && conditionId)
+        document
+          .querySelector?.(`[data-step-id="${conditionId}"]`)
+          ?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+    }),
+  );
+
+  $("alternate-screen-cancel").addEventListener("click", () =>
+    task(async () => {
+      textBuffer = "";
+      clearTimeout(textTimer);
+      await pendingManual;
+      await captureQueue;
+      const returnMode = recording.alternate_screen?.return_mode;
+      recording = await api("/api/recorder/alternate-screen/cancel", {});
+
+      if (returnMode === "review" && enabledManualForReviewSpecialCase) {
+        try {
+          await disable();
+        } finally {
+          enabledManualForReviewSpecialCase = false;
+        }
+      }
+
+      show(
+        returnMode === "review"
+          ? "Special Case cancelled. Actions already performed on the phone were not reversed."
+          : "Special Case cancelled. Main recording continues; actions already performed on the phone were not reversed.",
       );
     }),
   );
@@ -1084,6 +1909,25 @@
     }),
   );
 
+  $("record-screenshot-here").addEventListener("click", () =>
+    task(async () => {
+      if (!recording.active || stopping || annotationBusy()) return;
+      await pendingManual;
+      flushText();
+      await enqueueRecording(async () => {
+        recording = await api("/api/recorder/step", {
+          capture: false,
+          step: {
+            type: "capture_screen",
+            label: "Screenshot",
+            output_key: "receipt_path",
+          },
+        });
+        show("Screenshot added. Recording continues.");
+      });
+    }),
+  );
+
   function variableMethodFields() {
     $("record-variable-keyboard-field").hidden =
       $("record-variable-method").value !== "screen_keyboard";
@@ -1091,6 +1935,13 @@
 
   $("record-input-variable").addEventListener("click", () => {
     variableInputOpen = true;
+    if (
+      !["raw", "implied_cents", "whole_number"].includes(
+        $("record-amount-format").value,
+      )
+    )
+      $("record-amount-format").value = "raw";
+
     if (!["hid", "screen_keyboard"].includes($("record-variable-method").value))
       $("record-variable-method").value = "screen_keyboard";
     const current = $("record-variable-keyboard").value;
@@ -1101,10 +1952,22 @@
       ? current
       : keyboards[0]?.id || "__capture__";
     variableMethodFields();
+    variableChoiceFields(
+      "record-variable-name",
+      "record-variable-custom-field",
+      "record-variable-custom-name",
+      $("record-variable-name").value,
+    );
+    recordAmountFormatFields();
     renderRecording();
   });
 
   $("record-variable-method").addEventListener("change", variableMethodFields);
+  $("record-variable-name").addEventListener("change", () => {
+    $("record-variable-custom-field").hidden =
+      $("record-variable-name").value !== "__custom__";
+    recordAmountFormatFields();
+  });
   $("record-variable-keyboard").addEventListener("change", () => {
     if ($("record-variable-keyboard").value !== "__capture__") return;
     returnToVariableInput = true;
@@ -1116,11 +1979,17 @@
     renderRecording();
   });
 
-  async function addVariableInput(typeSample) {
+  async function addVariableInput(typeNow) {
     await pendingManual;
     await flushText();
-    const name = $("record-variable-name").value.trim();
+    const name = variableName(
+      "record-variable-name",
+      "record-variable-custom-name",
+    );
     if (!name) throw new Error("Enter a variable name.");
+    const defaultValue = $("record-variable-default").value;
+    if (typeNow && defaultValue === "")
+      throw new Error("Enter a Default value before using Add & Type Now.");
     const method = $("record-variable-method").value;
     const keyboardId = $("record-variable-keyboard").value;
     if (
@@ -1132,16 +2001,24 @@
       api("/api/recorder/variable-input", {
         variable: {
           name,
-          label: name.replaceAll("_", " "),
+          label:
+            {
+              account_number: "Account Number",
+              amount: "Amount",
+              bank_name: "Bank Name",
+            }[name] || name.replaceAll("_", " "),
           type: "text",
           required: true,
-          default: null,
+          default: defaultValue === "" ? null : defaultValue,
           ask_when_running: true,
         },
         input_method: method,
+        ...(name === "amount"
+          ? { amount_format: $("record-amount-format").value || "raw" }
+          : {}),
         ...(method === "screen_keyboard" ? { keyboard_id: keyboardId } : {}),
-        sample: $("record-variable-sample").value,
-        type_sample: typeSample,
+        sample: defaultValue,
+        type_sample: typeNow,
         frame_id: frameId,
       });
     const runPhysical = window.phoneConnection?.runPhysical
@@ -1149,19 +2026,19 @@
           window.phoneConnection.runPhysical(label, operation)
       : (_label, operation) => operation();
     try {
-      recording = typeSample
-        ? await runPhysical("Typing sample...", request)
+      recording = typeNow
+        ? await runPhysical("Typing default value...", request)
         : await request();
     } catch (error) {
-      if (typeSample && error.transient)
-        error.message = `${error.message} Sample result uncertain; it was not retried automatically.`;
+      if (typeNow && error.transient)
+        error.message = `${error.message} Typing result uncertain; it was not retried automatically.`;
       throw error;
     }
     variableInputOpen = false;
-    $("record-variable-sample").value = "";
+    $("record-variable-default").value = "";
     show(
-      typeSample
-        ? "Variable step added and sample typed once."
+      typeNow
+        ? "Variable step added and its default value typed once."
         : "Variable step added without sending input.",
     );
   }
@@ -1246,39 +2123,58 @@
 
   $("record-start").addEventListener("click", () =>
     task(async () => {
+      let enabledManualForRecording = false;
+
       if (piManual() || backend !== "mock") {
-        let result;
-        try {
-          result = await api("/api/control", {
-            enabled: true,
-            frame_id: frameId,
-          });
-        } finally {
-          if (piManual()) await refreshStatus();
+        if (!active()) {
+          const enabled = await enableManualControl();
+
+          if (!enabled) {
+            throw new Error(
+              "Manual Control could not be enabled. Recording was not started.",
+            );
+          }
+
+          enabledManualForRecording = true;
         }
-        applyControlResult(result);
       }
 
       try {
         keyboardSetupOpen = false;
         variableInputOpen = false;
+        readValueOpen = false;
         returnToVariableInput = false;
+        alternateSetupOpen = false;
+        specialCaseAfterStepId = null;
+
         recording = await api("/api/recorder/start", {
           name: "New Recording",
           execute: true,
         });
       } catch (error) {
-        if (piManual() || backend !== "mock") await disable();
+        if (enabledManualForRecording) {
+          await disable();
+        }
+
         throw error;
       }
 
       timelineSignature = "";
       textBuffer = "";
       stopping = false;
-      show("Use the phone preview as usual. Stop when you’re ready to review.");
+
+      show(
+        "Recording started. Manual Control is enabled — use the phone preview normally.",
+      );
+
       const livePreview = !piManual() && backend === "mock" ? preview : canvas;
+
       livePreview.focus({ preventScroll: true });
-      livePreview.scrollIntoView?.({ block: "center", behavior: "smooth" });
+
+      livePreview.scrollIntoView?.({
+        block: "center",
+        behavior: "smooth",
+      });
     }),
   );
 
@@ -1292,11 +2188,14 @@
         recording = await api("/api/recorder/stop", {});
         keyboardSetupOpen = false;
         variableInputOpen = false;
+        readValueOpen = false;
         returnToVariableInput = false;
+        alternateSetupOpen = false;
+        specialCaseAfterStepId = null;
         closeExpectedText();
         if (piManual() || backend !== "mock") await disable();
         show(
-          "Recording stopped. Review your steps, name your workflow, then save.",
+          "Recording stopped. Review your steps, enter the bank name, then save.",
         );
         renderRecording();
         $("review-flow").scrollIntoView?.({
@@ -1325,7 +2224,10 @@
       recording = await api("/api/recorder/cancel", {});
       keyboardSetupOpen = false;
       variableInputOpen = false;
+      readValueOpen = false;
       returnToVariableInput = false;
+      alternateSetupOpen = false;
+      specialCaseAfterStepId = null;
       closeExpectedText();
 
       show(editingExisting ? "Changes discarded." : "Recording discarded.");
@@ -1338,7 +2240,7 @@
     task(async () => {
       if (!$("flow-name").value.trim()) {
         $("flow-name").focus();
-        return show("Enter a workflow name", true);
+        return show("Enter bank name", true);
       }
 
       const editingExisting = !!recording.editing_existing;
@@ -1346,7 +2248,7 @@
       await review({
         operation: "rename_flow",
         name: $("flow-name").value.trim(),
-        financial: $("flow-financial").checked,
+        purpose: $("flow-purpose").value,
       });
 
       const saved = await api("/api/recorder/save", {});
@@ -1356,89 +2258,84 @@
         workflow: null,
         editing_existing: false,
       };
+      alternateSetupOpen = false;
+      specialCaseAfterStepId = null;
 
       show(editingExisting ? "Workflow updated" : "Workflow saved");
 
       await loadFlows();
       await selectFlow(saved.id);
+      await window.refreshDeviceReadiness?.();
     }),
   );
 
-  function localTarget(event) {
-    return (
-      event.target?.isContentEditable ||
-      event.target?.closest?.(
-        "input, textarea, select, button, a, [role='button']",
-      )
-    );
-  }
-  document.addEventListener("keydown", (event) => {
-    if (
-      piManual() ||
-      !recording.active ||
-      stopping ||
-      annotationBusy() ||
-      event.defaultPrevented ||
-      localTarget(event) ||
-      document.hidden ||
-      !document.hasFocus()
-    )
-      return;
-    if (
-      event.ctrlKey ||
-      event.metaKey ||
-      event.altKey ||
-      event.isComposing ||
-      event.keyCode === 229 ||
-      event.getModifierState?.("AltGraph")
-    )
-      return;
-    if (backend !== "mock" && (!active() || !fresh())) return;
-    if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
-      event.preventDefault();
-      addText(event.key);
-    } else if (
-      !event.shiftKey &&
-      ["Enter", "Backspace", "Tab"].includes(event.key)
-    ) {
-      event.preventDefault();
-      if (event.key === "Backspace" && textBuffer)
-        textBuffer = textBuffer.slice(0, -1);
-      else {
-        flushText();
-        enqueue({ type: "key", key: event.key.toUpperCase() });
-      }
-    }
-  });
-  document.addEventListener("paste", (event) => {
-    if (
-      piManual() ||
-      !recording.active ||
-      stopping ||
-      annotationBusy() ||
-      localTarget(event) ||
-      document.hidden ||
-      !document.hasFocus()
-    )
-      return;
-    if (backend !== "mock" && (!active() || !fresh())) return;
-    const value = event.clipboardData?.getData("text/plain") || "";
-    event.preventDefault();
-    if (!/^[ -~]*$/.test(value))
-      return show(
-        "This phone input currently supports printable English characters only.",
-        true,
-      );
-    addText(value);
-  });
-
-  function location(event, element) {
-    const box = element.getBoundingClientRect();
-    return [
-      (event.clientX - box.left) / box.width,
-      (event.clientY - box.top) / box.height,
-    ];
-  }
+  // function localTarget(event) {
+  //   return (
+  //     event.target?.isContentEditable ||
+  //     event.target?.closest?.(
+  //       "input, textarea, select, button, a, [role='button']",
+  //     )
+  //   );
+  // }
+  // document.addEventListener("keydown", (event) => {
+  //   if (
+  //     piManual() ||
+  //     !recording.active ||
+  //     stopping ||
+  //     annotationBusy() ||
+  //     event.defaultPrevented ||
+  //     localTarget(event) ||
+  //     document.hidden ||
+  //     !document.hasFocus()
+  //   )
+  //     return;
+  //   if (
+  //     event.ctrlKey ||
+  //     event.metaKey ||
+  //     event.altKey ||
+  //     event.isComposing ||
+  //     event.keyCode === 229 ||
+  //     event.getModifierState?.("AltGraph")
+  //   )
+  //     return;
+  //   if (backend !== "mock" && (!active() || !fresh())) return;
+  //   if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
+  //     event.preventDefault();
+  //     addText(event.key);
+  //   } else if (
+  //     !event.shiftKey &&
+  //     ["Enter", "Backspace", "Tab"].includes(event.key)
+  //   ) {
+  //     event.preventDefault();
+  //     if (event.key === "Backspace" && textBuffer)
+  //       textBuffer = textBuffer.slice(0, -1);
+  //     else {
+  //       flushText();
+  //       enqueue({ type: "key", key: event.key.toUpperCase() });
+  //     }
+  //   }
+  // });
+  // document.addEventListener("paste", (event) => {
+  //   if (
+  //     piManual() ||
+  //     !recording.active ||
+  //     stopping ||
+  //     annotationBusy() ||
+  //     localTarget(event) ||
+  //     document.hidden ||
+  //     !document.hasFocus()
+  //   )
+  //     return;
+  //   if (backend !== "mock" && (!active() || !fresh())) return;
+  //   const value = event.clipboardData?.getData("text/plain") || "";
+  //   event.preventDefault();
+  //   if (!/^[ -~]*$/.test(value))
+  //     return show(
+  //       "This phone input currently supports printable English characters only.",
+  //       true,
+  //     );
+  //   addText(value);
+  // });
 
   function installGestures(element, camera) {
     element.addEventListener("pointerdown", (event) => {
@@ -1460,7 +2357,7 @@
       element.setPointerCapture(event.pointerId);
       gesture = {
         id: event.pointerId,
-        start: location(event, element),
+        start: window.phonePreviewGestures.point(event, element),
         at: performance.now(),
         element,
       };
@@ -1480,19 +2377,17 @@
       if (camera && !fresh())
         return show("The camera frame expired; gesture discarded.", true);
 
-      const end = location(event, element);
+      const end = window.phonePreviewGestures.point(event, element);
       if ([...saved.start, ...end].some((v) => v < 0 || v > 1))
         return show("Keep the gesture inside the preview.", true);
-      const box = element.getBoundingClientRect();
-      const swipe =
-        Math.hypot(
-          (end[0] - saved.start[0]) * box.width,
-          (end[1] - saved.start[1]) * box.height,
-        ) > 8;
-      const duration_ms = Math.max(
-        50,
-        Math.min(60000, Math.round(performance.now() - saved.at)),
+      const classified = window.phonePreviewGestures.classify(
+        saved.start,
+        end,
+        element,
+        performance.now() - saved.at,
       );
+      const swipe = classified.type === "swipe";
+      const duration_ms = classified.duration_ms;
       const step = swipe ? { type: "swipe", duration_ms } : { type: "tap" };
       const extra = camera
         ? {
@@ -1529,7 +2424,7 @@
           true,
         );
       if (!camera && backend !== "mock") return;
-      const point = location(event, element);
+      const point = window.phonePreviewGestures.point(event, element);
       if (point.some((value) => value < 0 || value > 1))
         return show("Click inside the phone preview.", true);
       event.preventDefault();
@@ -1555,11 +2450,22 @@
 
   window.phoneRecorder = {
     capturesPreview: () => recording.active && !piManual() && !annotationBusy(),
-    blocksInput: () => !!recording.workflow && (stopping || annotationBusy()),
+
+    blocksInput: () => {
+      const reviewSpecialCaseSetup =
+        alternateSetupOpen && !!specialCaseAfterStepId && !recording.active;
+
+      return (
+        !!recording.workflow &&
+        (stopping || (annotationBusy() && !reviewSpecialCaseSetup))
+      );
+    },
+
     physicalBusyChanged: (value) => {
       externalPhysicalBusy = value;
       renderRecording();
     },
+
     refreshAfterReconnect: async () => {
       if (reconnectRefreshInFlight) return;
       reconnectRefreshInFlight = true;
@@ -1578,16 +2484,19 @@
         reconnectRefreshInFlight = false;
       }
     },
+
     trackManual: (operation) => {
       if (piManual() && recording.active)
         pendingManual = operation.catch(() => {});
     },
+
     acceptManual: (snapshot) => {
       if (!snapshot || !piManual()) return;
       recording = snapshot;
       renderRecording();
       openPendingExpectedText().catch((error) => show(error.message, true));
     },
+
     manualFailed: async (error) => {
       if (!piManual() || !recording.active) return;
       recording.active = false;
@@ -1613,29 +2522,101 @@
       );
       renderRecording();
     },
+
     ownerId: recorderOwner,
     action: naturalAction,
+    deviceStateChanged: () => {
+      renderDeviceAvailability();
+      loadFlows().catch((error) => show(error.message, true));
+    },
+    workflowAssignmentsChanged: () => loadFlows(),
+    dashboardModeChanged: () => loadFlows(),
+    pausePolling: () => {
+      workflowPollingStopped = true;
+      clearTimeout(runPollTimer);
+      runPollTimer = null;
+    },
+
+    resumePolling: () => {
+      workflowPollingStopped = false;
+      scheduleRunPoll(0);
+    },
+
+    shutdown: () => {
+      workflowPollingStopped = true;
+      clearTimeout(runPollTimer);
+      runPollTimer = null;
+      clearTimeout(textTimer);
+    },
+
+    deviceManagementBlocked: () =>
+      recording.active || (running && !terminal.has(running.status)),
   };
 
   async function loadFlows() {
+    const generation = ++flowLoadGeneration;
     const result = await api("/api/workflows", undefined, "GET");
+    if (generation !== flowLoadGeneration) return;
+
     backend = result.input_backend;
+    availableFlows = result.workflows;
+    const unrestricted = result.allowed_workflow_ids == null;
+    const allowedIds = new Set(result.allowed_workflow_ids || []);
+    const adminMode = document.body?.dataset?.dashboardMode === "admin";
+    const visibleFlows =
+      adminMode || unrestricted
+        ? result.workflows
+        : result.workflows.filter((flow) => allowedIds.has(flow.id));
+
+    if (selected && !unrestricted && !allowedIds.has(selected.id)) {
+      selected = null;
+      $("run-variables").replaceChildren();
+      $("run-title").textContent = "Run Flow";
+    }
 
     $("workflow-backend").textContent =
-      `Input: ${backend} · Screen: ${result.screen_backend}`;
+      `Input: ${backend} · Screen: ${result.screen_backend}` +
+      (result.selected_device_id
+        ? unrestricted
+          ? ` · ${result.selected_device_id}: legacy unrestricted`
+          : ` · ${result.selected_device_id}: ${allowedIds.size} assigned`
+        : "");
 
-    const rows = result.workflows.map((flow) => {
-      const row = document.createElement("li"),
-        label = document.createElement("span");
+    const rows = visibleFlows.map((flow) => {
+      const row = document.createElement("li");
+      const label = document.createElement("span");
 
-      label.textContent = `${flow.name} · ${flow.step_count} steps · ${flow.variable_count} variables · Created ${flow.created_at ? new Date(flow.created_at).toLocaleString() : "—"} · Updated ${flow.updated_at ? new Date(flow.updated_at).toLocaleString() : "—"}`;
+      label.textContent =
+        `${flow.name} · ` +
+        `${flow.purpose === "balance_check" ? "Balance Check" : "Payment"} · ` +
+        `${flow.step_count} steps · ` +
+        `${flow.variable_count} variables · ` +
+        `Created ${
+          flow.created_at ? new Date(flow.created_at).toLocaleString() : "—"
+        } · ` +
+        `Updated ${
+          flow.updated_at ? new Date(flow.updated_at).toLocaleString() : "—"
+        }`;
 
+      // Run workflow
+      // Visible in BOTH Operate and Admin.
+      // Reuses the existing workflow selection / execution flow.
       const select = document.createElement("button");
+      select.type = "button";
       select.textContent = "Run…";
+      select.disabled = !unrestricted && !allowedIds.has(flow.id);
+      if (select.disabled)
+        select.title = `Not assigned to ${result.selected_device_id || "the selected phone"}`;
+
       select.addEventListener("click", () => task(() => selectFlow(flow.id)));
 
+      // Edit workflow
+      // Admin only.
       const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "admin-only";
       edit.textContent = "Edit";
+
       edit.addEventListener("click", () =>
         task(async () => {
           recording = await api("/api/recorder/edit", {
@@ -1657,24 +2638,39 @@
         }),
       );
 
+      // Delete workflow
+      // Admin only.
       const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "admin-only stop";
       remove.textContent = "Delete";
+
       remove.addEventListener("click", () =>
         task(async () => {
-          if (!window.confirm(`Delete workflow “${flow.name}”?`)) return;
+          if (!window.confirm(`Delete workflow “${flow.name}”?`)) {
+            return;
+          }
+
           await api("/api/workflows/" + flow.id, {}, "DELETE");
+
+          // If the deleted workflow is currently selected for running,
+          // clear the run panel.
           if (selected?.id === flow.id) {
             selected = null;
+
             $("run-variables").replaceChildren();
             $("run-title").textContent = "Run Flow";
           }
+
           await loadFlows();
         }),
       );
 
       row.append(label, select, edit, remove);
+
       return row;
     });
+
     $("saved-flows").replaceChildren(...rows);
   }
 
@@ -1682,7 +2678,7 @@
     selected = await api("/api/workflows/" + id, undefined, "GET");
     $("run-title").textContent = "Run: " + selected.name;
     const fields = selected.variables
-      .filter((variable) => variable.ask_when_running !== false)
+      .filter((variable) => variable.required && variable.default == null)
       .map((variable) => {
         const label = document.createElement("label"),
           input = document.createElement("input");
@@ -1690,8 +2686,8 @@
         input.name = variable.name;
         input.type = variable.type === "number" ? "number" : "text";
         if (input.type === "number") input.step = "any";
-        input.required = variable.required;
-        input.value = variable.default ?? "";
+        input.required = true;
+        input.value = "";
         input.autocomplete = "off";
         label.append(input);
         return label;
@@ -1707,7 +2703,7 @@
     task(async () => {
       const variables = {};
       for (const definition of selected.variables) {
-        if (definition.ask_when_running === false) continue;
+        if (!definition.required || definition.default != null) continue;
         const field = $("flow-run-form").elements.namedItem(definition.name);
         variables[definition.name] =
           field.value === ""
@@ -1723,6 +2719,7 @@
       render();
       renderRun();
       localStorage.setItem("phone-workflow-run", running.run_id);
+      scheduleRunPoll(0);
     });
   });
 
@@ -1738,6 +2735,7 @@
           render();
         }
         renderRun();
+        scheduleRunPoll();
       }),
     );
 
@@ -1794,29 +2792,57 @@
 
   function renderRun() {
     if (!running) return;
+    const nextRunStateSignature = `${running.run_id}:${running.status}`;
+    if (nextRunStateSignature !== runStateSignature) {
+      runStateSignature = nextRunStateSignature;
+      window.phoneRuntimeStateChanged?.(running);
+      if (terminal.has(running.status)) void window.refreshDeviceReadiness?.();
+    }
     $("flow-run-state").textContent =
       `${running.status} · Step ${running.step_index || 0}/${running.step_count || 0} · ${running.preview ? describe(running.preview, (running.step_index || 1) - 1) : "Starting"}${running.checkpoint_message ? " — " + running.checkpoint_message : ""}${terminal.has(running.status) ? " — " + (running.message || "") : ""}`;
     $("flow-resume").hidden = running.status !== "waiting_manual";
     $("flow-cancel").disabled = terminal.has(running.status);
     $("workflow-logs").textContent = (running.logs || []).join("\n");
+    $("operate-workflow-log").textContent = (running.logs || [])
+      .slice(-6)
+      .join("\n");
     drawPreview(running.preview);
     renderRecording();
   }
 
+  function scheduleRunPoll(delay = 500) {
+    if (
+      workflowPollingStopped ||
+      runPollTimer !== null ||
+      !running ||
+      terminal.has(running.status)
+    )
+      return;
+    runPollTimer = setTimeout(pollRun, delay);
+  }
+
   async function pollRun() {
+    runPollTimer = null;
+    if (
+      workflowPollingStopped ||
+      runPollInFlight ||
+      !running ||
+      terminal.has(running.status)
+    )
+      return;
+    runPollInFlight = true;
     try {
-      if (running && !terminal.has(running.status)) {
-        running = await api(
-          `/api/workflow-runs/${running.run_id}`,
-          undefined,
-          "GET",
-        );
-        renderRun();
-      }
+      running = await api(
+        `/api/workflow-runs/${running.run_id}`,
+        undefined,
+        "GET",
+      );
+      renderRun();
     } catch (error) {
       show(error.message, true);
     } finally {
-      setTimeout(pollRun, 500);
+      runPollInFlight = false;
+      scheduleRunPoll();
     }
   }
 
@@ -1829,11 +2855,11 @@
       try {
         running = await api(`/api/workflow-runs/${id}`, undefined, "GET");
         renderRun();
+        scheduleRunPoll();
       } catch {
         localStorage.removeItem("phone-workflow-run");
       }
     }
     drawPreview(running?.preview);
   });
-  pollRun();
 })();

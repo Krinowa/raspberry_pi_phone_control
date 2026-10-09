@@ -8,6 +8,8 @@ or recognition implementation.
 import time
 from typing import Protocol, runtime_checkable
 
+from ..workflows.timing import record_timing
+
 
 class ScreenStateError(RuntimeError):
     """Safe, user-facing semantic screen-state failure."""
@@ -55,26 +57,68 @@ def wait_for_text(
     timeout_seconds,
     *,
     interval=0.2,
+    roi=None,
     clock=time.monotonic,
+    required=True,
 ):
     """Poll a provider without coupling workflow execution to its data source."""
     if provider is None:
         provider = UnavailableScreenStateProvider()
 
-    deadline = clock() + timeout_seconds
+    wait_started = time.monotonic()
+    started = clock()
+    deadline = started + timeout_seconds
+    last_ocr_at = started
+    optimized_poll = getattr(provider, "poll_contains_text", None)
+    forced_interval = getattr(provider, "forced_ocr_interval", None)
+    provider_interval = getattr(provider, "poll_interval", None)
+    polling_interval = (
+        provider_interval
+        if isinstance(provider_interval, (int, float)) and provider_interval > 0
+        else interval
+    )
 
-    while True:
-        context.check_cancelled()
+    roi_options = {}
+    if roi is not None and callable(getattr(provider, "new_roi_wait", None)):
+        roi_options["roi_state"] = provider.new_roi_wait()
 
-        if provider.contains_text(expected_text):
-            return
+    try:
+        while True:
+            context.check_cancelled()
 
-        remaining = deadline - clock()
+            record_timing("polling_wait", 0.0, count=1)
+            if (
+                callable(optimized_poll)
+                and isinstance(forced_interval, (int, float))
+                and forced_interval > 0
+            ):
+                now = clock()
+                checked, found = optimized_poll(
+                    expected_text,
+                    roi=roi,
+                    force=now - last_ocr_at >= forced_interval,
+                    **roi_options,
+                )
+                if checked:
+                    last_ocr_at = clock()
+            else:
+                found = provider.contains_text(expected_text)
 
-        if remaining <= 0:
-            raise ScreenStateError(
-                f'Text "{expected_text}" was not detected within '
-                f"{timeout_seconds:g} seconds."
-            )
+            if found:
+                return True if not required else None
 
-        context.cancel_event.wait(min(interval, remaining))
+            remaining = deadline - clock()
+
+            if remaining <= 0:
+                if not required:
+                    return False
+                raise ScreenStateError(
+                    f'Text "{expected_text}" was not detected within '
+                    f"{timeout_seconds:g} seconds."
+                )
+
+            sleep_started = time.monotonic()
+            context.cancel_event.wait(min(polling_interval, remaining))
+            record_timing("polling_wait", time.monotonic() - sleep_started)
+    finally:
+        record_timing("wait_for_condition", time.monotonic() - wait_started)

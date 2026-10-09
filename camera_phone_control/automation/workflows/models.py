@@ -11,19 +11,24 @@ STEP_TYPES = {
     "wait",
     "wait_until_stable",
     "wait_for_text",
+    "if_text",
+    "capture_screen",
+    "ocr_value",
     "manual_checkpoint",
 }
 VARIABLE_TYPES = {"text", "number"}
+WORKFLOW_PURPOSES = {"payment", "balance_check"}
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def new_workflow(name):
+def new_workflow(name, purpose="payment"):
     return {
         "id": "flow_" + uuid.uuid4().hex,
         "name": name,
+        "purpose": purpose,
         "version": 1,
         "variables": [],
         "keyboards": {},

@@ -100,11 +100,12 @@ For a standalone copy, Python 3.10+ is required. Create an environment with
 Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector and its
 English-specific PP-OCRv5 mobile recognizer on the CPU. The document-orientation
 and document-unwarping models are disabled; text line orientation is also
-disabled by default. Paddle and its models are created lazily, exactly once in a
-persistent spawned worker process, then reused for the life of the server. This
+disabled by default. Paddle and its models are created exactly once in a
+persistent spawned worker process, then reused for the life of the server. A
+background warmup starts the worker before Flask begins serving so model
+initialization normally finishes before the first workflow OCR request. This
 keeps Paddle's native inference work and Python-runtime contention out of the
-camera/Flask process. The first request can take longer while the models are
-downloaded and initialized.
+camera/Flask process.
 
 On an Apple Silicon Mac (`uname -m` prints `arm64`), install the CPU build in the
 active virtual environment with:
@@ -130,11 +131,21 @@ orientation only for screens that regularly rotate individual lines:
 CAMERA_OCR_TEXTLINE_ORIENTATION=1 python app.py --camera 0
 ```
 
-OCR uses four CPU inference threads in the worker by default. Tune this between
-1 and 16 only after measuring on the target machine:
+OCR uses one CPU inference thread in the worker by default. On the current Mac,
+one and four configured threads had effectively identical medians while one
+thread had the tighter p95. Tune this between 1 and 16 only after measuring on
+the target machine:
 
 ```zsh
 CAMERA_OCR_CPU_THREADS=2 python app.py --camera 0
+```
+
+Text regions are recognized one at a time by default. On the current Apple
+Silicon/Paddle 3.3 setup this is faster than PaddleOCR's implicit batch default
+for phone screens with many differently sized lines. It remains configurable:
+
+```zsh
+CAMERA_OCR_RECOGNITION_BATCH_SIZE=1 python app.py --camera 0
 ```
 
 Successful OCR results are reused only when a downsampled screen signature is
@@ -146,16 +157,77 @@ mean difference and changed-pixel ratio; its conservative default is `0.001`,
 CAMERA_OCR_CACHE_THRESHOLD=0.002 python app.py --camera 0
 ```
 
+During `wait_for_text`, the camera provider captures a cheap 96×160 signature
+before the preceding input action. It polls that signature every 75 ms, requires
+120 ms of visual stability after a change, and invokes PaddleOCR after settling
+or every 450 ms if no change is detected. The timings are configurable with
+`CAMERA_OCR_POLL_INTERVAL_SECONDS`, `CAMERA_OCR_SETTLE_SECONDS`, and
+`CAMERA_OCR_FORCED_INTERVAL_SECONDS`. Change detection uses a 3-level mean pixel
+difference and a 0.002 changed-pixel ratio by default; advanced deployments can
+tune `CAMERA_OCR_CHANGE_THRESHOLD` and `CAMERA_OCR_CHANGE_RATIO_THRESHOLD` after
+measuring camera noise.
+
+Paddle inference uses a global pool of persistent child processes. The default
+pool size is two. The selectable maximum is calculated from physical CPU cores,
+RAM headroom, and an absolute safety cap of eight:
+
+```bash
+CAMERA_OCR_WORKER_POOL_SIZE=2 python app.py --camera 0
+```
+
+`OCR_CPU_CAPACITY_PERCENT` controls the CPU capacity budget and defaults to 80;
+accepted values are 25 through 90. For example, eight physical cores at 80%
+produce a CPU ceiling of six workers. The RAM ceiling keeps at least 25% or 2 GB
+of total RAM for the OS/backend and at least 1 GB of currently available RAM for
+non-OCR work. It uses observed Paddle process RSS when available, otherwise a
+conservative 900 MB estimate. The final hardware ceiling is the minimum of the
+CPU ceiling, RAM ceiling, and eight-worker safety cap.
+
+The dashboard OCR Worker Pool setting is persisted privately in
+`automation/camera_data/ocr_settings.json` and overrides the environment default.
+Saving a different size marks the pool as requiring restart; **Restart OCR Workers**
+is accepted only while no OCR requests are active or queued. Each process owns one
+Paddle model, while per-device providers retain independent frame signatures and OCR
+caches. Pool status is available from `GET /api/ocr/status`; settings use
+`GET/PUT /api/ocr/settings` and `POST /api/ocr/restart`.
+
+The status API also reports live CPU/RAM data and 30 seconds of bounded OCR queue
+and inference history. A conservative recommendation may suggest one more worker
+for sustained queue pressure with CPU/RAM headroom, or one fewer worker during
+sustained CPU saturation and slow inference. Recommendations never resize or
+restart the pool automatically; **Apply Recommendation** saves the proposed size,
+then the existing explicit restart action applies it safely. If a stored setting
+exceeds the detected startup ceiling, the backend starts the safe ceiling, keeps
+the stored value intact, and exposes a warning in the dashboard.
+
+To compare one and two workers with an exact saved real OCR frame:
+
+```bash
+python tools/benchmark_ocr_pool.py /path/to/paddle-ocr-0001.png
+```
+
 For one-request diagnostics, save the exact NumPy image passed to PaddleOCR and
-log its dimensions, detected text, region count, confidence, and separate
-capture, decode, warp, copy, preprocessing, worker startup, IPC send/wait,
-child-process inference, total timing, cache status, worker PID, and main PID:
+log its dimensions, region count, confidence, queue wait, child CPU/thread data,
+and separate capture, decode, warp, copy, preprocessing, worker startup, IPC
+send/wait, child-process inference, total timing, cache status, worker PID, and
+main PID. Logs deliberately omit recognized text:
 
 ```zsh
 CAMERA_OCR_DEBUG=1 \
 CAMERA_OCR_DEBUG_DIR=/tmp/camera-ocr-debug \
 python app.py --camera 0
 curl http://127.0.0.1:8765/api/ocr/texts
+```
+
+Benchmark a saved real OCR input at the production size, 75%, 50%, and 960/720
+long-side caps. The report checks only the expected strings and does not print
+recognized screen text:
+
+```zsh
+python -m automation.screen.benchmark_paddle \
+  /tmp/camera-ocr-debug/paddle-ocr-0001.png \
+  --iterations 5 --recognition-batch-size 1 \
+  --output /tmp/camera-ocr-benchmark.json
 ```
 
 To profile camera delivery around an OCR request, restart with preview debugging
@@ -344,9 +416,33 @@ Without `--serial`, automation selects a phone only when exactly one authorized
 physical USB phone is available. Zero/multiple candidates fail clearly. With
 `--serial`, it validates that exact phone; unauthorized/offline phones, emulators,
 and wireless ADB remain unsupported. The manual dashboard retains its stricter
-single-attached-phone selection. **One tested Android phone remains the current
-hardware scope**; serial selection and lock isolation prepare for future devices,
-not a multi-device dashboard.
+single-attached-phone selection. Raspberry Pi mode supports selecting registered
+logical phones through the dashboard with separate lock and calibration
+identities.
+
+Logical phones can also use separate external cameras. Camera assignments are
+stored in `automation/camera_data/cameras.json`; the selected phone controls the
+main preview, calibration, OCR, recorder capture, and workflow screen observer.
+Configure source `0` for `phone_A`, source `1` for `phone_B`, or any supported
+OpenCV camera URL through **Camera Settings** on its device card. The Devices
+grid shows every registered phone's monitoring preview and keeps Bluetooth and
+camera availability as separate states. Selecting a card changes the control
+target while the other previews remain visible. **Test Camera** checks a source
+and displays a temporary frame without saving the assignment.
+
+Changing source or rotation invalidates only that phone's in-memory calibration
+and prompts for recalibration; its saved calibration file is retained.
+`GET /api/cameras?probe=true` checks
+local indexes 0–10 without retaining probe handles. On macOS, AVFoundation camera
+indexes may differ from ffmpeg enumeration. Monitoring previews run at a modest
+rate, the selected main preview runs at the normal rate, and OCR remains
+request-driven through the single persistent OCR worker.
+Camera discovery runs only when Camera Settings requests it. Results are cached
+for 20 seconds; **Refresh Cameras** explicitly refreshes the probe. The one-second
+device poll reads assigned-camera status and does not probe indexes 0–10. The
+discovery list includes an index only after OpenCV opens it and reads a frame.
+An unavailable saved assignment remains visible as unavailable but is never
+silently replaced.
 
 ### Exclusive device ownership
 
@@ -519,6 +615,90 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
   `context.screen.capture()` as PNG bytes; no screenshots are saved automatically.
   Use manual checkpoints for authentication and final financial authorization.
   Coordinate taps cannot determine an app action's meaning.
+
+## Account-routed external jobs
+
+External jobs use a persistent account binding rather than the dashboard's current
+phone selection. Each account has a stable `account_id`, display name, optional
+provider, one `device_id`, and an enabled flag. The current model permits one account
+per device. It stores routing metadata only; credentials, passwords, PINs, OTPs, and
+other banking secrets do not belong in account bindings.
+
+Account routes:
+
+```text
+GET    /api/accounts
+POST   /api/accounts
+GET    /api/accounts/<account_id>
+PATCH  /api/accounts/<account_id>
+DELETE /api/accounts/<account_id>
+GET    /api/accounts/<account_id>/device
+```
+
+Create a passive queued job with:
+
+```json
+POST /api/jobs
+{
+  "account_id": "uob_account_1",
+  "workflow": "flow_example",
+  "payload": {}
+}
+```
+
+The server validates the enabled account and saved workflow, resolves the account's
+device once, persists that `device_id`, and returns `202 Accepted`. Changing the
+dashboard control target later does not move the job. `GET /api/jobs` and
+`GET /api/jobs/<job_id>` expose safe status metadata without echoing the stored
+payload. `POST /api/jobs/<job_id>/cancel` immediately cancels queued jobs. Running
+jobs record `cancel_requested`, signal the active workflow cancellation event, and
+remain assigned until workflow ownership has been released safely.
+
+Future HTTP/WebSocket providers enter through
+`automation.jobs.ExternalIntegrationService`, rather than calling workflow or
+device code directly. An injected `IntegrationAdapter` converts an unknown provider
+payload into `NormalizedJobRequest(external_ref, bank, action, payload)`. A separate
+injected `JobRouteResolver` maps that normalized request to an existing account and
+workflow. Only then does the service resolve and persist the account's `device_id`.
+No provider field names or transport schema are part of this boundary. Jobs created
+through it retain nullable `external_ref`, `bank`, and `action` metadata; legacy and
+local jobs load with those fields set to null.
+
+Job states are `QUEUED`, `WAITING_FOR_DEVICE`, `RUNNING`, `COMPLETED`, `FAILED`,
+`CANCELLED`, and `INTERRUPTED`. Queues are ordered independently per device. The
+background executor runs one workflow thread for each free device, so different
+phones may progress concurrently while each phone remains strictly sequential. A
+scheduler reservation is atomic within the backend process, permits at most one
+running job for a device, and never substitutes another phone. On restart, an
+interrupted `RUNNING` job becomes `INTERRUPTED`; physical HID input is never replayed
+automatically. Queued and waiting jobs retain their original device and remain
+eligible.
+
+Bindings and jobs are stored as private, atomically replaced JSON files under
+`automation/job_data/`. The dashboard shows the account assigned to each device and
+recent jobs with queue position, timestamps, result/error, and valid cancellation
+actions. These local APIs currently retain the dashboard's
+same-origin and control-token protections; a production external service needs a
+separate authenticated ingress policy before network exposure. The JSON stores and
+scheduler serialize threads in the current single Flask process. A future
+multi-process or multi-host deployment must move reservation and queue transitions
+to a transactional database or another shared locking system.
+
+The intended worker flow is:
+
+```text
+POST /api/jobs -> persistent job -> per-device scheduler -> background worker
+-> CameraManager frame -> OCR / visual state -> workflow -> Pi HID
+-> persist result -> release device
+```
+
+The normal server entry point starts one executor, which polls persisted eligibility
+independently of browser requests and resolves each job's assigned camera and saved
+calibration when execution starts. Application-factory users must opt in with
+`start_job_executor=True`, preventing test factories or multiple WSGI workers from
+accidentally starting competing schedulers. Per-device OCR providers keep separate
+frame/cache state while sharing the one persistent Paddle worker. Closing the browser
+therefore has no effect on a running job.
 
 ## Errors and diagnostics
 

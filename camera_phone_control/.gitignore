@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
+.env
 venv/
 .venv/
 tests/*
+automation/job_data/
+automation/auth_data/users.json

@@ -1,6 +1,7 @@
 """Workflow input contract over the existing Pi manual-input bridge."""
 
 from hardware.pi_api_client import PiApiClient
+from hardware.device_config import DEFAULT_DEVICE_ID
 from hardware.raspberry_pi_input import RaspberryPiInputBridge
 from .base import InputBridge, UnsupportedOperation
 
@@ -24,9 +25,14 @@ class RaspberryPiWorkflowInput(InputBridge):
     def __init__(self, target):
         # Use the same endpoint for execution and device ownership, even if the
         # process environment changes after selection. Construction does no I/O.
+        endpoint = target.serial.removeprefix("pi-api:").split("#", 1)[0]
         self.bridge = RaspberryPiInputBridge(
-            PiApiClient(target.serial.removeprefix("pi-api:"))
+            PiApiClient(
+                endpoint,
+                device_id=getattr(target, "device_id", DEFAULT_DEVICE_ID),
+            )
         )
+        self.device_id = self.bridge.device_id
 
     def tap(self, x, y):
         return self.bridge.tap(x, y)

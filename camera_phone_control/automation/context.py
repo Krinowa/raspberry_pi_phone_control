@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from android_control import validate_key
 from .backends import bind
 from .coordinates import device_to_normalized
+from .workflows.timing import measure_timing
 
 
 class Cancelled(Exception):
@@ -96,7 +97,7 @@ class AutomationContext:
             or seconds < 0
         ):
             raise ValueError("Wait duration must be a finite nonnegative number.")
-        with self._step("wait"):
+        with self._step("wait"), measure_timing("fixed_sleep"):
             deadline = time.monotonic() + seconds
             while True:
                 self.check_cancelled()

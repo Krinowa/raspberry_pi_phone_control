@@ -15,6 +15,43 @@ from .validation import (
 )
 
 
+def iter_workflow_steps(steps):
+    for step in steps:
+        yield step
+        if step.get("type") == "if_text":
+            yield from iter_workflow_steps(step.get("then_steps", []))
+            yield from iter_workflow_steps(step.get("else_steps", []))
+
+
+def find_step_location(steps, step_id):
+    for index, step in enumerate(steps):
+        if step.get("id") == step_id:
+            return steps, index
+        if step.get("type") == "if_text":
+            for branch in ("then_steps", "else_steps"):
+                found = find_step_location(step.get(branch, []), step_id)
+                if found is not None:
+                    return found
+    return None
+
+
+def branch_steps(workflow, parent_step_id=None, branch=None):
+    if parent_step_id in {None, ""}:
+        if branch not in {None, "", "steps"}:
+            raise ValueError("A branch parent is required.")
+        return workflow["steps"]
+    location = find_step_location(workflow["steps"], parent_step_id)
+    if location is None:
+        raise ValueError("Condition step not found.")
+    parent = location[0][location[1]]
+    if parent.get("type") != "if_text" or branch not in {
+        "then_steps",
+        "else_steps",
+    }:
+        raise ValueError("Choose a valid condition branch.")
+    return parent[branch]
+
+
 class Recorder:
     def __init__(self):
         self.owner = None
@@ -23,12 +60,25 @@ class Recorder:
         self.execute = False
         self.input_target = None
         self.editing_existing = False
-        self.mark_next_screen = False
         self.pending_expected_text = None
         self.keyboard_capture = None
+        self.active_alternate_screen = None
+
+    def _recording_steps(self, workflow=None):
+        workflow = self.workflow if workflow is None else workflow
+        if self.active_alternate_screen is None:
+            return workflow["steps"]
+        location = find_step_location(
+            workflow["steps"], self.active_alternate_screen["condition_id"]
+        )
+        if location is None:
+            raise ValueError("The Special Case is no longer available.")
+        condition = location[0][location[1]]
+        if condition.get("type") != "if_text":
+            raise ValueError("The Special Case is no longer available.")
+        return condition["then_steps"]
 
     def _clear_annotation_state(self):
-        self.mark_next_screen = False
         self.pending_expected_text = None
         self.keyboard_capture = None
 
@@ -41,7 +91,8 @@ class Recorder:
     def start_keyboard_capture(self, owner, name, keys, kind="numeric"):
         self.require_owner(owner)
         self._require_not_annotating()
-        previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
+        recording_steps = self._recording_steps()
+        previous = recording_steps[-1] if recording_steps else None
         if previous and (
             previous["type"] == "manual_checkpoint"
             or SENSITIVE.search(previous.get("label") or "")
@@ -68,7 +119,6 @@ class Recorder:
         keyboard["name"] = keyboard["name"].strip()
         if keyboard["name"].casefold() in existing_names:
             raise ValueError("A captured keyboard already uses this name.")
-        self.mark_next_screen = False
         self.keyboard_capture = {**keyboard, "requested_keys": list(keys)}
         return self.snapshot()
 
@@ -114,7 +164,7 @@ class Recorder:
             raise ValueError("Captured keyboard not found.")
         references = [
             step
-            for step in self.workflow["steps"]
+            for step in iter_workflow_steps(self.workflow["steps"])
             if step.get("input_method") == "screen_keyboard"
             and step.get("keyboard_id") == keyboard_id
         ]
@@ -134,14 +184,14 @@ class Recorder:
         if self.owner != owner or self.workflow is None:
             raise ValueError("No recording belongs to this browser.")
 
-    def start(self, owner, name, execute=False, financial=False):
+    def start(self, owner, name, execute=False, financial=False, purpose="payment"):
         if self.workflow is not None:
             raise ValueError("Save or cancel the current recording first.")
 
         if type(execute) is not bool or type(financial) is not bool:
             raise ValueError("Recording options must be booleans.")
 
-        workflow = new_workflow(name)
+        workflow = new_workflow(name, purpose)
         workflow["financial"] = financial
         validate_workflow(workflow, allow_empty=True)
 
@@ -154,6 +204,7 @@ class Recorder:
 
         self.input_target = None
         self.editing_existing = False
+        self.active_alternate_screen = None
         self._clear_annotation_state()
 
         return self.snapshot()
@@ -171,6 +222,7 @@ class Recorder:
         self.execute = False
         self.input_target = None
         self.editing_existing = True
+        self.active_alternate_screen = None
         self._clear_annotation_state()
 
         return self.snapshot()
@@ -204,7 +256,7 @@ class Recorder:
             if old is None:
                 candidate["variables"].append(variable)
 
-        candidate["steps"].append(step)
+        self._recording_steps(candidate).append(step)
         # A financial draft may be incomplete until Save; validate other fields now.
         check = deepcopy(candidate)
         check["financial"] = False
@@ -216,10 +268,11 @@ class Recorder:
         self._require_not_annotating()
         self.input_target = None
 
-        if self.workflow["steps"]:
-            self.workflow["steps"].pop()
+        recording_steps = self._recording_steps()
+        if recording_steps:
+            recording_steps.pop()
 
-        used = {s.get("variable") for s in self.workflow["steps"]}
+        used = {s.get("variable") for s in iter_workflow_steps(self.workflow["steps"])}
         self.workflow["variables"] = [
             v for v in self.workflow["variables"] if v["name"] in used
         ]
@@ -228,6 +281,7 @@ class Recorder:
     def stop(self, owner):
         self.require_owner(owner)
         self.active = False
+        self.active_alternate_screen = None
         self._clear_annotation_state()
         return self.snapshot()
 
@@ -236,11 +290,13 @@ class Recorder:
         self.owner, self.workflow, self.active, self.execute = None, None, False, False
         self.editing_existing = False
         self.input_target = None
+        self.active_alternate_screen = None
         self._clear_annotation_state()
 
     def fail_recording(self):
         self.active = False
         self.input_target = None
+        self.active_alternate_screen = None
         self._clear_annotation_state()
 
     def prepare_capture(self, owner, step, target=None):
@@ -248,33 +304,37 @@ class Recorder:
         step = deepcopy(step)
         step["recorded_at"] = now()
         candidate = self.prepare(owner, step)
-        previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
+        current_steps = self._recording_steps()
+        previous = current_steps[-1] if current_steps else None
         if previous and target is not None and target == self.input_target:
             if previous["type"] == "input" and previous.get("source") == "fixed":
                 if step["type"] == "input" and step.get("source") == "fixed":
-                    candidate["steps"][-2]["value"] += step["value"]
-                    candidate["steps"].pop()
+                    candidate_steps = self._recording_steps(candidate)
+                    candidate_steps[-2]["value"] += step["value"]
+                    candidate_steps.pop()
                 elif (
                     step["type"] == "key" and step.get("key", "").upper() == "BACKSPACE"
                 ):
                     if previous["value"]:
-                        candidate["steps"][-2]["value"] = previous["value"][:-1]
-                        candidate["steps"].pop()
+                        candidate_steps = self._recording_steps(candidate)
+                        candidate_steps[-2]["value"] = previous["value"][:-1]
+                        candidate_steps.pop()
         if (
             previous
             and step["type"] == "manual_checkpoint"
             and previous.get("label") == "Secure input"
         ):
-            candidate["steps"].pop()
+            self._recording_steps(candidate).pop()
         check = deepcopy(candidate)
         check["financial"] = False
         validate_workflow(check)
         return candidate
 
     def require_expected_text_action(self, step_id):
-        step = next((s for s in self.workflow["steps"] if s["id"] == step_id), None)
-        if not step:
+        location = find_step_location(self.workflow["steps"], step_id)
+        if location is None:
             raise ValueError("Recorded step not found.")
+        step = location[0][location[1]]
         navigation = step["type"] in {"tap", "swipe"} or (
             step["type"] == "key" and step.get("key", "").upper() in {"HOME", "BACK"}
         )
@@ -289,32 +349,11 @@ class Recorder:
         return step
 
     def commit_recording(self, owner, candidate, input_target=None):
-        """Commit a successful action and expose an armed navigation target."""
+        """Commit a successful recorded action."""
         self.require_owner(owner)
         self.workflow = candidate
         self.input_target = input_target
 
-        if self.mark_next_screen and candidate["steps"]:
-            step = candidate["steps"][-1]
-
-            try:
-                self.require_expected_text_action(step["id"])
-            except ValueError:
-                pass
-            else:
-                self.mark_next_screen = False
-                self.pending_expected_text = step["id"]
-
-        return self.snapshot()
-
-    def toggle_mark_next_screen(self, owner):
-        self.require_owner(owner)
-
-        if not self.active:
-            raise ValueError("Recording is stopped.")
-
-        self._require_not_annotating()
-        self.mark_next_screen = not self.mark_next_screen
         return self.snapshot()
 
     def begin_current_screen_annotation(self, owner):
@@ -328,7 +367,8 @@ class Recorder:
 
         self._require_not_annotating()
 
-        previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
+        current_steps = self._recording_steps()
+        previous = current_steps[-1] if current_steps else None
 
         if previous and (
             previous["type"] == "manual_checkpoint"
@@ -338,7 +378,6 @@ class Recorder:
                 "Expected text is unavailable after a secure or manual checkpoint."
             )
 
-        self.mark_next_screen = False
         self.pending_expected_text = "current"
         return self.workflow
 
@@ -360,7 +399,7 @@ class Recorder:
         self._clear_annotation_state()
         return self.snapshot()
 
-    def add_pending_expected_text(self, owner, text, timeout_seconds=10):
+    def add_pending_expected_text(self, owner, text, timeout_seconds=10, roi=None):
         self.require_owner(owner)
 
         if not self.active or self.pending_expected_text is None:
@@ -374,26 +413,20 @@ class Recorder:
             "text": text,
             "timeout_seconds": timeout_seconds,
         }
+        if roi is not None:
+            step["roi"] = deepcopy(roi)
 
         if target == "current":
-            candidate["steps"].append(step)
+            self._recording_steps(candidate).append(step)
         else:
-            index = next(
-                (
-                    index
-                    for index, item in enumerate(candidate["steps"])
-                    if item["id"] == target
-                ),
-                None,
-            )
-
-            if index is None:
+            location = find_step_location(candidate["steps"], target)
+            if location is None:
                 raise ValueError("Recorded action is no longer available.")
-
+            siblings, index = location
             self.require_expected_text_action(target)
-            candidate["steps"].insert(index + 1, step)
+            siblings.insert(index + 1, step)
 
-        for item in candidate["steps"]:
+        for item in iter_workflow_steps(candidate["steps"]):
             if item["type"] == "wait_for_text" and isinstance(item.get("text"), str):
                 item["text"] = item["text"].strip()
 
@@ -410,7 +443,8 @@ class Recorder:
         step["recorded_at"] = now()
         self.require_owner(owner)
         self._require_not_annotating()
-        previous = self.workflow["steps"][-1] if self.workflow["steps"] else None
+        current_steps = self._recording_steps()
+        previous = current_steps[-1] if current_steps else None
         if (
             self.active
             and self.input_target == "manual-text"
@@ -422,12 +456,99 @@ class Recorder:
             and len(previous["value"]) + len(step["value"]) <= 4096
         ):
             candidate = deepcopy(self.workflow)
-            candidate["steps"][-1]["value"] += step["value"]
+            self._recording_steps(candidate)[-1]["value"] += step["value"]
             check = deepcopy(candidate)
             check["financial"] = False
             validate_workflow(check)
             return candidate
         return self.prepare(owner, step)
+
+    def start_alternate_screen(
+        self,
+        owner,
+        text,
+        timeout_seconds=0.8,
+        roi=None,
+        after_step_id=None,
+    ):
+        self.require_owner(owner)
+        self._require_not_annotating()
+        if self.active_alternate_screen is not None:
+            raise ValueError(
+                "Finish the current Special Case before adding another one."
+            )
+        return_mode = "recording" if self.active else "review"
+        if return_mode == "recording" and after_step_id is not None:
+            raise ValueError("Finish recording before choosing a review position.")
+        insertion_index = len(self.workflow["steps"])
+        if return_mode == "review":
+            location = find_step_location(self.workflow["steps"], after_step_id)
+            if location is None:
+                raise ValueError("Choose a workflow step for this Special Case.")
+            if location[0] is not self.workflow["steps"]:
+                raise ValueError(
+                    "Finish editing the current Special Case before adding another one here."
+                )
+            insertion_index = location[1] + 1
+        condition = {
+            "id": "step_" + uuid.uuid4().hex,
+            "type": "if_text",
+            "text": text,
+            "timeout_seconds": timeout_seconds,
+            "then_steps": [],
+            "else_steps": [],
+        }
+        if roi is not None:
+            condition["roi"] = deepcopy(roi)
+        candidate = deepcopy(self.workflow)
+        candidate["steps"].insert(insertion_index, condition)
+        check = deepcopy(candidate)
+        check["financial"] = False
+        candidate = validate_workflow(check, allow_empty=True)
+        candidate["financial"] = self.workflow.get("financial", False)
+        self.workflow = candidate
+        self.active = True
+        self.active_alternate_screen = {
+            "condition_id": condition["id"],
+            "return_mode": return_mode,
+            "after_step_id": after_step_id,
+        }
+        self.input_target = None
+        return self.snapshot()
+
+    def finish_alternate_screen(self, owner):
+        self.require_owner(owner)
+        if self.active_alternate_screen is None:
+            raise ValueError("No Special Case recording is active.")
+        self._require_not_annotating()
+        return_mode = self.active_alternate_screen["return_mode"]
+        self.active_alternate_screen = None
+        self.active = return_mode == "recording"
+        self.input_target = None
+        return self.snapshot()
+
+    def cancel_alternate_screen(self, owner):
+        self.require_owner(owner)
+        if self.active_alternate_screen is None:
+            raise ValueError("No Special Case recording is active.")
+        self._require_not_annotating()
+        condition_id = self.active_alternate_screen["condition_id"]
+        location = find_step_location(self.workflow["steps"], condition_id)
+        if location is not None:
+            location[0].pop(location[1])
+        return_mode = self.active_alternate_screen["return_mode"]
+        self.active_alternate_screen = None
+        self.active = return_mode == "recording"
+        self.input_target = None
+        used = {
+            step.get("variable") for step in iter_workflow_steps(self.workflow["steps"])
+        }
+        self.workflow["variables"] = [
+            definition
+            for definition in self.workflow["variables"]
+            if definition["name"] in used
+        ]
+        return self.snapshot()
 
     def review(self, owner, operation, data):
         self.require_owner(owner)
@@ -437,8 +558,16 @@ class Recorder:
 
         if operation == "rename_flow":
             candidate["name"] = data.get("name")
+            if "purpose" in data:
+                candidate["purpose"] = data["purpose"]
             if "financial" in data:
                 candidate["financial"] = data["financial"]
+            if "recovery_workflow_id" in data:
+                recovery_workflow_id = data["recovery_workflow_id"]
+                if recovery_workflow_id in {None, ""}:
+                    candidate.pop("recovery_workflow_id", None)
+                else:
+                    candidate["recovery_workflow_id"] = recovery_workflow_id
 
         elif operation == "insert":
             step = deepcopy(data.get("step"))
@@ -450,31 +579,32 @@ class Recorder:
                 "wait",
                 "wait_until_stable",
                 "wait_for_text",
+                "if_text",
+                "capture_screen",
+                "ocr_value",
                 "manual_checkpoint",
             }:
                 raise ValueError("Choose a supported step type.")
-            index = data.get("index", len(candidate["steps"]))
+            target_steps = branch_steps(
+                candidate,
+                data.get("parent_step_id"),
+                data.get("branch"),
+            )
+            index = data.get("index", len(target_steps))
 
-            if type(index) is not int or not 0 <= index <= len(candidate["steps"]):
+            if type(index) is not int or not 0 <= index <= len(target_steps):
                 raise ValueError("Invalid insertion position.")
             step["id"] = "step_" + uuid.uuid4().hex
-            candidate["steps"].insert(index, step)
+            target_steps.insert(index, step)
         else:
-            index = next(
-                (
-                    i
-                    for i, step in enumerate(candidate["steps"])
-                    if step["id"] == data.get("step_id")
-                ),
-                None,
-            )
-
-            if index is None:
+            location = find_step_location(candidate["steps"], data.get("step_id"))
+            if location is None:
                 raise ValueError("Recorded step not found.")
-            old = candidate["steps"][index]
+            siblings, index = location
+            old = siblings[index]
             if operation in {"expected_text", "remove_expected_text"}:
                 self.require_expected_text_action(old["id"])
-                following = candidate["steps"][index + 1 : index + 2]
+                following = siblings[index + 1 : index + 2]
                 wait = (
                     following[0]
                     if following and following[0]["type"] == "wait_for_text"
@@ -482,16 +612,20 @@ class Recorder:
                 )
                 if operation == "remove_expected_text":
                     if wait is not None:
-                        candidate["steps"].pop(index + 1)
+                        siblings.pop(index + 1)
                 else:
                     fields = {
                         "text": data.get("text"),
                         "timeout_seconds": data.get("timeout_seconds", 10),
                     }
+                    if "roi" in data:
+                        fields["roi"] = deepcopy(data["roi"])
                     if wait is not None:
                         wait.update(fields)
+                        if fields.get("roi", False) is None:
+                            wait.pop("roi", None)
                     else:
-                        candidate["steps"].insert(
+                        siblings.insert(
                             index + 1,
                             {
                                 "id": "step_" + uuid.uuid4().hex,
@@ -500,7 +634,7 @@ class Recorder:
                             },
                         )
             elif operation == "delete":
-                candidate["steps"].pop(index)
+                siblings.pop(index)
             elif operation == "fields":
                 allowed = {
                     "tap": {"x", "y"},
@@ -508,13 +642,21 @@ class Recorder:
                     "key": {"key"},
                     "wait": {"seconds"},
                     "wait_until_stable": {"stable_ms", "timeout_seconds"},
-                    "wait_for_text": {"text", "timeout_seconds"},
+                    "wait_for_text": {"text", "timeout_seconds", "roi"},
+                    "if_text": {"text", "timeout_seconds", "roi"},
+                    "capture_screen": {"output_key"},
+                    "ocr_value": {"roi", "parser", "output"},
                     "manual_checkpoint": {"message"},
                 }.get(old["type"], set())
                 changes = data.get("fields")
                 if not isinstance(changes, dict) or set(changes) - allowed:
                     raise ValueError("Unsupported fields for this step.")
                 old.update(deepcopy(changes))
+                if (
+                    old["type"] in {"wait_for_text", "if_text"}
+                    and changes.get("roi", False) is None
+                ):
+                    old.pop("roi", None)
             elif operation == "wait":
                 if old["type"] != "wait":
                     raise ValueError("Choose a wait step to edit its duration.")
@@ -533,7 +675,7 @@ class Recorder:
                     )
                     and old["type"] != "manual_checkpoint"
                 ):
-                    candidate["steps"][index] = {
+                    siblings[index] = {
                         "id": old["id"],
                         "type": "manual_checkpoint",
                         "label": label,
@@ -541,13 +683,42 @@ class Recorder:
                     }
                 else:
                     old["label"] = label
+            elif operation == "set_critical":
+                critical = data.get("critical")
+                if type(critical) is not bool:
+                    raise ValueError(
+                        "Irreversible payment marker must be true or false."
+                    )
+                if critical:
+                    old["critical"] = True
+                else:
+                    old.pop("critical", None)
             elif operation == "move":
                 destination = data.get("index")
-                if type(destination) is not int or not 0 <= destination < len(
-                    candidate["steps"]
+                if type(destination) is not int or not 0 <= destination < len(siblings):
+                    raise ValueError("Invalid step position.")
+                siblings.insert(destination, siblings.pop(index))
+            elif operation == "relocate":
+                parent_step_id = data.get("parent_step_id")
+                if parent_step_id and any(
+                    item.get("id") == parent_step_id
+                    for item in iter_workflow_steps([old])
+                ):
+                    raise ValueError("A condition cannot be moved into itself.")
+                target_steps = branch_steps(
+                    candidate,
+                    parent_step_id,
+                    data.get("branch"),
+                )
+                destination = data.get("index", len(target_steps))
+                if type(destination) is not int or not 0 <= destination <= len(
+                    target_steps
                 ):
                     raise ValueError("Invalid step position.")
-                candidate["steps"].insert(destination, candidate["steps"].pop(index))
+                moving = siblings.pop(index)
+                if target_steps is siblings and destination > index:
+                    destination -= 1
+                target_steps.insert(destination, moving)
             elif operation == "input":
                 source = data.get("source")
                 input_method = data.get("input_method", "hid")
@@ -560,7 +731,7 @@ class Recorder:
                     else {}
                 )
                 if source == "manual":
-                    candidate["steps"][index] = {
+                    siblings[index] = {
                         "id": old["id"],
                         "type": "manual_checkpoint",
                         "label": "Manual input",
@@ -580,7 +751,7 @@ class Recorder:
                     ):
                         new_value = old.get("value", "")
 
-                    candidate["steps"][index] = {
+                    siblings[index] = {
                         **{
                             k: v
                             for k, v in old.items()
@@ -592,6 +763,7 @@ class Recorder:
                                 "value",
                                 "input_method",
                                 "keyboard_id",
+                                "amount_format",
                             }
                         },
                         "id": old["id"],
@@ -607,6 +779,27 @@ class Recorder:
                     if not isinstance(variable, dict):
                         raise ValueError("Variable definition is required.")
 
+                    previous = next(
+                        (
+                            definition
+                            for definition in candidate["variables"]
+                            if definition["name"] == old.get("variable")
+                        ),
+                        None,
+                    )
+                    named = next(
+                        (
+                            definition
+                            for definition in candidate["variables"]
+                            if definition is not previous
+                            and definition["name"] == variable.get("name")
+                        ),
+                        None,
+                    )
+                    existing = named or previous
+                    if existing is not None:
+                        variable = {**existing, **variable}
+
                     sensitive_label = (
                         str(variable.get("name", ""))
                         + " "
@@ -616,32 +809,30 @@ class Recorder:
                     if variable.get(
                         "sensitive", False
                     ) is not False or SENSITIVE.search(sensitive_label):
-                        candidate["steps"][index] = {
+                        siblings[index] = {
                             "id": old["id"],
                             "type": "manual_checkpoint",
                             "label": "Secure input",
                             "message": "Complete secure authentication manually.",
                         }
                     else:
-                        existing = next(
-                            (
-                                v
-                                for v in candidate["variables"]
-                                if v["name"] == variable.get("name")
-                            ),
-                            None,
-                        )
-                        if existing:
+                        if existing is not None:
+                            existing.clear()
                             existing.update(variable)
                         else:
                             candidate["variables"].append(variable)
                         # Remove the captured value and preview on conversion.
-                        candidate["steps"][index] = {
+                        siblings[index] = {
                             "id": old["id"],
                             "type": "input",
                             "source": "variable",
                             "variable": variable.get("name"),
                             "label": old.get("label", ""),
+                            **(
+                                {"amount_format": data.get("amount_format", "raw")}
+                                if variable.get("name") == "amount"
+                                else {}
+                            ),
                             **method_fields,
                         }
                 else:
@@ -649,13 +840,16 @@ class Recorder:
             else:
                 raise ValueError("Unknown review operation.")
 
-        used = {s.get("variable") for s in candidate["steps"]}
+        all_steps = list(iter_workflow_steps(candidate["steps"]))
+        used = {s.get("variable") for s in all_steps}
 
         candidate["variables"] = [
             v for v in candidate["variables"] if v["name"] in used
         ]
-        for step in candidate["steps"]:
-            if step["type"] == "wait_for_text" and isinstance(step.get("text"), str):
+        for step in all_steps:
+            if step["type"] in {"wait_for_text", "if_text"} and isinstance(
+                step.get("text"), str
+            ):
                 step["text"] = step["text"].strip()
         check = deepcopy(candidate)
         check["financial"] = False
@@ -669,18 +863,29 @@ class Recorder:
     def snapshot(self):
         workflow = deepcopy(self.workflow)
         if self.editing_existing and workflow:
-            for step in workflow["steps"]:
+            for step in iter_workflow_steps(workflow["steps"]):
                 if step["type"] == "input" and step.get("source") == "fixed":
                     step["value"] = "(hidden)"
                 step.pop("preview", None)
-            for variable in workflow["variables"]:
-                variable["default"] = None
+        alternate_screen = None
+        if self.active_alternate_screen is not None and workflow is not None:
+            location = find_step_location(
+                workflow["steps"], self.active_alternate_screen["condition_id"]
+            )
+            if location is not None:
+                condition = location[0][location[1]]
+                alternate_screen = {
+                    "condition_id": condition["id"],
+                    "text": condition["text"],
+                    "step_count": len(condition["then_steps"]),
+                    "return_mode": self.active_alternate_screen["return_mode"],
+                    "after_step_id": self.active_alternate_screen.get("after_step_id"),
+                }
         return {
             "workflow": workflow,
             "editing_existing": self.editing_existing,
             "active": self.active,
             "execute": self.execute,
-            "mark_next_screen": self.mark_next_screen,
             "expected_text_pending": self.pending_expected_text is not None,
             "pending_expected_text_step_id": (
                 self.pending_expected_text
@@ -688,4 +893,5 @@ class Recorder:
                 else None
             ),
             "keyboard_capture": deepcopy(self.keyboard_capture),
+            "alternate_screen": alternate_screen,
         }

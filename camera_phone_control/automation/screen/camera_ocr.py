@@ -8,19 +8,28 @@ import math
 import multiprocessing
 import os
 from pathlib import Path
+import resource
 import threading
 import time
 import uuid
+from collections import deque
 
 import cv2
 import numpy as np
 
+from ..coordinates import normalized_roi
 from .state import ScreenStateError, TextDetectionUnavailable
+from ..workflows.timing import measure_timing, record_timing
 
 LOG = logging.getLogger("camera_ocr")
 
 
-def _build_paddle_engine(language, textline_orientation, cpu_threads):
+def _build_paddle_engine(
+    language,
+    textline_orientation,
+    cpu_threads,
+    recognition_batch_size=None,
+):
     """Construct Paddle only in the OCR child process."""
     try:
         from paddleocr import PaddleOCR
@@ -37,6 +46,8 @@ def _build_paddle_engine(language, textline_orientation, cpu_threads):
         use_textline_orientation=textline_orientation,
         cpu_threads=cpu_threads,
     )
+    if recognition_batch_size is not None:
+        options["text_recognition_batch_size"] = recognition_batch_size
     if language == "en":
         options.update(
             text_detection_model_name="PP-OCRv5_mobile_det",
@@ -89,6 +100,7 @@ def _paddle_worker(connection, config):
             config["language"],
             config["textline_orientation"],
             config["cpu_threads"],
+            config.get("recognition_batch_size"),
         )
         connection.send(("ready", worker_pid, time.monotonic() - started))
     except BaseException as exc:
@@ -115,15 +127,31 @@ def _paddle_worker(connection, config):
                 continue
             _, request_id, image = message
             try:
+                usage_before = resource.getrusage(resource.RUSAGE_SELF)
+                try:
+                    import psutil
+
+                    native_threads = psutil.Process().num_threads()
+                except (ImportError, OSError):
+                    native_threads = None
                 started = time.monotonic()
                 results = [_plain_result(item) for item in engine.predict(input=image)]
+                inference = time.monotonic() - started
+                usage_after = resource.getrusage(resource.RUSAGE_SELF)
                 connection.send(
                     (
                         "result",
                         request_id,
                         results,
-                        time.monotonic() - started,
+                        inference,
                         worker_pid,
+                        {
+                            "cpu_user": usage_after.ru_utime - usage_before.ru_utime,
+                            "cpu_system": usage_after.ru_stime - usage_before.ru_stime,
+                            "native_threads": native_threads,
+                            "input_width": image.shape[1],
+                            "input_height": image.shape[0],
+                        },
                     )
                 )
             except BaseException as exc:
@@ -231,20 +259,23 @@ class _PaddleWorkerClient:
         _, pid, self.initialization_seconds = message
         LOG.info(
             "PaddleOCR worker ready pid=%d main_pid=%d model_init=%.2fs "
-            "language=%s textline_orientation=%s cpu_threads=%d",
+            "language=%s textline_orientation=%s cpu_threads=%d rec_batch=%s",
             pid,
             os.getpid(),
             self.initialization_seconds,
             self.config["language"],
             self.config["textline_orientation"],
             self.config["cpu_threads"],
+            self.config.get("recognition_batch_size"),
         )
         return time.monotonic() - started
 
-    def request(self, image):
+    def request(self, image, *, request_id=None):
+        queued_at = time.monotonic()
         with self._lock:
+            queue_wait = time.monotonic() - queued_at
             startup = self._start()
-            request_id = uuid.uuid4().hex
+            request_id = request_id or uuid.uuid4().hex
             send_started = time.monotonic()
             try:
                 self._connection.send(("ocr", request_id, image))
@@ -253,6 +284,7 @@ class _PaddleWorkerClient:
                 raise ScreenStateError(
                     "PaddleOCR worker stopped before accepting the image."
                 ) from exc
+
             send_seconds = time.monotonic() - send_started
             wait_started = time.monotonic()
             message = self._receive(wait_started + self.timeout, "inference")
@@ -270,14 +302,22 @@ class _PaddleWorkerClient:
             if message[0] != "result":
                 self._stop(force=True)
                 raise ScreenStateError("PaddleOCR worker returned an invalid response.")
-            _, _, results, inference, pid = message
+            _, _, results, inference, pid, *extra = message
+            diagnostics = extra[0] if extra and isinstance(extra[0], dict) else {}
             return results, {
+                "queue_wait": queue_wait,
                 "worker_start": startup,
                 "ipc_send": send_seconds,
                 "ipc_wait": wait_seconds,
                 "inference": inference,
                 "worker_pid": pid,
+                **diagnostics,
             }
+
+    def start(self):
+        """Initialize the persistent model process without running inference."""
+        with self._lock:
+            return self._start()
 
     def _stop(self, *, force):
         process, connection = self._process, self._connection
@@ -310,12 +350,334 @@ class _PaddleWorkerClient:
             self._stop(force=False)
 
 
+class _PaddleWorkerPool:
+    """Fair dispatcher over independent persistent Paddle worker processes."""
+
+    def __init__(
+        self,
+        config,
+        timeout,
+        pool_size=2,
+        *,
+        client_factory=None,
+    ):
+        from .ocr_settings import validate_pool_size
+
+        self.config = dict(config)
+        self.timeout = float(timeout)
+        self.pool_size = validate_pool_size(pool_size)
+        self.client_factory = client_factory or self._new_client
+        self.condition = threading.Condition(threading.RLock())
+        self.queue = []
+        self.slots = []
+        self.accepting = True
+        self.restarting = False
+        self._next_worker = 0
+        self.metrics = deque(maxlen=256)
+        self._build_slots(self.pool_size)
+
+    def _new_client(self, worker_id):
+        return _PaddleWorkerClient(self.config, self.timeout)
+
+    def _build_slots(self, size):
+        self.slots = [
+            {
+                "worker_id": index + 1,
+                "client": self.client_factory(index + 1),
+                "state": "STARTING",
+                "failures": 0,
+                "retry_at": 0.0,
+            }
+            for index in range(size)
+        ]
+        self.pool_size = size
+        self._next_worker = 0
+
+    @property
+    def pid(self):
+        with self.condition:
+            return next(
+                (slot["client"].pid for slot in self.slots if slot["client"].pid),
+                None,
+            )
+
+    def _available_slot(self, current):
+        for offset in range(self.pool_size):
+            index = (self._next_worker + offset) % self.pool_size
+            slot = self.slots[index]
+            if slot["state"] in {"IDLE", "STARTING"}:
+                self._next_worker = (index + 1) % self.pool_size
+                return slot
+            if slot["state"] == "FAILED" and current >= slot["retry_at"]:
+                try:
+                    slot["client"].close()
+                except Exception:
+                    pass
+                slot["client"] = self.client_factory(slot["worker_id"])
+                slot["state"] = "STARTING"
+                self._next_worker = (index + 1) % self.pool_size
+                return slot
+        return None
+
+    def start(self):
+        """Warm every model once; failed slots remain recoverable with backoff."""
+        with self.condition:
+            if self.has_active_requests():
+                return self.status()
+            self.restarting = True
+        try:
+            errors = []
+            for slot in self.slots:
+                with self.condition:
+                    if slot["state"] == "IDLE":
+                        continue
+                    slot["state"] = "STARTING"
+                try:
+                    slot["client"].start()
+                except Exception as exc:
+                    errors.append(exc)
+                    self._mark_failed(slot)
+                else:
+                    with self.condition:
+                        slot["state"] = "IDLE"
+                        slot["failures"] = 0
+                        self.condition.notify_all()
+            if errors and len(errors) == len(self.slots):
+                raise errors[0]
+        finally:
+            with self.condition:
+                self.restarting = False
+                self.condition.notify_all()
+        return self.status()
+
+    def _mark_failed(self, slot):
+        with self.condition:
+            slot["failures"] += 1
+            # Fast first recovery, then bounded exponential backoff. Persistent
+            # failures remain visible and are retried only when work arrives.
+            delay = min(30.0, 0.25 * (2 ** min(slot["failures"] - 1, 7)))
+            slot["retry_at"] = time.monotonic() + delay
+            slot["state"] = "FAILED"
+            self.condition.notify_all()
+
+    def request(self, image):
+        submitted = time.monotonic()
+        request_id = uuid.uuid4().hex
+        deadline = submitted + self.timeout
+        with self.condition:
+            if not self.accepting:
+                raise ScreenStateError("PaddleOCR worker pool is shutting down.")
+            self.queue.append(request_id)
+            slot = None
+            while slot is None:
+                if not self.accepting:
+                    if request_id in self.queue:
+                        self.queue.remove(request_id)
+                    self.condition.notify_all()
+                    raise ScreenStateError("PaddleOCR worker pool is shutting down.")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if request_id in self.queue:
+                        self.queue.remove(request_id)
+                    self.condition.notify_all()
+                    raise ScreenStateError(
+                        "PaddleOCR worker pool timed out waiting for an available worker."
+                    )
+                if not self.restarting and self.queue and self.queue[0] == request_id:
+                    slot = self._available_slot(time.monotonic())
+                    if slot is not None:
+                        self.queue.pop(0)
+                        slot["state"] = "BUSY"
+                        busy_at_dispatch = sum(
+                            item["state"] == "BUSY" for item in self.slots
+                        )
+                        queued_at_dispatch = len(self.queue)
+                        break
+                retry_delays = [
+                    item["retry_at"] - time.monotonic()
+                    for item in self.slots
+                    if item["state"] == "FAILED" and item["retry_at"] > time.monotonic()
+                ]
+                wait_for = min(0.05, remaining)
+                if retry_delays:
+                    wait_for = min(wait_for, max(0.001, min(retry_delays)))
+                self.condition.wait(wait_for)
+
+        dispatcher_queue_wait = time.monotonic() - submitted
+        total_started = submitted
+        healthy = False
+        try:
+            results, timings = slot["client"].request(
+                image,
+                request_id=request_id,
+            )
+            healthy = True
+            # Include lazy/recovery startup in queue delay because inference
+            # cannot begin until that worker's persistent model is ready.
+            queue_wait = (
+                dispatcher_queue_wait
+                + timings.get("queue_wait", 0.0)
+                + timings.get("worker_start", 0.0)
+            )
+            total_ocr = time.monotonic() - total_started
+            with self.condition:
+                self.metrics.append(
+                    {
+                        "timestamp": time.monotonic(),
+                        "pool_size": self.pool_size,
+                        "queue_wait_ms": queue_wait * 1000.0,
+                        "inference_ms": timings.get("inference", 0.0) * 1000.0,
+                        "busy_ratio": busy_at_dispatch / self.pool_size,
+                    }
+                )
+            return results, {
+                **timings,
+                "request_id": request_id,
+                "worker_id": slot["worker_id"],
+                "dispatcher_queue_wait": dispatcher_queue_wait,
+                "queue_wait": queue_wait,
+                "queue_wait_ms": queue_wait * 1000.0,
+                "inference_ms": timings.get("inference", 0.0) * 1000.0,
+                "total_ocr": total_ocr,
+                "total_ocr_ms": total_ocr * 1000.0,
+                "pool_size": self.pool_size,
+                "busy_workers": busy_at_dispatch,
+                "queued_requests": queued_at_dispatch,
+            }
+        finally:
+            if healthy or slot["client"].pid is not None:
+                with self.condition:
+                    slot["state"] = "IDLE"
+                    if healthy:
+                        slot["failures"] = 0
+                    self.condition.notify_all()
+            else:
+                self._mark_failed(slot)
+
+    def has_active_requests(self):
+        with self.condition:
+            return bool(self.queue) or any(
+                slot["state"] == "BUSY" for slot in self.slots
+            )
+
+    def status(self):
+        with self.condition:
+            status = {
+                "pool_size": self.pool_size,
+                "busy_workers": sum(slot["state"] == "BUSY" for slot in self.slots),
+                "queued_requests": len(self.queue),
+                "accepting": self.accepting,
+                "restarting": self.restarting,
+                "workers": [
+                    {
+                        "worker_id": slot["worker_id"],
+                        "state": slot["state"],
+                        "pid": slot["client"].pid,
+                    }
+                    for slot in self.slots
+                ],
+            }
+        rss_values = []
+        try:
+            import psutil
+
+            for worker in status["workers"]:
+                if worker["pid"] is None:
+                    continue
+                try:
+                    rss = int(psutil.Process(worker["pid"]).memory_info().rss)
+                except (OSError, psutil.Error):
+                    continue
+                worker["rss_bytes"] = rss
+                rss_values.append(rss)
+        except ImportError:
+            pass
+        status["observed_worker_rss_bytes"] = (
+            round(sum(rss_values) / len(rss_values)) if rss_values else None
+        )
+        return status
+
+    def recent_metrics(self, window_seconds=30.0):
+        """Return bounded recent metrics used by the recommendation service."""
+        cutoff = time.monotonic() - float(window_seconds)
+        with self.condition:
+            records = [item for item in self.metrics if item["timestamp"] >= cutoff]
+            current_size = self.pool_size
+        current = [item for item in records if item["pool_size"] == current_size]
+        lower = [item for item in records if item["pool_size"] < current_size]
+
+        def average(items, name):
+            if not items:
+                return None
+            return sum(item[name] for item in items) / len(items)
+
+        return {
+            "sample_count": len(current),
+            "average_queue_wait_ms": average(current, "queue_wait_ms") or 0.0,
+            "average_inference_ms": average(current, "inference_ms") or 0.0,
+            "average_busy_ratio": average(current, "busy_ratio") or 0.0,
+            "lower_pool_inference_ms": average(lower, "inference_ms"),
+            "lower_pool_queue_wait_ms": average(lower, "queue_wait_ms"),
+        }
+
+    def restart(self, pool_size):
+        from .ocr_settings import OCRPoolBusy, validate_pool_size
+
+        pool_size = validate_pool_size(pool_size)
+        with self.condition:
+            if self.has_active_requests():
+                raise OCRPoolBusy(
+                    "OCR workers are busy. Wait for active OCR requests to finish."
+                )
+            self.restarting = True
+            old_slots = self.slots
+        try:
+            for slot in old_slots:
+                slot["client"].close()
+            with self.condition:
+                self._build_slots(pool_size)
+            errors = []
+            for slot in self.slots:
+                try:
+                    slot["client"].start()
+                except Exception as exc:
+                    errors.append(exc)
+                    self._mark_failed(slot)
+                else:
+                    with self.condition:
+                        slot["state"] = "IDLE"
+                        self.condition.notify_all()
+            if errors and len(errors) == len(self.slots):
+                raise errors[0]
+        finally:
+            with self.condition:
+                self.restarting = False
+                self.condition.notify_all()
+        return self.status()
+
+    def close(self):
+        with self.condition:
+            self.accepting = False
+            while any(slot["state"] == "BUSY" for slot in self.slots):
+                self.condition.wait(0.05)
+            slots = list(self.slots)
+            self.condition.notify_all()
+        for slot in slots:
+            slot["client"].close()
+
+
 class CameraOCRScreenStateProvider:
-    """Read phone UI text through one persistent PaddleOCR child process."""
+    """Read phone UI text through a shared persistent PaddleOCR process pool."""
 
-    _inference_lock = threading.Lock()
-
-    def __init__(self, external_screen, *, language="en", timeout=30.0):
+    def __init__(
+        self,
+        external_screen,
+        *,
+        language="en",
+        timeout=30.0,
+        worker_pool_size=2,
+        _shared_worker=None,
+    ):
         self.external_screen = external_screen
         self.language = language
         self.timeout = float(timeout)
@@ -330,16 +692,45 @@ class CameraOCRScreenStateProvider:
         )
         self.scale = self._configured_scale()
         self.cpu_threads = self._configured_cpu_threads()
+        self.recognition_batch_size = self._configured_recognition_batch_size()
         self.cache_threshold = self._configured_cache_threshold()
+        self.change_threshold = self._configured_change_threshold()
+        self.change_ratio_threshold = self._configured_change_ratio_threshold()
+        self.forced_ocr_interval = self._configured_forced_interval()
+        self.poll_interval = self._configured_poll_interval()
+        self.settle_seconds = self._configured_settle_seconds()
+        self.roi_fallback_misses = int(
+            self._configured_float("CAMERA_OCR_ROI_FALLBACK_MISSES", 3, 1, 100)
+        )
+        self.roi_fallback_seconds = self._configured_float(
+            "CAMERA_OCR_ROI_FALLBACK_SECONDS", 3.0, 0.1, 300
+        )
+        self._roi_waits = {}
         self._debug_sequence = itertools.count(1)
-        self._cache_signature = self._cache_candidates = None
-        self._worker = _PaddleWorkerClient(
+        self._cache_by_scope = {}
+        self._change_baseline = self._change_candidate = None
+        self._change_candidate_since = None
+        self._inference_lock = threading.Lock()
+        self._owns_worker = _shared_worker is None
+        self._worker = _shared_worker or _PaddleWorkerPool(
             {
                 "language": self.language,
                 "textline_orientation": self.textline_orientation,
                 "cpu_threads": self.cpu_threads,
+                "recognition_batch_size": self.recognition_batch_size,
             },
             self.timeout,
+            worker_pool_size,
+        )
+
+    def for_screen(self, external_screen):
+        """Create an isolated per-screen cache while sharing Paddle inference."""
+        return type(self)(
+            external_screen,
+            language=self.language,
+            timeout=self.timeout,
+            worker_pool_size=self._worker.pool_size,
+            _shared_worker=self._worker,
         )
 
     @staticmethod
@@ -365,15 +756,30 @@ class CameraOCRScreenStateProvider:
 
     @staticmethod
     def _configured_cpu_threads():
-        value = os.environ.get("CAMERA_OCR_CPU_THREADS", "4").strip()
+        value = os.environ.get("CAMERA_OCR_CPU_THREADS", "1").strip()
         try:
             threads = int(value)
         except ValueError:
-            threads = 4
+            threads = 1
         if not 1 <= threads <= 16:
-            LOG.warning("Unsupported CAMERA_OCR_CPU_THREADS=%r; using 4.", value)
-            return 4
+            LOG.warning("Unsupported CAMERA_OCR_CPU_THREADS=%r; using 1.", value)
+            return 1
         return threads
+
+    @staticmethod
+    def _configured_recognition_batch_size():
+        value = os.environ.get("CAMERA_OCR_RECOGNITION_BATCH_SIZE", "1").strip()
+        try:
+            batch_size = int(value)
+        except ValueError:
+            batch_size = 1
+        if not 1 <= batch_size <= 32:
+            LOG.warning(
+                "Unsupported CAMERA_OCR_RECOGNITION_BATCH_SIZE=%r; using 1.",
+                value,
+            )
+            return 1
+        return batch_size
 
     @staticmethod
     def _configured_cache_threshold():
@@ -388,6 +794,46 @@ class CameraOCRScreenStateProvider:
             )
             return 0.001
         return threshold
+
+    @staticmethod
+    def _configured_float(name, default, low, high):
+        value = os.environ.get(name, str(default)).strip()
+        try:
+            configured = float(value)
+        except ValueError:
+            configured = default
+        if not low <= configured <= high:
+            LOG.warning("Unsupported %s=%r; using %s.", name, value, default)
+            return default
+        return configured
+
+    @classmethod
+    def _configured_change_threshold(cls):
+        # Signature pixels use the original 0..255 grayscale range. Three levels
+        # matches the existing stability detector's camera-noise tolerance.
+        return cls._configured_float("CAMERA_OCR_CHANGE_THRESHOLD", 3.0, 0.0, 32.0)
+
+    @classmethod
+    def _configured_change_ratio_threshold(cls):
+        return cls._configured_float(
+            "CAMERA_OCR_CHANGE_RATIO_THRESHOLD", 0.002, 0.0, 0.25
+        )
+
+    @classmethod
+    def _configured_forced_interval(cls):
+        return cls._configured_float(
+            "CAMERA_OCR_FORCED_INTERVAL_SECONDS", 0.45, 0.2, 30.0
+        )
+
+    @classmethod
+    def _configured_poll_interval(cls):
+        return cls._configured_float(
+            "CAMERA_OCR_POLL_INTERVAL_SECONDS", 0.075, 0.025, 0.5
+        )
+
+    @classmethod
+    def _configured_settle_seconds(cls):
+        return cls._configured_float("CAMERA_OCR_SETTLE_SECONDS", 0.12, 0.0, 0.5)
 
     @staticmethod
     def _grayscale(image):
@@ -427,16 +873,34 @@ class CameraOCRScreenStateProvider:
         signature = cv2.resize(gray, (96, 160), interpolation=cv2.INTER_AREA)
         return cv2.GaussianBlur(signature, (3, 3), 0)
 
-    def _cache_match(self, signature):
-        if (
-            self.cache_threshold <= 0
-            or self._cache_signature is None
-            or self._cache_candidates is None
-        ):
+    @staticmethod
+    def _signature_difference(current, previous):
+        difference = cv2.absdiff(current, previous)
+        return (
+            float(difference.mean()),
+            float(np.count_nonzero(difference >= 12)) / difference.size,
+        )
+
+    def _signatures_match_for_change(self, current, previous):
+        if previous is None:
             return False, None, None
-        difference = cv2.absdiff(signature, self._cache_signature)
-        mean_difference = float(difference.mean()) / 255.0
-        changed_ratio = float(np.count_nonzero(difference >= 12)) / difference.size
+        mean_difference, changed_ratio = self._signature_difference(current, previous)
+        return (
+            mean_difference <= self.change_threshold
+            and changed_ratio <= self.change_ratio_threshold,
+            mean_difference,
+            changed_ratio,
+        )
+
+    def _cache_match(self, signature, scope):
+        cached = self._cache_by_scope.get(scope)
+        if self.cache_threshold <= 0 or cached is None:
+            return False, None, None
+        cached_signature, cached_candidates = cached
+        raw_mean, changed_ratio = self._signature_difference(
+            signature, cached_signature
+        )
+        mean_difference = raw_mean / 255.0
         return (
             mean_difference <= self.cache_threshold
             and changed_ratio <= self.cache_threshold,
@@ -447,6 +911,25 @@ class CameraOCRScreenStateProvider:
     def capture_snapshot(self):
         image, _, _ = self._capture_snapshot_with_timings()
         return image
+
+    @staticmethod
+    def _camera_seconds(timings):
+        return sum(
+            timings.get(name, 0.0) for name in ("capture", "decode", "warp", "copy")
+        )
+
+    def capture_change_baseline(self):
+        """Remember the screen immediately before an input action without OCR."""
+        self._change_baseline = self._change_candidate = None
+        self._change_candidate_since = None
+        snapshot, sequence, timings = self._capture_snapshot_with_timings()
+        self._change_baseline = self._screen_signature(snapshot)
+        self._change_candidate = None
+        record_timing(
+            "camera_frame",
+            self._camera_seconds(timings),
+            count=int(sequence is not None),
+        )
 
     def _capture_snapshot_with_timings(self):
         timings = {}
@@ -543,31 +1026,49 @@ class CameraOCRScreenStateProvider:
         if self.debug_logging:
             LOG.info(
                 "OCR timing capture=%s decode=%s warp=%s copy=%s preprocess=%s "
-                "worker_start=%s ipc_send=%s ipc_wait=%s child_inference=%s "
+                "queue_wait=%s worker_start=%s ipc_send=%s ipc_wait=%s "
+                "child_inference=%s child_cpu_user=%s child_cpu_system=%s "
                 "total=%s cache=%s cache_mean=%s cache_changed=%s "
-                "worker_pid=%s main_pid=%d regions=%d image=%dx%d detections=%r",
+                "worker_id=%s worker_pid=%s pool_size=%s busy=%s queued=%s "
+                "main_pid=%d native_threads=%s regions=%d "
+                "original=%sx%s camera=%sx%s warped=%sx%s calibrated=%sx%s "
+                "input=%dx%d "
+                "confidences=%r",
                 self._timing(timings, "capture"),
                 self._timing(timings, "decode"),
                 self._timing(timings, "warp"),
                 self._timing(timings, "copy"),
                 self._timing(timings, "preprocess"),
+                self._timing(timings, "queue_wait"),
                 self._timing(timings, "worker_start"),
                 self._timing(timings, "ipc_send"),
                 self._timing(timings, "ipc_wait"),
                 self._timing(timings, "inference"),
+                self._timing(timings, "cpu_user"),
+                self._timing(timings, "cpu_system"),
                 self._timing(timings, "total"),
                 cache_hit,
                 "n/a" if mean is None else f"{mean:.5f}",
                 "n/a" if changed is None else f"{changed:.5f}",
+                timings.get("worker_id"),
                 timings.get("worker_pid"),
+                timings.get("pool_size"),
+                timings.get("busy_workers"),
+                timings.get("queued_requests"),
                 os.getpid(),
+                timings.get("native_threads"),
                 len(candidates),
+                timings.get("original_frame_width", "n/a"),
+                timings.get("original_frame_height", "n/a"),
+                timings.get("camera_frame_width", "n/a"),
+                timings.get("camera_frame_height", "n/a"),
+                timings.get("warped_width", "n/a"),
+                timings.get("warped_height", "n/a"),
+                timings.get("calibrated_width", "n/a"),
+                timings.get("calibrated_height", "n/a"),
                 prepared.shape[1],
                 prepared.shape[0],
-                [
-                    {"text": item["text"], "confidence": round(item["confidence"], 1)}
-                    for item in candidates
-                ],
+                [round(item["confidence"], 1) for item in candidates],
             )
         else:
             LOG.debug(
@@ -579,40 +1080,155 @@ class CameraOCRScreenStateProvider:
                 len(candidates),
             )
 
-    def _recognize_candidates(self, image, *, timings=None, total_started=None):
+    @staticmethod
+    def _record_workflow_timings(
+        timings, frame_id, cache_hit, *, failed=False, scope="full"
+    ):
+        camera_seconds = CameraOCRScreenStateProvider._camera_seconds(timings)
+        record_timing("camera_frame", camera_seconds, count=int(frame_id is not None))
+        record_timing("ocr_preprocessing", timings.get("preprocess", 0.0))
+        record_timing("ocr_queue", timings.get("queue_wait", 0.0))
+        record_timing(
+            "ocr_ipc",
+            sum(
+                timings.get(name, 0.0)
+                for name in ("worker_start", "ipc_send", "ipc_wait")
+            ),
+        )
+        record_timing("ocr_inference", timings.get("inference", 0.0))
+        record_timing("ocr_postprocessing", timings.get("postprocess", 0.0))
+        record_timing(
+            "ocr_call",
+            0.0,
+            event={
+                "frame_id": (
+                    int(frame_id) if isinstance(frame_id, np.integer) else frame_id
+                ),
+                "cache_hit": cache_hit,
+                "scope": "roi" if scope.startswith("roi:") else "full",
+                "roi": timings.get("roi"),
+                "roi_attempt_count": int(scope.startswith("roi:")),
+                "roi_hit_count": int(
+                    scope.startswith("roi:") and timings.get("matched", False)
+                ),
+                "roi_miss_count": int(
+                    scope.startswith("roi:")
+                    and not failed
+                    and not timings.get("matched", False)
+                ),
+                "full_fallback_count": int(scope == "full_fallback"),
+                "failed": failed,
+                "worker_pid": timings.get("worker_pid"),
+                "worker_id": timings.get("worker_id"),
+                "pool_size": timings.get("pool_size"),
+                "busy_workers": timings.get("busy_workers"),
+                "queued_requests": timings.get("queued_requests"),
+                "queue_wait_ms": timings.get("queue_wait", 0.0) * 1000.0,
+                "inference_ms": timings.get("inference", 0.0) * 1000.0,
+                "total_ocr_ms": timings.get(
+                    "total_ocr_ms", timings.get("total", 0.0) * 1000.0
+                ),
+                "total_seconds": timings.get("total", 0.0),
+                "preprocessing_seconds": timings.get("preprocess", 0.0),
+                "queue_wait_seconds": timings.get("queue_wait", 0.0),
+                "worker_start_seconds": timings.get("worker_start", 0.0),
+                "ipc_send_seconds": timings.get("ipc_send", 0.0),
+                "ipc_wait_seconds": timings.get("ipc_wait", 0.0),
+                "inference_seconds": timings.get("inference", 0.0),
+                "postprocessing_seconds": timings.get("postprocess", 0.0),
+                "original_frame_width": timings.get("original_frame_width"),
+                "original_frame_height": timings.get("original_frame_height"),
+                "camera_frame_width": timings.get("camera_frame_width"),
+                "camera_frame_height": timings.get("camera_frame_height"),
+                "warped_width": timings.get("warped_width"),
+                "warped_height": timings.get("warped_height"),
+                "calibrated_width": timings.get("calibrated_width"),
+                "calibrated_height": timings.get("calibrated_height"),
+                "ocr_input_width": timings.get("input_width"),
+                "ocr_input_height": timings.get("input_height"),
+                "region_count": timings.get("region_count"),
+                "cpu_user_seconds": timings.get("cpu_user"),
+                "cpu_system_seconds": timings.get("cpu_system"),
+                "native_thread_count": timings.get("native_threads"),
+            },
+        )
+
+    def _recognize_candidates(
+        self,
+        image,
+        *,
+        timings=None,
+        total_started=None,
+        frame_id=None,
+        scope="full",
+        expected=None,
+    ):
         timings = {} if timings is None else timings
         total_started = time.monotonic() if total_started is None else total_started
         preprocess_started = time.monotonic()
         signature = self._screen_signature(image)
         timings["signature"] = time.monotonic() - preprocess_started
+        inference_queued = time.monotonic()
         with self._inference_lock:
-            cache_hit, mean_difference, changed_ratio = self._cache_match(signature)
+            provider_queue_wait = time.monotonic() - inference_queued
+            cache_hit, mean_difference, changed_ratio = self._cache_match(
+                signature, scope
+            )
             if cache_hit:
-                candidates = copy.deepcopy(self._cache_candidates)
+                pool_status = self._worker.status()
+                candidates = copy.deepcopy(self._cache_by_scope[scope][1])
                 timings.update(
-                    preprocess=time.monotonic() - preprocess_started,
+                    preprocess=timings["signature"],
+                    queue_wait=provider_queue_wait,
                     worker_start=0.0,
                     ipc_send=0.0,
                     ipc_wait=0.0,
                     inference=0.0,
-                    worker_pid=self._worker.pid,
+                    worker_pid=None,
+                    worker_id=None,
+                    pool_size=pool_status["pool_size"],
+                    busy_workers=pool_status["busy_workers"],
+                    queued_requests=pool_status["queued_requests"],
+                    total_ocr_ms=0.0,
                 )
                 prepared = self._grayscale(image)
             else:
+                prepare_started = time.monotonic()
                 prepared = self._prepare_image(image)
-                timings["preprocess"] = time.monotonic() - preprocess_started
+                timings["preprocess"] = (
+                    timings["signature"] + time.monotonic() - prepare_started
+                )
+                timings["input_width"] = prepared.shape[1]
+                timings["input_height"] = prepared.shape[0]
                 self._save_debug_image(prepared)
+                request_started = time.monotonic()
                 try:
                     results, worker_timings = self._worker.request(prepared)
                 except Exception:
                     # A failed recognition invalidates even an older successful
                     # screen result; the next request must ask Paddle again.
-                    self._cache_signature = self._cache_candidates = None
+                    self._cache_by_scope.clear()
+                    timings["queue_wait"] = provider_queue_wait
+                    timings["ipc_wait"] = time.monotonic() - request_started
+                    timings["total"] = time.monotonic() - total_started
+                    self._record_workflow_timings(
+                        timings, frame_id, False, failed=True, scope=scope
+                    )
                     raise
+                worker_queue_wait = worker_timings.pop("queue_wait", 0.0)
                 timings.update(worker_timings)
+                timings["queue_wait"] = provider_queue_wait + worker_queue_wait
+                postprocess_started = time.monotonic()
                 candidates = self._candidates_from_results(results)
-                self._cache_signature = signature.copy()
-                self._cache_candidates = copy.deepcopy(candidates)
+                timings["postprocess"] = time.monotonic() - postprocess_started
+                self._cache_by_scope[scope] = (
+                    signature.copy(),
+                    copy.deepcopy(candidates),
+                )
+        timings["input_width"] = prepared.shape[1]
+        timings["input_height"] = prepared.shape[0]
+        timings["region_count"] = len(candidates)
+        timings.setdefault("postprocess", 0.0)
         timings["total"] = time.monotonic() - total_started
         self._log_result(
             timings,
@@ -622,10 +1238,17 @@ class CameraOCRScreenStateProvider:
             mean_difference,
             changed_ratio,
         )
+        if expected is not None:
+            timings["matched"] = self._candidates_contain(candidates, expected)
+        self._record_workflow_timings(timings, frame_id, cache_hit, scope=scope)
         return candidates
 
     def close(self):
-        self._worker.close()
+        if self._owns_worker:
+            self._worker.close()
+
+    def start_worker(self):
+        return self._worker.start()
 
     def visible_text_candidates_from_image(self, image):
         return self._recognize_candidates(image)
@@ -635,11 +1258,12 @@ class CameraOCRScreenStateProvider:
 
     def visible_text_candidates(self):
         total_started = time.monotonic()
-        image, _, timings = self._capture_snapshot_with_timings()
+        image, sequence, timings = self._capture_snapshot_with_timings()
         return self._recognize_candidates(
             image,
             timings=timings,
             total_started=total_started,
+            frame_id=sequence,
         )
 
     def visible_texts(self):
@@ -651,16 +1275,170 @@ class CameraOCRScreenStateProvider:
             return False
         if image is None:
             total_started = time.monotonic()
-            snapshot, _, timings = self._capture_snapshot_with_timings()
+            snapshot, sequence, timings = self._capture_snapshot_with_timings()
             candidates = self._recognize_candidates(
                 snapshot,
                 timings=timings,
                 total_started=total_started,
+                frame_id=sequence,
             )
         else:
             candidates = self.visible_text_candidates_from_image(image)
-        complete_text = " ".join(item["text"] for item in candidates).casefold()
-        return expected in complete_text
+        with measure_timing("ocr_matching"):
+            complete_text = " ".join(item["text"] for item in candidates).casefold()
+            return expected in complete_text
+
+    @staticmethod
+    def _crop_roi(image, roi):
+        x, y, width, height = normalized_roi(roi)
+        image_height, image_width = image.shape[:2]
+        left = min(image_width - 1, max(0, int(math.floor(x * image_width))))
+        top = min(image_height - 1, max(0, int(math.floor(y * image_height))))
+        right = min(
+            image_width,
+            max(left + 1, int(math.ceil((x + width) * image_width))),
+        )
+        bottom = min(
+            image_height,
+            max(top + 1, int(math.ceil((y + height) * image_height))),
+        )
+        return image[top:bottom, left:right]
+
+    @staticmethod
+    def _candidates_contain(candidates, expected):
+        with measure_timing("ocr_matching"):
+            complete_text = " ".join(item["text"] for item in candidates).casefold()
+            return expected in complete_text
+
+    @staticmethod
+    def new_roi_wait():
+        return {"misses": 0, "last_fallback": time.monotonic()}
+
+    def poll_contains_text(self, text, *, roi=None, force=False, roi_state=None):
+        """Cheaply gate wait polling, then run ROI OCR with a full fallback.
+
+        Returns ``(ocr_was_run, text_found)`` so the caller can maintain the
+        forced-OCR deadline without changing the public ``contains_text`` API.
+        """
+        expected = " ".join(text.split()).casefold()
+        if not expected:
+            return False, False
+
+        total_started = time.monotonic()
+        snapshot, sequence, timings = self._capture_snapshot_with_timings()
+        signature_started = time.monotonic()
+        signature = self._screen_signature(snapshot)
+        signature_seconds = time.monotonic() - signature_started
+
+        should_check = force or self._change_baseline is None
+        reason = "forced" if force else "no_baseline"
+        now = time.monotonic()
+        if not should_check:
+            unchanged, mean_difference, changed_ratio = (
+                self._signatures_match_for_change(
+                    signature,
+                    self._change_baseline,
+                )
+            )
+            if unchanged:
+                self._change_candidate = None
+                self._change_candidate_since = None
+                reason = "unchanged"
+            else:
+                settled, _, _ = self._signatures_match_for_change(
+                    signature, self._change_candidate
+                )
+                if (
+                    settled
+                    and self._change_candidate_since is not None
+                    and now - self._change_candidate_since >= self.settle_seconds
+                ):
+                    should_check = True
+                    reason = "changed_and_settled"
+                else:
+                    if not settled:
+                        self._change_candidate = signature.copy()
+                        self._change_candidate_since = now
+                    reason = "change_settling"
+            if self.debug_logging:
+                LOG.info(
+                    "OCR gate frame=%s reason=%s mean_difference=%s "
+                    "changed_ratio=%s forced=%s",
+                    sequence,
+                    reason,
+                    "n/a" if mean_difference is None else f"{mean_difference:.3f}",
+                    "n/a" if changed_ratio is None else f"{changed_ratio:.5f}",
+                    force,
+                )
+
+        if not should_check:
+            record_timing(
+                "camera_frame",
+                self._camera_seconds(timings) + signature_seconds,
+                count=int(sequence is not None),
+            )
+            record_timing(
+                "ocr_skip",
+                0.0,
+                count=1,
+                event={"frame_id": sequence, "reason": reason},
+            )
+            return False, False
+
+        self._change_baseline = signature.copy()
+        self._change_candidate = None
+        self._change_candidate_since = None
+        record_timing("ocr_trigger", 0.0, count=1, event={"reason": reason})
+        if roi is not None:
+            roi = normalized_roi(roi)
+            if roi_state is None:
+                roi_state = self._roi_waits.setdefault(
+                    (expected, tuple(roi)), self.new_roi_wait()
+                )
+            roi_image = self._crop_roi(snapshot, roi)
+            roi_timings = dict(
+                timings, roi=dict(zip(("x", "y", "width", "height"), roi))
+            )
+            candidates = self._recognize_candidates(
+                roi_image,
+                timings=roi_timings,
+                total_started=total_started,
+                frame_id=sequence,
+                scope="roi:" + repr(tuple(roi)),
+                expected=expected,
+            )
+            if roi_timings["matched"]:
+                return True, True
+            roi_state["misses"] += 1
+            if (
+                roi_state["misses"] < self.roi_fallback_misses
+                and time.monotonic() - roi_state["last_fallback"]
+                < self.roi_fallback_seconds
+            ):
+                return True, False
+            # Capture/warp happened once; do not count it again for fallback.
+            fallback_timings = {
+                key: value
+                for key, value in timings.items()
+                if key not in {"capture", "decode", "warp", "copy"}
+            }
+            fallback_timings["roi"] = roi_timings["roi"]
+            candidates = self._recognize_candidates(
+                snapshot,
+                timings=fallback_timings,
+                frame_id=sequence,
+                scope="full_fallback",
+            )
+            roi_state.update(misses=0, last_fallback=time.monotonic())
+        else:
+            candidates = self._recognize_candidates(
+                snapshot,
+                timings=timings,
+                total_started=total_started,
+                frame_id=sequence,
+                scope="full",
+            )
+        return True, self._candidates_contain(candidates, expected)
 
 
 PaddleOCRScreenStateProvider = CameraOCRScreenStateProvider

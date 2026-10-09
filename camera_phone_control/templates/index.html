@@ -1,315 +1,1356 @@
 <!doctype html>
+
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+
     <meta name="control-token" content="{{ control_token }}" />
+
     <meta name="preview-debug" content="{{ '1' if preview_debug else '0' }}" />
+
     <title>Phone · Local control</title>
+
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="{{ url_for('static', filename='favicon.svg') }}"
+    />
+
     <link
       rel="stylesheet"
       href="{{ url_for('static', filename='style.css') }}"
     />
+
+    <script
+      defer
+      src="{{ url_for('static', filename='phone_gestures.js') }}"
+    ></script>
+
     <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+
     <script
       defer
       src="{{ url_for('static', filename='workflows.js') }}"
     ></script>
   </head>
-  <body>
+
+  <body
+    data-dashboard-mode="operate"
+    data-developer-tools="{{ 'enabled' if developer_mode else 'disabled' }}"
+  >
     <main>
       <header>
         <div>
           <p class="eyebrow">PHONE CONTROL / EXTERNAL CAMERA</p>
+
           <h1>Local control</h1>
         </div>
-        <span class="local-tag">● On this Mac only</span>
+
+        <span id="controller-tag" class="local-tag"
+          >● Checking controller…</span
+        >
       </header>
-      <section class="metrics" aria-label="Connection details">
+
+      <nav class="dashboard-tabs" aria-label="Dashboard mode">
+        <button id="dashboard-operate" type="button" aria-selected="true">
+          Operate
+        </button>
+
+        <button id="dashboard-admin" type="button" aria-selected="false">
+          Admin
+        </button>
+      </nav>
+
+      <section
+        class="card operate-only operate-health"
+        aria-labelledby="operate-health-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">SYSTEM STATUS</p>
+
+            <h2 id="operate-health-title">Operational health</h2>
+          </div>
+        </div>
+
+        <div class="health-grid">
+          <div>
+            <span>Controller</span
+            ><strong id="operate-controller-state">Checking…</strong>
+          </div>
+
+          <div>
+            <span>Raspberry Pi</span
+            ><strong id="operate-pi-state">Checking…</strong>
+          </div>
+
+          <div>
+            <span>HID</span><strong id="operate-hid-state">Checking…</strong>
+          </div>
+
+          <div>
+            <span>Camera</span
+            ><strong id="operate-camera-state">Checking…</strong>
+          </div>
+
+          <div>
+            <span>OCR</span><strong id="operate-ocr-state">Checking…</strong>
+          </div>
+        </div>
+
+        <div id="operate-attention" class="operate-attention" hidden>
+          <strong id="operate-attention-message">Calibration required</strong>
+
+          <button id="operate-resolve-issue" class="primary" type="button">
+            Resolve Issue
+          </button>
+        </div>
+      </section>
+
+      <section
+        id="operate-recovery"
+        class="card operate-only recovery-panel"
+        aria-labelledby="operate-recovery-title"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">NEEDS ATTENTION</p>
+
+            <h2 id="operate-recovery-title">Resolve Issue</h2>
+          </div>
+
+          <span id="operate-recovery-state" class="badge">Needs Attention</span>
+        </div>
+
+        <dl class="recovery-summary">
+          <div>
+            <dt>Issue</dt>
+
+            <dd id="operate-recovery-issue">Checking device status…</dd>
+          </div>
+
+          <div>
+            <dt>Recommended action</dt>
+
+            <dd id="operate-recovery-recommendation">
+              Review the available recovery options.
+            </dd>
+          </div>
+        </dl>
+
+        <p id="operate-recovery-result" role="status" aria-live="polite"></p>
+
+        <div class="flow-buttons">
+          <button
+            id="operate-recover-phone"
+            class="primary"
+            type="button"
+            hidden
+          >
+            Recover Phone
+          </button>
+
+          <button id="operate-view-details" type="button">View Details</button>
+
+          <button id="operate-open-assistance" type="button" hidden>
+            Resolve Phone Issue
+          </button>
+        </div>
+      </section>
+
+      <section class="metrics admin-only" aria-label="Connection details">
         <div>
           <span>Phone control</span
           ><strong id="serial">Checking connection…</strong>
         </div>
+
         <div><span>Phone display</span><strong id="resolution">—</strong></div>
+
         <div>
           <span>External camera</span
           ><strong id="camera-state">Starting…</strong>
         </div>
       </section>
+
       <section
         id="pi-connection"
-        class="metrics pi-metrics"
+        class="metrics pi-metrics admin-only"
         aria-label="Pi connection status"
       >
         <div>
           <span>Pi API</span><strong id="pi-api-state">Checking…</strong>
         </div>
+
         <div>
           <span>Phone HID</span><strong id="pi-phone-state">Checking…</strong>
         </div>
       </section>
-      <div class="workspace">
-        <section class="viewer">
+
+      <section id="devices" class="card devices-card" hidden>
+        <div class="section-heading">
+          <div>
+            <h2>Devices</h2>
+
+            <p class="small">
+              Monitor every phone camera and choose one control target.
+            </p>
+          </div>
+
+          <button id="device-add" class="admin-only" type="button">
+            Add Phone
+          </button>
+        </div>
+
+        <p id="device-state" role="status" aria-live="polite">
+          Loading registered phones…
+        </p>
+
+        <div id="device-list" class="device-list" aria-live="polite"></div>
+
+        <form
+          id="device-enrollment-form"
+          class="device-enrollment admin-only"
+          hidden
+        >
+          <label>
+            Logical device ID
+
+            <input
+              id="device-enrollment-id"
+              maxlength="64"
+              pattern="[A-Za-z0-9][A-Za-z0-9\_-]{0,63}"
+              placeholder="phone_B"
+              required
+            />
+          </label>
+
+          <div class="flow-buttons">
+            <button id="device-enrollment-start" class="primary" type="submit">
+              Start Enrollment
+            </button>
+
+            <button id="device-enrollment-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+
+        <div
+          id="device-enrollment-active"
+          class="device-enrollment-active admin-only"
+          hidden
+        >
+          <div>
+            <strong>Waiting for phone to pair</strong>
+
+            <span id="device-enrollment-target"></span>
+          </div>
+
+          <span id="device-enrollment-time"></span>
+
+          <button id="device-enrollment-stop" class="stop" type="button">
+            Stop Enrollment
+          </button>
+        </div>
+
+        <p id="device-error" class="device-error" role="alert" hidden></p>
+      </section>
+
+      <section
+        id="jobs"
+        class="card jobs-card admin-only developer-only"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <h2>Job History</h2>
+
+            <p class="small">Persistent job audit and diagnostic history.</p>
+          </div>
+        </div>
+
+        <p id="jobs-state" role="status" aria-live="polite">Loading jobs…</p>
+
+        <div id="jobs-list" class="jobs-list"></div>
+      </section>
+
+      <section
+        id="diagnostics"
+        class="card diagnostics-card admin-only developer-only"
+      >
+        <div class="section-heading">
+          <div>
+            <h2>Diagnostics / Logs</h2>
+
+            <p class="small">
+              Recent redacted application activity for support.
+            </p>
+          </div>
+
+          <button id="diagnostics-refresh" type="button">Refresh Logs</button>
+        </div>
+
+        <div class="diagnostics-tools">
+          <label>
+            Filter logs
+
+            <input
+              id="diagnostics-filter"
+              type="search"
+              maxlength="100"
+              placeholder="camera, OCR, workflow…"
+            />
+          </label>
+
+          <button id="diagnostics-copy" type="button">Copy</button>
+        </div>
+
+        <p id="diagnostics-state" class="small" role="status"></p>
+
+        <pre id="diagnostics-output" aria-label="Recent application logs">
+
+Select Refresh Logs to load recent activity.</pre
+        >
+      </section>
+
+      <section id="ocr-settings" class="card ocr-settings-card admin-only">
+        <div class="section-heading">
+          <div>
+            <h2>OCR Worker Pool</h2>
+
+            <p class="small">
+              Higher values allow simultaneous OCR requests but use more CPU and
+              memory.
+            </p>
+          </div>
+        </div>
+
+        <form id="ocr-settings-form" class="ocr-settings-form">
+          <label>
+            Worker pool size
+
+            <input
+              id="ocr-worker-pool-size"
+              type="number"
+              min="1"
+              max="8"
+              step="1"
+              required
+            />
+          </label>
+
+          <div class="flow-buttons">
+            <button id="ocr-settings-save" class="primary" type="submit">
+              Save
+            </button>
+
+            <button id="ocr-workers-restart" type="button">
+              Restart OCR Workers
+            </button>
+
+            <button id="ocr-apply-recommendation" type="button">
+              Apply Recommendation
+            </button>
+          </div>
+        </form>
+
+        <p id="ocr-settings-error" class="device-error" role="alert" hidden></p>
+
+        <p id="ocr-settings-warning" class="small" role="status" hidden></p>
+
+        <div class="ocr-pool-status" aria-live="polite">
+          <span
+            >Physical CPU cores:
+
+            <strong id="ocr-physical-cores">—</strong></span
+          >
+
+          <span
+            >Logical CPU threads:
+
+            <strong id="ocr-logical-threads">—</strong></span
+          >
+
+          <span>OCR CPU budget: <strong id="ocr-cpu-budget">—</strong></span>
+
+          <span
+            >CPU worker ceiling: <strong id="ocr-cpu-ceiling">—</strong></span
+          >
+
+          <span
+            >RAM worker ceiling: <strong id="ocr-ram-ceiling">—</strong></span
+          >
+
+          <span
+            >Hardware worker ceiling:
+
+            <strong id="ocr-hardware-ceiling">—</strong></span
+          >
+
+          <span>Current workers: <strong id="ocr-pool-size">—</strong></span>
+
+          <span
+            >Recommended workers:
+
+            <strong id="ocr-recommended-workers">—</strong></span
+          >
+
+          <span>Busy workers: <strong id="ocr-busy-workers">—</strong></span>
+
+          <span
+            >Queued OCR requests:
+
+            <strong id="ocr-queued-requests">—</strong></span
+          >
+
+          <span
+            >Restart required:
+
+            <strong id="ocr-restart-required">—</strong></span
+          >
+
+          <span>CPU usage: <strong id="ocr-cpu-usage">—</strong></span>
+
+          <span>Memory usage: <strong id="ocr-memory-usage">—</strong></span>
+
+          <span>Available RAM: <strong id="ocr-available-ram">—</strong></span>
+
+          <span
+            >Average queue wait: <strong id="ocr-average-queue">—</strong></span
+          >
+
+          <span
+            >Average inference:
+
+            <strong id="ocr-average-inference">—</strong></span
+          >
+        </div>
+
+        <p class="ocr-recommendation">
+          <strong>Recommendation:</strong>
+
+          <span id="ocr-recommendation-reason">Collecting metrics…</span>
+        </p>
+
+        <div id="ocr-workers" class="ocr-workers"></div>
+      </section>
+
+      <div
+        id="camera-settings-dialog"
+        class="modal-backdrop admin-only"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="camera-settings-title"
+        hidden
+      >
+        <form id="camera-settings-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">DEVICE CAMERA</p>
+
+              <h2 id="camera-settings-title">Camera Settings</h2>
+            </div>
+
+            <button id="camera-settings-close" type="button" aria-label="Close">
+              ×
+            </button>
+          </div>
+
+          <label>
+            Camera source
+
+            <input
+              id="camera-settings-source"
+              list="camera-source-options"
+              maxlength="2048"
+              placeholder="Select a camera, index, or camera URL"
+              required
+            />
+
+            <datalist id="camera-source-options"></datalist>
+          </label>
+
+          <label>
+            Rotation
+
+            <select id="camera-settings-rotation">
+              <option value="0">0°</option>
+
+              <option value="90">90°</option>
+
+              <option value="180">180°</option>
+
+              <option value="270">270°</option>
+            </select>
+          </label>
+
+          <label class="check">
+            <input id="camera-settings-enabled" type="checkbox" /> Enabled
+          </label>
+
+          <p
+            id="camera-settings-status"
+            class="camera-settings-status"
+            role="status"
+          >
+            Loading camera status…
+          </p>
+
+          <div id="camera-test-preview" class="camera-test-preview">
+            <img id="camera-test-image" alt="Test camera preview" hidden />
+
+            <span id="camera-test-placeholder"
+              >Test the camera to preview it here.</span
+            >
+          </div>
+
+          <p
+            id="camera-settings-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+
+          <div class="flow-buttons">
+            <button id="camera-settings-refresh" type="button">
+              Refresh Cameras
+            </button>
+
+            <button id="camera-settings-test" type="button">Test Camera</button>
+
+            <button id="camera-settings-save" class="primary" type="submit">
+              Save
+            </button>
+
+            <button id="camera-settings-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
+
+      <div
+        id="withdraw-settings-dialog"
+        class="modal-backdrop admin-only"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="withdraw-settings-title"
+        hidden
+      >
+        <form id="withdraw-settings-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">EXTERNAL WITHDRAW BOT</p>
+
+              <h2 id="withdraw-settings-title">Withdraw Account</h2>
+            </div>
+
+            <button
+              id="withdraw-settings-close"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+
+          <strong id="withdraw-settings-status"
+            >Account Status: Not Assigned</strong
+          >
+
+          <p id="withdraw-settings-identity" class="small"></p>
+
+          <label>
+            Username
+
+            <input
+              id="withdraw-settings-username"
+              autocomplete="username"
+              maxlength="200"
+              required
+            />
+          </label>
+
+          <label>
+            Password
+
+            <input
+              id="withdraw-settings-password"
+              type="password"
+              autocomplete="new-password"
+              maxlength="4096"
+              required
+            />
+          </label>
+
+          <label>
+            Google 2FA Secret
+
+            <input
+              id="withdraw-settings-totp"
+              type="password"
+              autocomplete="off"
+              maxlength="256"
+              required
+            />
+          </label>
+
+          <p class="small">
+            The current verification code is generated securely by the server.
+            Saved credentials are never shown in the dashboard.
+          </p>
+
+          <p
+            id="withdraw-settings-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+
+          <div class="flow-buttons">
+            <button id="withdraw-settings-submit" class="primary" type="submit">
+              Login & Assign
+            </button>
+
+            <button id="withdraw-settings-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
+
+      <div
+        id="withdraw-cancel-dialog"
+        class="modal-backdrop"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="withdraw-cancel-title"
+        hidden
+      >
+        <form id="withdraw-cancel-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">CURRENT WITHDRAWAL</p>
+
+              <h2 id="withdraw-cancel-title">Cancel Withdrawal</h2>
+            </div>
+
+            <button id="withdraw-cancel-close" type="button" aria-label="Close">
+              ×
+            </button>
+          </div>
+
+          <label>
+            Reason
+
+            <select id="withdraw-cancel-reason" required>
+              <option value="">Select issue</option>
+
+              <option value="invalid_account">Invalid account number</option>
+
+              <option value="bank_rejected">Bank rejected payment</option>
+
+              <option value="unable_to_complete">
+                Unable to complete payment
+              </option>
+            </select>
+          </label>
+
+          <p
+            id="withdraw-cancel-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+
+          <div class="flow-buttons">
+            <button id="withdraw-cancel-back" type="button">Back</button>
+
+            <button
+              id="withdraw-cancel-confirm"
+              class="stop"
+              type="submit"
+              disabled
+            >
+              Confirm Cancel
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div
+        id="workflow-settings-dialog"
+        class="modal-backdrop admin-only"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="workflow-settings-title"
+        hidden
+      >
+        <form id="workflow-settings-form" class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">DEVICE AUTOMATION</p>
+              <h2 id="workflow-settings-title">Workflow Assignment</h2>
+            </div>
+            <button
+              id="workflow-settings-close"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <p id="workflow-settings-help" class="small"></p>
+
+          <div id="workflow-settings-payment-section">
+            <h3>Payment Workflow</h3>
+            <label>
+              Search workflows
+              <input
+                id="workflow-settings-search"
+                type="search"
+                placeholder="Search by workflow name or ID"
+                autocomplete="off"
+              />
+            </label>
+            <div
+              id="workflow-settings-list"
+              class="workflow-assignment-list"
+            ></div>
+          </div>
+
+          <div id="workflow-settings-balance-section">
+            <h3>Balance Check Workflow</h3>
+            <label>
+              Search workflows
+              <input
+                id="workflow-settings-balance-search"
+                type="search"
+                placeholder="Search by workflow name or ID"
+                autocomplete="off"
+              />
+            </label>
+            <div
+              id="workflow-settings-balance-list"
+              class="workflow-assignment-list"
+            ></div>
+          </div>
+
+          <p
+            id="workflow-settings-error"
+            class="device-error"
+            role="alert"
+            hidden
+          ></p>
+          <div class="flow-buttons">
+            <button id="workflow-settings-save" class="primary" type="submit">
+              Save Workflow
+            </button>
+            <button id="workflow-settings-cancel" type="button">Cancel</button>
+          </div>
+        </form>
+      </div>
+
+      <div id="control-workspace" class="workspace control-workspace">
+        <section
+          id="workflow-phone-pane"
+          class="viewer manual-control-surface workflow-phone-pane"
+        >
           <div class="section-heading">
             <h2>Camera view</h2>
+
             <span id="frame-state">Waiting for live video</span>
           </div>
+
           <div class="video-wrap">
             <canvas
               id="video"
               width="1280"
               height="720"
               tabindex="0"
-              aria-label="Live external camera. Click to tap and control the keyboard. Press Escape to release."
+              aria-label="Live external camera. Click to tap or drag to swipe."
               aria-describedby="keyboard-help"
             ></canvas>
+
             <div id="video-placeholder">Waiting for camera access…</div>
+
+            <div id="workflow-mock-preview-slot" class="admin-only" hidden>
+              <div id="mock-recording-preview" hidden>
+                <p>
+                  Interact with this phone preview to try recording without
+                  hardware.
+                </p>
+              </div>
+
+              <canvas
+                id="workflow-preview"
+                width="270"
+                height="480"
+                aria-label="Phone preview. Click, drag and type to record in mock mode."
+                tabindex="0"
+              ></canvas>
+            </div>
+
+            <div
+              id="keyboard-capture-overlay"
+              class="keyboard-capture-overlay"
+              hidden
+            >
+              <span>Capture key</span>
+
+              <strong id="keyboard-capture-overlay-key">—</strong>
+
+              <small>Tap this key on the phone</small>
+            </div>
           </div>
+
           <div class="viewer-footer">
             <span id="instruction"
               >Input is disabled. Calibrate the display to begin.</span
-            ><output id="coordinates">—</output>
+            ><output id="coordinates" class="admin-only">—</output>
           </div>
         </section>
+
         <aside>
-          <section id="record-card" class="card">
+          <section id="record-card" class="card admin-only">
             <div class="section-heading"><h2>Record</h2></div>
+
             <button id="record-new" class="primary">● Start Recording</button>
+
             <p id="record-guidance" class="small">
               No steps recorded yet. Click Start Recording, then control the
               phone through the preview. Your taps, swipes, typing and
               navigation will appear here. Typed text is saved in the workflow.
             </p>
+
             <a id="record-review-link" href="#review-flow" hidden
               >Review recording and save workflow</a
             >
+
             <div id="camera-record-controls"></div>
+
             <div id="record-ready" hidden>
               <p>
                 Use the phone preview as usual. We’ll record your taps, swipes
                 and typing, then you can review and name the flow.
               </p>
+
               <p class="small">
                 Secure input belongs on the phone. Avoid typing sensitive values
-                while recording. You can add a manual checkpoint during review.
+                while recording.
               </p>
+
               <button id="record-start" class="primary">Start Recording</button>
             </div>
+
             <div id="record-controls-slot">
               <div id="record-live" hidden>
                 <strong id="record-status" class="recording" role="status"
                   >● Recording</strong
                 >
+
                 <span id="record-count">Actions recorded: 0</span>
+
                 <div class="record-action-group record-primary-actions">
                   <span>Primary actions</span>
+
                   <button id="record-input-variable">Input Variable</button>
+
                   <button id="record-expect-current">
                     Expect Current Screen
                   </button>
-                </div>
-                <div class="record-action-group">
-                  <span>More</span>
+
+                  <button id="record-read-value" type="button">
+                    Read Balance
+                  </button>
+
+                  <button id="record-screenshot-here" type="button">
+                    Capture Screenshot
+                  </button>
+
                   <button id="record-capture-keyboard">Capture Keyboard</button>
-                  <button id="record-mark-next">Mark Next Screen: OFF</button>
+
+                  <button id="record-alternate-screen" type="button">
+                    Add Special Case
+                  </button>
                 </div>
+
+                <div
+                  id="alternate-screen-active"
+                  class="alternate-screen-panel is-active"
+                  hidden
+                >
+                  <strong>Recording Special Case</strong>
+
+                  <p id="alternate-screen-status"></p>
+
+                  <div class="flow-buttons">
+                    <button id="alternate-screen-finish" type="button">
+                      Finish Special Case
+                    </button>
+
+                    <button id="alternate-screen-cancel" type="button">
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+
                 <div class="record-action-group">
                   <span>Recording controls</span>
+
                   <button id="record-undo">Undo Last</button>
+
                   <button id="record-stop" class="stop">
                     ■ Stop Recording
                   </button>
                 </div>
+
                 <div id="keyboard-capture" hidden>
                   <h3>Capture Keyboard</h3>
+
                   <label>
                     Name
+
                     <input
                       id="keyboard-capture-name"
                       maxlength="160"
                       value="Numeric keypad"
                     />
                   </label>
+
                   <label>
                     Keyboard type
+
                     <select id="keyboard-capture-kind">
                       <option value="numeric">Numeric</option>
+
                       <option value="alphabetic">Alphabetic</option>
+
                       <option value="custom">Custom</option>
                     </select>
                   </label>
+
                   <div id="keyboard-numeric-options">
                     <p>Digits 0-9 are included.</p>
+
                     <label class="check"
                       ><input id="keyboard-include-decimal" type="checkbox" />
+
                       Include decimal</label
                     >
+
                     <label class="check"
                       ><input id="keyboard-numeric-backspace" type="checkbox" />
+
                       Include backspace</label
                     >
                   </div>
+
                   <div id="keyboard-alphabetic-options" hidden>
-                    <p>Lowercase a-z are included.</p>
+                    <p>Lowercase QWERTY keys are included.</p>
+
                     <label class="check"
                       ><input id="keyboard-include-space" type="checkbox" />
+
                       Include space</label
                     >
+
                     <label class="check"
                       ><input
                         id="keyboard-alphabetic-backspace"
                         type="checkbox"
                       />
+
                       Include backspace</label
                     >
                   </div>
+
                   <label id="keyboard-custom-options" hidden>
                     Keys to capture, separated by commas
+
                     <input
                       id="keyboard-custom-keys"
                       maxlength="3299"
                       placeholder="A,B,C,1,2,3,-"
                     />
                   </label>
+
+                  <div
+                    id="keyboard-capture-target"
+                    class="keyboard-capture-target"
+                    hidden
+                  >
+                    <span>Capture this key</span>
+
+                    <strong id="keyboard-capture-target-key">—</strong>
+                  </div>
+
                   <p id="keyboard-capture-instruction" role="status">
                     Choose keys, then start capture.
                   </p>
+
                   <p class="small">
                     Use only for keyboards whose key positions stay the same
                     between runs. Do not use this for PIN, OTP, password,
                     randomized, or authorization keypads.
                   </p>
+
                   <div class="flow-buttons">
                     <button id="keyboard-capture-start" type="button">
                       Start Capture
                     </button>
+
                     <button id="keyboard-capture-save" type="button" hidden>
                       Save Keyboard
                     </button>
+
                     <button id="keyboard-capture-cancel" type="button">
                       Cancel
                     </button>
                   </div>
                 </div>
+
                 <form id="record-variable-input" hidden>
                   <h3>Input Variable</h3>
+
                   <label>
                     Variable
+
+                    <select id="record-variable-name">
+                      <option value="account_number">Account Number</option>
+
+                      <option value="amount">Amount</option>
+
+                      <option value="bank_name">Bank Name</option>
+
+                      <option value="\_\_custom\_\_">
+                        Custom workflow variable…
+                      </option>
+                    </select>
+                  </label>
+
+                  <label id="record-variable-custom-field" hidden>
+                    Custom variable name
+
                     <input
-                      id="record-variable-name"
-                      placeholder="account_no"
+                      id="record-variable-custom-name"
+                      placeholder="customer_name"
                       maxlength="80"
                     />
                   </label>
+
+                  <label id="record-amount-format-field" hidden>
+                    Amount Input Format
+
+                    <select id="record-amount-format">
+                      <option value="raw">As received</option>
+
+                      <option value="implied_cents">
+                        Implied cents (100.00 → 10000)
+                      </option>
+
+                      <option value="whole_number">
+                        Whole amount only (100.00 → 100)
+                      </option>
+                    </select>
+                  </label>
+
                   <label>
                     Input method
+
                     <select id="record-variable-method">
                       <option value="screen_keyboard">
                         Captured on-screen keyboard
                       </option>
-                      <option value="hid">Bluetooth HID</option>
+
+                      <!-- <option value="hid">Bluetooth HID</option> -->
                     </select>
                   </label>
+
                   <label id="record-variable-keyboard-field">
                     Keyboard
+
                     <select id="record-variable-keyboard"></select>
                   </label>
+
                   <label>
-                    Sample value for recording
+                    Default value
+
                     <input
-                      id="record-variable-sample"
+                      id="record-variable-default"
                       autocomplete="off"
                       maxlength="4096"
                     />
                   </label>
+
                   <p class="small">
-                    The sample can be typed during recording, but it is never
-                    saved in the workflow.
+                    Used when no value is provided when the workflow starts.
                   </p>
+
                   <div class="flow-buttons">
                     <button id="record-variable-add" type="button">
-                      Add Step Only
+                      Add Step
                     </button>
+
                     <button id="record-variable-type" type="button">
-                      Add &amp; Type Sample
+                      Add & Type Now
                     </button>
+
                     <button id="record-variable-cancel" type="button">
                       Cancel
                     </button>
                   </div>
                 </form>
+
+                <form id="record-read-value-form" hidden>
+                  <h3>Read Balance</h3>
+
+                  <label>
+                    Read
+
+                    <select id="live-value-preset">
+                      <option value="balance">Balance</option>
+
+                      <option value="custom">Custom Value</option>
+                    </select>
+                  </label>
+
+                  <label>
+                    Name
+
+                    <input
+                      id="live-value-name"
+                      value="Available Balance"
+                      maxlength="160"
+                      readonly
+                    />
+                  </label>
+
+                  <label>
+                    Parser
+
+                    <select id="live-value-parser" disabled>
+                      <option value="currency">Currency</option>
+                    </select>
+                  </label>
+
+                  <label>
+                    Output
+
+                    <input
+                      id="live-value-output"
+                      value="payer_balance"
+                      maxlength="64"
+                      readonly
+                    />
+                  </label>
+
+                  <div id="live-value-roi-picker"></div>
+
+                  <div class="flow-buttons">
+                    <button id="live-value-save" type="button">Save</button>
+
+                    <button id="live-value-cancel" type="button">Cancel</button>
+                  </div>
+                </form>
+
                 <div id="live-timeline-slot"></div>
               </div>
             </div>
+
+            <div
+              id="alternate-screen-setup"
+              class="alternate-screen-panel"
+              hidden
+            >
+              <h3>Special Case</h3>
+
+              <p class="small">
+                Sometimes something extra appears here. Record what to do when
+                it does.
+              </p>
+
+              <label>
+                When this appears
+
+                <input
+                  id="condition-text-value"
+                  maxlength="500"
+                  autocomplete="off"
+                />
+              </label>
+
+              <label class="duration-field">
+                Check for up to
+
+                <span>
+                  <input
+                    id="condition-text-timeout"
+                    type="number"
+                    min="0.1"
+                    max="300"
+                    step="any"
+                    value="2"
+                  />
+
+                  seconds
+                </span>
+              </label>
+
+              <details id="condition-text-advanced" class="advanced-options">
+                <summary>Advanced options</summary>
+
+                <div id="condition-roi-picker"></div>
+              </details>
+
+              <p class="small">If not found: Continue normally</p>
+
+              <div class="flow-buttons">
+                <button id="alternate-screen-start" type="button">
+                  Record What To Do
+                </button>
+
+                <button id="alternate-screen-setup-cancel" type="button">
+                  Cancel
+                </button>
+              </div>
+            </div>
+
             <div id="captured-keyboards" hidden>
               <h3>Captured Keyboards</h3>
+
               <p class="small">
                 Input steps select one of these maps explicitly.
               </p>
+
               <ul id="captured-keyboard-list"></ul>
             </div>
+
+            <div id="workflow-authoring-slot"></div>
           </section>
-          <section class="card">
+
+          <section id="manual-control-card" class="card manual-control-surface">
             <div class="section-heading">
-              <h2>Input</h2>
+              <h2 class="admin-only">Input</h2>
+
+              <h2 class="operate-only">Resolve Phone Issue</h2>
+
               <span id="mode" class="badge">Disabled</span>
             </div>
-            <p id="control-help">
-              Enable control when you are ready. Each click sends one tap to the
-              phone.
+
+            <p class="operate-only manual-assistance-help">
+              Use the phone preview to return the phone to the expected starting
+              screen.
             </p>
+
+            <p id="control-help">
+              Start manual control to use the phone preview, Back, and Home.
+            </p>
+
             <button id="enable" class="primary" disabled>
-              Enable Manual Control
+              Start Manual Control
             </button>
-            <button id="takeover" class="stop" hidden disabled>
+
+            <button id="takeover" class="stop admin-only" hidden disabled>
               Take Over
             </button>
-            <button id="disable" class="stop">Disable input</button>
+
+            <button id="disable" class="stop admin-only">Disable input</button>
+
             <p
               id="keyboard-state"
-              class="badge"
+              class="badge admin-only"
               role="status"
               aria-live="polite"
             >
               Keyboard control inactive
             </p>
-            <p id="keyboard-help" class="small">
+
+            <p id="keyboard-help" class="small admin-only">
               Click or focus the phone view to enable keyboard control.
             </p>
+
             <div class="controls">
               <button data-action="back" disabled>← Back</button>
+
               <button data-action="home" disabled>⌂ Home</button>
-              <button data-action="recents" disabled>▣ Recent apps</button>
-              <button data-action="swipe_up" disabled>↑ Swipe up</button>
-              <button data-action="swipe_down" disabled>↓ Swipe down</button>
-              <button data-action="swipe_left" disabled>← Swipe left</button>
-              <button data-action="swipe_right" disabled>→ Swipe right</button>
-              <button data-action="screen_on" disabled>☀ Wake screen</button>
-              <button data-action="screen_off" disabled>⏻ Screen off</button>
+
+              <!-- <button class="admin-only" data-action="recents" disabled>
+
+                ▣ Recent apps
+
+              </button> -->
+
+              <button class="admin-only" data-action="swipe_up" disabled>
+                ↑ Swipe up
+              </button>
+
+              <button class="admin-only" data-action="swipe_down" disabled>
+                ↓ Swipe down
+              </button>
+
+              <button class="admin-only" data-action="swipe_left" disabled>
+                ← Swipe left
+              </button>
+
+              <button class="admin-only" data-action="swipe_right" disabled>
+                → Swipe right
+              </button>
+
+              <button class="admin-only" data-action="screen_on" disabled>
+                ☀ Wake screen
+              </button>
+
+              <!-- <button class="admin-only" data-action="screen_off" disabled>
+
+                ⏻ Screen off
+
+              </button> -->
+            </div>
+
+            <div class="operate-only manual-assistance-finish">
+              <button id="operate-verify-finish" class="primary" type="button">
+                Verify & Finish
+              </button>
+
+              <button id="operate-close-assistance" type="button">
+                Cancel
+              </button>
+
+              <p class="small">
+                Verification never resumes or retries the failed workflow.
+              </p>
             </div>
           </section>
-          <section class="card">
+
+          <section class="card admin-only">
             <div class="section-heading">
               <h2>Calibration</h2>
+
               <span id="cal-state">Required</span>
             </div>
+
             <p>
               Click the four corners of the <strong>lit phone display</strong>,
               in this order. Leave the bezel out.
             </p>
+
             <ol id="corner-list">
               <li>Top-left</li>
+
               <li>Top-right</li>
+
               <li>Bottom-right</li>
+
               <li>Bottom-left</li>
             </ol>
+
             <button id="calibrate" disabled>Calibrate display</button>
+
             <div class="cal-actions">
               <button id="undo" disabled>Undo corner</button
               ><button id="save" class="primary" disabled>
                 Save calibration
               </button>
             </div>
+
             <p class="small">
               Keep the camera and phone fixed. Recalibrate after moving either
               one or rotating the phone.
@@ -317,38 +1358,54 @@
           </section>
         </aside>
       </div>
+
       <p id="notice" role="status" aria-live="polite">
         Checking the camera and phone…
       </p>
+
       <div id="connection-banner" class="connection-banner" hidden>
         <strong id="connection-state">Reconnecting...</strong>
+
         <span>Physical controls are paused while status checks continue.</span>
+
         <button id="reload-dashboard" type="button">Reload Dashboard</button>
       </div>
+
       <section id="automations" class="card">
         <div class="section-heading">
           <h2>Automations</h2>
         </div>
-        <div id="mock-recording-preview" hidden>
-          <p>
-            Interact with this phone preview to try recording without hardware.
-          </p>
-        </div>
-        <canvas
-          id="workflow-preview"
-          width="270"
-          height="480"
-          aria-label="Phone preview. Click, drag and type to record in mock mode."
-          tabindex="0"
-        ></canvas>
-        <div id="review-flow" hidden>
+
+        <div id="review-flow" class="admin-only" hidden>
           <h3>Review Recording</h3>
-          <label>Workflow name <input id="flow-name" maxlength="160" /></label>
+
+          <label>
+            Bank Name
+            <input
+              id="flow-name"
+              maxlength="160"
+              placeholder="e.g. Hong Leong"
+              autocomplete="off"
+            />
+          </label>
+
+          <label
+            >Purpose
+
+            <select id="flow-purpose">
+              <option value="payment">Payment</option>
+
+              <option value="balance_check">Balance Check</option>
+            </select>
+          </label>
+
           <button id="flow-rename">Rename</button>
+
           <div class="flow-buttons">
             <button id="review-capture-keyboard" type="button">
               Capture Keyboard
             </button>
+
             <button id="record-save" class="primary">Save Workflow</button
             ><button id="record-cancel">Discard Recording</button>
           </div>
@@ -356,10 +1413,12 @@
           <div id="review-timeline-slot">
             <div id="record-timeline">
               <h3>Recorded Steps</h3>
+
               <p id="record-empty">
                 No steps recorded yet. Use the phone preview to record taps,
                 swipes, typing and navigation.
               </p>
+
               <ol
                 id="record-steps"
                 class="step-list review-timeline"
@@ -368,18 +1427,33 @@
               ></ol>
             </div>
           </div>
+
           <form id="step-editor" hidden>
             <h3 id="step-editor-title">Edit Step</h3>
 
             <label>
               Step name
+
               <input id="step-name" maxlength="160" />
             </label>
+
+            <label class="check">
+              <input id="step-critical" type="checkbox" />
+
+              Irreversible payment submission
+            </label>
+
+            <p class="small">
+              Mark only the final action after which the bank may have sent
+              money. Withdraw retries use this boundary to prevent duplicate
+              payments.
+            </p>
 
             <div id="step-tap-options" hidden>
               <div class="flow-buttons">
                 <label>
                   X (%)
+
                   <input
                     id="step-tap-x"
                     type="number"
@@ -391,6 +1465,7 @@
 
                 <label>
                   Y (%)
+
                   <input
                     id="step-tap-y"
                     type="number"
@@ -406,6 +1481,7 @@
               <div class="flow-buttons">
                 <label>
                   Start X (%)
+
                   <input
                     id="step-swipe-start-x"
                     type="number"
@@ -417,6 +1493,7 @@
 
                 <label>
                   Start Y (%)
+
                   <input
                     id="step-swipe-start-y"
                     type="number"
@@ -430,6 +1507,7 @@
               <div class="flow-buttons">
                 <label>
                   End X (%)
+
                   <input
                     id="step-swipe-end-x"
                     type="number"
@@ -441,6 +1519,7 @@
 
                 <label>
                   End Y (%)
+
                   <input
                     id="step-swipe-end-y"
                     type="number"
@@ -453,6 +1532,7 @@
 
               <label>
                 Duration (ms)
+
                 <input
                   id="step-swipe-duration"
                   type="number"
@@ -465,33 +1545,47 @@
 
             <label id="step-key-options" hidden>
               Key
+
               <select id="step-key">
                 <option value="ENTER">Enter</option>
+
                 <option value="BACKSPACE">Backspace</option>
+
                 <option value="TAB">Tab</option>
 
                 <option value="LEFT">Arrow Left</option>
+
                 <option value="RIGHT">Arrow Right</option>
+
                 <option value="UP">Arrow Up</option>
+
                 <option value="DOWN">Arrow Down</option>
 
                 <option value="DELETE">Delete</option>
+
                 <option value="HOME">Home</option>
+
                 <option value="END">End</option>
+
                 <option value="PAGEUP">Page Up</option>
+
                 <option value="PAGEDOWN">Page Down</option>
 
                 <option value="BACK">Back</option>
+
                 <option value="SCREEN_ON">Wake Screen</option>
               </select>
             </label>
 
             <!-- ====================================================== -->
+
             <!-- WAIT -->
+
             <!-- ====================================================== -->
 
             <label id="step-wait-options" hidden>
               Wait duration (seconds)
+
               <input
                 id="step-wait-seconds"
                 type="number"
@@ -504,6 +1598,7 @@
             <div id="step-stable-options" hidden>
               <label
                 >Stable for (ms)
+
                 <input
                   id="step-stable-ms"
                   type="number"
@@ -513,8 +1608,10 @@
                   value="700"
                 />
               </label>
+
               <label
                 >Maximum wait (sec)
+
                 <input
                   id="step-stable-timeout"
                   type="number"
@@ -526,26 +1623,60 @@
               </label>
             </div>
 
+            <div id="step-value-options" hidden>
+              <label
+                >Parser
+
+                <select id="step-value-parser">
+                  <option value="currency">Currency</option>
+                </select></label
+              >
+
+              <label
+                >Output variable
+
+                <input
+                  id="step-value-output"
+                  value="payer_balance"
+                  maxlength="64"
+              /></label>
+
+              <div id="value-roi-picker"></div>
+            </div>
+
             <div id="step-text-options" hidden>
               <label
                 >Text
+
                 <input
                   id="step-text-value"
                   maxlength="500"
                   autocomplete="off"
                 />
               </label>
-              <label
-                >Maximum wait (sec)
-                <input
-                  id="step-text-timeout"
-                  type="number"
-                  min="0.5"
-                  max="300"
-                  step="any"
-                  value="10"
-                />
+
+              <label class="duration-field">
+                Wait up to
+
+                <span>
+                  <input
+                    id="step-text-timeout"
+                    type="number"
+                    min="0.5"
+                    max="300"
+                    step="any"
+                    value="10"
+                  />
+
+                  seconds
+                </span>
               </label>
+
+              <details id="step-text-advanced" class="advanced-options">
+                <summary>Advanced options</summary>
+
+                <div id="step-roi-picker"></div>
+              </details>
             </div>
 
             <div id="step-input-options" hidden>
@@ -554,7 +1685,9 @@
 
                 <select id="input-source">
                   <option value="fixed">Keep Fixed</option>
+
                   <option value="variable">Make Variable</option>
+
                   <option value="manual">Manual</option>
                 </select>
               </label>
@@ -569,52 +1702,83 @@
 
               <div id="variable-fields" hidden>
                 <label>
-                  Variable name
+                  Variable
 
-                  <input id="variable-name" placeholder="customer_name" />
+                  <select id="variable-name">
+                    <option value="account_number">Account Number</option>
+
+                    <option value="amount">Amount</option>
+
+                    <option value="bank_name">Bank Name</option>
+
+                    <option value="\_\_custom\_\_">
+                      Custom workflow variable…
+                    </option>
+                  </select>
+                </label>
+
+                <label id="amount-format-field" hidden>
+                  Amount Input Format
+
+                  <select id="amount-format">
+                    <option value="raw">As received</option>
+
+                    <option value="implied_cents">
+                      Implied cents (100.00 → 10000)
+                    </option>
+
+                    <option value="whole_number">
+                      Whole amount only (100.00 → 100)
+                    </option>
+                  </select>
+                </label>
+
+                <label id="variable-custom-field" hidden>
+                  Custom variable name
+
+                  <input
+                    id="variable-custom-name"
+                    placeholder="customer_name"
+                    maxlength="80"
+                  />
                 </label>
 
                 <label>
-                  Label
+                  Default value
 
-                  <input id="variable-label" placeholder="Customer Name" />
+                  <input
+                    id="variable-default"
+                    autocomplete="off"
+                    maxlength="4096"
+                  />
                 </label>
 
-                <label class="check">
-                  <input id="variable-required" type="checkbox" checked />
-
-                  Required
-                </label>
-
-                <label>
-                  Default value (optional)
-
-                  <input id="variable-default" autocomplete="off" />
-                </label>
-
-                <label class="check">
-                  <input id="variable-ask" type="checkbox" checked />
-
-                  Ask When Running
-                </label>
+                <p class="small">
+                  Used when no value is provided when the workflow starts.
+                </p>
               </div>
 
               <p id="manual-input-help" hidden>
                 The recorded value will be removed. Playback will pause for you
                 to complete this step on the phone.
               </p>
+
               <div id="input-method-fields">
                 <label>
                   Input method
+
                   <select id="input-method">
-                    <option value="hid">Bluetooth HID</option>
+                    <!-- <option value="hid">Bluetooth HID</option> -->
+
                     <option value="screen_keyboard">
                       Captured on-screen keyboard
                     </option>
                   </select>
                 </label>
+
                 <label id="input-keyboard-field" hidden>
                   Keyboard
+
                   <select id="input-keyboard"></select>
                 </label>
               </div>
@@ -626,15 +1790,21 @@
               <button id="step-close" type="button">Close</button>
             </div>
           </form>
+
           <details id="review-insert">
             <summary>Add Step</summary>
+
             <label
               >Insert after
+
               <select id="insert-position"></select
             ></label>
+
             <h4>Wait for Text</h4>
+
             <label
               >Text
+
               <input
                 id="record-text-value"
                 maxlength="500"
@@ -642,19 +1812,84 @@
                 placeholder="Transfer"
               />
             </label>
-            <label
-              >Maximum wait (sec)
-              <input
-                id="record-text-timeout"
-                type="number"
-                min="0.5"
-                max="300"
-                step="any"
-                value="10"
-              />
+
+            <label class="duration-field">
+              Wait up to
+
+              <span>
+                <input
+                  id="record-text-timeout"
+                  type="number"
+                  min="0.5"
+                  max="300"
+                  step="any"
+                  value="10"
+                />
+
+                seconds
+              </span>
             </label>
+
+            <details id="record-text-advanced" class="advanced-options">
+              <summary>Advanced options</summary>
+
+              <div id="record-roi-picker"></div>
+            </details>
+
             <button id="record-text">Insert Wait for Text</button>
-            <h4>Fixed Wait</h4>
+
+            <h4>Screenshot</h4>
+
+            <button id="record-screenshot" type="button">
+              Capture Screenshot
+            </button>
+
+            <h4>Read Balance</h4>
+
+            <label
+              >Read
+
+              <select id="record-value-preset">
+                <option value="balance">Balance</option>
+
+                <option value="custom">Custom Value</option>
+              </select></label
+            >
+
+            <label
+              >Step name
+
+              <input
+                id="record-value-name"
+                value="Available Balance"
+                maxlength="160"
+                readonly
+            /></label>
+
+            <label
+              >Parser
+
+              <select id="record-value-parser">
+                <option value="currency">Currency</option>
+              </select></label
+            >
+
+            <label
+              >Output variable
+
+              <input
+                id="record-value-output"
+                value="payer_balance"
+                maxlength="64"
+                readonly
+            /></label>
+
+            <div id="record-value-roi-picker"></div>
+
+            <button id="record-value" type="button">Insert Read Balance</button>
+
+            <h4>Wait</h4>
+
             <div class="flow-buttons">
               <input
                 id="record-wait-seconds"
@@ -664,73 +1899,183 @@
                 step="0.1"
                 value="1"
                 aria-label="Wait seconds"
-              /><button id="record-wait">Insert Fixed Wait</button>
+              /><button id="record-wait">Insert Wait</button>
             </div>
-            <label
-              >Checkpoint message
-              <input
-                id="checkpoint-message"
-                value="Complete this step manually, then Resume."
-                maxlength="500"
-            /></label>
-            <button id="record-checkpoint">Insert Manual Checkpoint</button>
           </details>
-          <label class="check"
-            ><input id="flow-financial" type="checkbox" /> Financial preparation
-            flow — end with manual authorization</label
-          >
         </div>
-        <form id="expected-text-editor" hidden>
+
+        <form id="expected-text-editor" class="admin-only" hidden>
           <h3 id="expected-text-title">Choose expected text</h3>
+
           <p id="expected-text-status" role="status"></p>
+
           <div id="expected-suggestions"></div>
+
           <button id="expected-text-manual" type="button">
             Enter manually
           </button>
+
           <label
             >Expected text
+
             <input id="expected-text-value" maxlength="500" required
           /></label>
-          <label
-            >Maximum wait (sec)
-            <input
-              id="expected-text-timeout"
-              type="number"
-              min="0.5"
-              max="300"
-              step="0.5"
-              value="10"
-              required
-            />
+
+          <label class="duration-field">
+            Wait up to
+
+            <span>
+              <input
+                id="expected-text-timeout"
+                type="number"
+                min="0.5"
+                max="300"
+                step="0.5"
+                value="10"
+                required
+              />
+
+              seconds
+            </span>
           </label>
+
+          <details id="expected-text-advanced" class="advanced-options">
+            <summary>Advanced options</summary>
+
+            <div id="expected-roi-picker"></div>
+          </details>
+
           <button type="submit">Add Check</button>
+
           <button id="expected-text-cancel" type="button">Cancel</button>
         </form>
+
+        <template id="region-ocr-template">
+          <div class="region-ocr-picker">
+            <label
+              ><input data-roi-control="enabled" type="checkbox" /> Use Region
+              OCR</label
+            >
+
+            <p>
+              Select on the calibrated current screen snapshot; refresh after
+              the phone screen changes.
+            </p>
+
+            <button data-roi-control="refresh" type="button">
+              Select on Current Screen
+            </button>
+
+            <button data-roi-control="clear" type="button">
+              Clear OCR Region
+            </button>
+
+            <canvas
+              data-roi-control="canvas"
+              width="1"
+              height="1"
+              hidden
+            ></canvas>
+
+            <div class="row">
+              <label
+                >x
+
+                <input
+                  data-roi-control="x"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+
+              <label
+                >y
+
+                <input
+                  data-roi-control="y"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+
+              <label
+                >width
+
+                <input
+                  data-roi-control="width"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+
+              <label
+                >height
+
+                <input
+                  data-roi-control="height"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="any"
+              /></label>
+            </div>
+
+            <output data-roi-control="values" aria-live="polite"></output>
+
+            <button data-roi-control="test" type="button">Test ROI OCR</button>
+
+            <p data-roi-control="result" role="status"></p>
+          </div>
+        </template>
+
         <div id="saved-flow-panel">
           <h3>Saved Flows</h3>
+
           <button id="flows-refresh">Refresh Flows</button>
+
           <ul id="saved-flows" class="saved-flows"></ul>
+
           <h3 id="run-title">Run Flow</h3>
+
           <form id="flow-run-form">
             <div id="run-variables"></div>
+
             <button id="flow-run" class="primary" disabled>Start Run</button>
           </form>
+
           <div class="flow-buttons">
-            <button id="flow-resume" hidden>Resume after manual action</button
-            ><button id="flow-cancel" disabled>Stop Run</button>
+            <button id="flow-resume" hidden>Resume Checkpoint</button>
+
+            <button id="flow-cancel" disabled>Stop Run</button>
           </div>
+
           <p id="flow-run-state" role="status" aria-live="polite">
             No active run
           </p>
+
+          <pre
+            id="operate-workflow-log"
+            class="operate-only operate-workflow-log"
+            aria-label="Recent workflow activity"
+          ></pre>
         </div>
-        <details id="workflow-debug">
+
+        <details id="workflow-debug" class="admin-only developer-only">
           <summary>Advanced / Debug</summary>
+
           <p id="workflow-backend"></p>
+
           <pre id="workflow-debug-data"></pre>
+
           <pre id="workflow-logs" aria-label="Workflow execution logs"></pre>
         </details>
+
         <p id="workflow-notice" role="status" aria-live="polite"></p>
       </section>
+
       <footer>
         Local dashboard. Camera viewing, manual control, scripts and saved
         workflows share device ownership.

@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from automation.coordinates import normalized_to_device, unit
+from hardware.device_config import DEFAULT_DEVICE_ID, validate_device_id
 
 LOG = logging.getLogger("calibration")
 DEFAULT_CALIBRATION_PATH = (
@@ -117,7 +118,7 @@ class Calibration:
 
 
 class CalibrationStorage:
-    """Persist one camera calibration using atomic local JSON replacement."""
+    """Persist camera calibration separately for each logical Pi device."""
 
     def __init__(self, path=None):
         self.path = Path(path or DEFAULT_CALIBRATION_PATH)
@@ -126,24 +127,41 @@ class CalibrationStorage:
     @staticmethod
     def _camera_details(camera, camera_info):
         return {
-            "source": camera.source,
+            "source": getattr(camera, "configured_source", camera.source),
             "rotation": camera.rotate,
             "width": camera_info["width"],
             "height": camera_info["height"],
         }
 
+    @staticmethod
+    def _device_details(device):
+        # device_id routes controllers but does not change the physical geometry
+        # represented by version-1 calibration files.
+        details = asdict(device)
+        details.pop("device_id", None)
+        return details
+
+    def path_for(self, device=None):
+        """Return the legacy path for phone_A and a sibling file for others."""
+        device_id = getattr(device, "device_id", None)
+        if device_id in {None, DEFAULT_DEVICE_ID}:
+            return self.path
+        validate_device_id(device_id)
+        return self.path.with_name(f"{self.path.stem}.{device_id}{self.path.suffix}")
+
     def load(self, camera, camera_info, device):
         """Return a compatible Calibration, or None for missing/unsafe data."""
+        path = self.path_for(device)
         with self.lock:
-            if not self.path.exists():
+            if not path.exists():
                 return None
-            if self.path.is_symlink():
+            if path.is_symlink():
                 LOG.warning("Saved calibration file is invalid; starting uncalibrated.")
                 return None
             try:
-                if self.path.stat().st_size > 64 * 1024:
+                if path.stat().st_size > 64 * 1024:
                     raise ValueError("Calibration file is unexpectedly large.")
-                with self.path.open(encoding="utf-8") as stream:
+                with path.open(encoding="utf-8") as stream:
                     data = json.load(stream)
                 if not isinstance(data, dict) or data.get("version") != 1:
                     raise ValueError("Unsupported calibration format.")
@@ -176,7 +194,7 @@ class CalibrationStorage:
                         "Saved calibration ignored because camera resolution changed."
                     )
                     return None
-                if saved_device != asdict(device):
+                if saved_device != self._device_details(device):
                     LOG.info(
                         "Saved calibration ignored because phone geometry changed."
                     )
@@ -191,19 +209,20 @@ class CalibrationStorage:
             return calibration
 
     def save(self, calibration, camera, camera_info, device):
+        path = self.path_for(device)
         data = {
             "version": 1,
             "camera": self._camera_details(camera, camera_info),
-            "device": asdict(device),
+            "device": self._device_details(device),
             "corners": calibration.corners.tolist(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.is_symlink():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
                 raise OSError("Calibration path cannot be a symlink.")
             fd, temporary = tempfile.mkstemp(
-                dir=self.path.parent,
+                dir=path.parent,
                 prefix=".calibration-",
                 suffix=".tmp",
             )
@@ -213,17 +232,18 @@ class CalibrationStorage:
                     stream.write("\n")
                     stream.flush()
                     os.fsync(stream.fileno())
-                os.replace(temporary, self.path)
+                os.replace(temporary, path)
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
         LOG.info("Saved camera calibration.")
 
-    def clear(self):
+    def clear(self, device=None):
+        path = self.path_for(device)
         with self.lock:
             try:
-                if self.path.is_symlink():
+                if path.is_symlink():
                     raise OSError("Calibration path cannot be a symlink.")
-                self.path.unlink()
+                path.unlink()
             except FileNotFoundError:
                 pass

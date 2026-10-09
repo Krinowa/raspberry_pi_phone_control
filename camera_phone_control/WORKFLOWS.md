@@ -147,8 +147,8 @@ unchanged. Playback uses its independently configured input backend, including
 Pi when `PHONE_INPUT_BACKEND=raspberry_pi`.
 
 Review supports step names, fixed/variable/manual text, wait duration, deletion,
-and reordering. **Save Workflow** uses the workflow name field; an empty name shows
-“Enter a workflow name”. Recorder tests run without hardware:
+and reordering. **Save Workflow** uses the bank name field; an empty name shows
+“Enter a bank name”. Recorder tests run without hardware:
 
 ```sh
 python -m unittest discover -s tests -p 'test_pi_recording.py' -v
@@ -575,13 +575,25 @@ Review mode can insert an explicit semantic wait:
   "id": "text_1",
   "type": "wait_for_text",
   "text": "Transfer",
-  "timeout_seconds": 10
+  "timeout_seconds": 10,
+  "roi": [0.0, 0.25, 1.0, 0.5]
 }
 ```
 
 The text is trimmed and must contain 1–500 characters. `timeout_seconds` accepts
-finite numbers from 0.5–300. Playback polls about every 200 ms, checks cancellation
-between samples, and never repeats an earlier action. A timeout fails the run.
+finite numbers from 0.5–300. `roi` is optional normalized
+`[x, y, width, height]`; camera OCR checks that region first and always falls back
+to the full calibrated screen when the region misses. Generic providers poll about
+every 200 ms; the camera provider currently uses a 75 ms visual poll. Playback
+checks cancellation between samples and never repeats an earlier action. A timeout
+fails the run.
+
+When a camera text wait immediately follows an automated input action, playback
+captures a low-resolution pre-action signature. It waits for a visible change to
+settle before invoking PaddleOCR, while a periodic forced OCR check preserves the
+same timeout and target-detection behavior when a change is too small to observe.
+Other `ScreenStateProvider` implementations continue using `contains_text()` on
+every poll.
 
 Workflow execution depends only on `ScreenStateProvider.contains_text()` from
 `automation/screen/state.py`. Providers perform case-insensitive literal substring
@@ -589,3 +601,165 @@ matching; fuzzy matching and regular expressions are outside the contract. This
 allows an Android accessibility service, camera OCR, or deterministic test provider
 to use the same runner path. Until a production provider is configured, the step
 fails clearly instead of falling back to a fixed delay.
+
+## Optional ROI-first text waits
+
+### Read Balance and receipt outputs
+
+In the workflow review/editor, **Read Balance** reuses the calibrated **Region OCR**
+picker. Select the displayed balance, test the crop, choose the `currency` parser,
+and set the output name to `payer_balance`. Save the step at the selected insert
+position. This adds an instruction; it does not read the balance until playback.
+
+```json
+{
+  "type": "ocr_value",
+  "label": "Read balance",
+  "roi": { "x": 0.12, "y": 0.18, "width": 0.65, "height": 0.1 },
+  "parser": "currency",
+  "output": "payer_balance"
+}
+```
+
+The ROI above is illustrative: measure it on the actual calibrated phone screen.
+The step passes only that crop to the existing OCR provider and worker pool. It
+requires one unambiguous amount with two decimal places, optionally prefixed by
+`RM`, `MYR`, `Balance`, or `Available Balance`. Malformed or multiple amounts fail
+the step. Monetary parsing uses `Decimal`; run outputs serialize the value as a
+decimal string, such as `"8230.50"`. Outputs belong to the individual run and are
+separate from workflow input variables.
+
+**Insert Screenshot** and screenshot editing have an optional output name. Set
+it to `receipt_path` to retain the saved image's absolute local path in run
+outputs. The existing color calibrated image, JPEG encoding, daily directories,
+and screenshot metadata remain unchanged. Omitting the output name preserves
+ordinary screenshot behavior.
+
+```json
+{ "type": "capture_screen", "label": "Receipt", "output_key": "receipt_path" }
+```
+
+Successful external jobs persist their run outputs internally. A screenshot or
+a successful balance read alone does not prove a payment succeeded.
+
+Withdraw Bot v2 uses these run outputs only after an administrator enables a
+device's separately configured integration, balance workflow, and main payment
+workflow. The bot will not lock work without a valid balance read, and it never
+replays an interrupted payment.
+
+### Text-wait ROI behavior
+
+Only `wait_for_text` uses ROI. The same Region OCR component is mounted in the
+live recording expected-text dialog, the recording review **Insert Wait for
+Text** panel, and the saved-step editor. Enter or select the target text, click
+**Select OCR Region**, and drag a rectangle on the calibrated snapshot. The
+displayed x/y/width/height values update while dragging and can also be entered
+numerically. **Test ROI OCR** checks the selected crop of that exact snapshot
+against the target text, without sending phone input or running full-screen
+fallback. Select again after changing screens; snapshots expire after five
+minutes. **Clear OCR Region** removes the optional ROI while retaining the text
+wait. Save the check or step, then save the workflow after recording review.
+
+The picker uses the same calibrated/warped, edge-trimmed screen image as OCR,
+not the raw camera image. Coordinates describe that image from its top-left.
+The editor stores `roi: {"x": ..., "y": ..., "width": ..., "height": ...}`.
+Existing `[x, y, width, height]` configuration remains supported and retains its
+array representation when validated. Values must be finite numbers in [0, 1],
+with positive width/height, and the rectangle must fit inside the screen.
+Booleans, strings, NaN, infinity, and out-of-bounds rectangles are rejected;
+only floating-point roundoff at the far edge is clamped. Pixel crops round
+outwards and always include at least one pixel.
+
+Without ROI, polling and full-screen recognition follow the existing path.
+With ROI, each eligible initial/changed-and-settled/forced check tries ROI
+first. On a miss, one full-screen fallback runs when either threshold is met:
+
+- `CAMERA_OCR_ROI_FALLBACK_MISSES=3` (positive count, maximum 100).
+- `CAMERA_OCR_ROI_FALLBACK_SECONDS=3.0` (0.1–300 seconds).
+
+Both thresholds reset after a fallback, so subsequent checks return to ROI.
+The interval starts at wait entry, then at completion of the last fallback.
+It is evaluated on eligible OCR checks, not an independent timer; existing
+forced checks ensure static screens eventually get a fallback while the wait
+is still active. Existing timeout/cancellation, polling/settle intervals,
+preprocessing, caches, model, and worker dispatch remain in use. Cache hits
+count as OCR attempts but have zero inference time. Every workflow wait gets
+fresh fallback state, separate from other waits and devices.
+
+Run snapshots expose `timing.steps[].ocr_calls[]` with `scope` (`roi`/`full`),
+normalized `roi` (null for ordinary full-screen calls), ROI attempt/hit/miss
+counts, fallback count, inference/queue milliseconds, region count, and the
+existing pool/worker/cache metadata. Counts in call records are increments;
+step and summary counts are totals. `timing.summary` includes
+`total_seconds`, `ocr_wall_seconds`, `roi_ocr_seconds`, `full_ocr_seconds`,
+`roi_attempt_count`, `roi_hit_count`, `roi_miss_count`, `full_fallback_count`.
+ROI/full OCR times use the existing OCR wall accounting (preprocessing, queue,
+worker start/IPC including inference, postprocessing); camera capture/warp
+remain separate. Step `region_count` sums detected regions across calls.
+
+### PBe before/after procedure
+
+No ROI coordinates have been guessed or added to existing workflows. Keep UOB
+unchanged as the control. Measure only **Welcome** and **Login with PBe** in
+**Public bank** initially.
+
+1. Restart the dashboard with the changed code using your normal launch command
+   and unchanged camera, model, pool and preprocessing settings. The optional
+   environment variables above use their defaults if unset.
+2. Leave ROI disabled on both PBe waits. Reset the phone to the workflow's normal
+   starting screen, run PBe from the dashboard, and save the completed run JSON.
+   In browser DevTools Network, copy the run ID from
+   `/api/workflow-runs/<run_id>` (or evaluate
+   `localStorage.getItem("phone-workflow-run")` in the dashboard console).
+3. Export a completed run with the command below, replacing `BEFORE_RUN_ID`:
+
+   ```sh
+   curl --fail --silent --show-error \
+     http://127.0.0.1:8765/api/workflow-runs/BEFORE_RUN_ID \
+     -o /tmp/pbe-before.json
+   ```
+
+4. Manually display the real PBe Welcome screen. In its wait-step editor, refresh
+   the calibrated preview, select the measured rectangle, and use **Test ROI
+   OCR**. Save the step. Repeat on the actual Login with PBe screen, then save
+   the workflow. Do not change UOB or other text waits.
+5. Reset to the same starting screen, run PBe, and export its completed run:
+
+   ```sh
+   curl --fail --silent --show-error \
+     http://127.0.0.1:8765/api/workflow-runs/AFTER_RUN_ID \
+     -o /tmp/pbe-after.json
+   python3 - /tmp/pbe-before.json /tmp/pbe-after.json <<'PY'
+   import json, sys
+   fields = ('total_seconds', 'ocr_wall_seconds', 'roi_ocr_seconds',
+             'full_ocr_seconds', 'roi_attempt_count', 'roi_hit_count',
+             'roi_miss_count', 'full_fallback_count')
+   for filename in sys.argv[1:]:
+       run = json.load(open(filename))
+       print(filename, 'status=' + run['status'])
+       for field in fields:
+           print(f"  {field}: {run['timing']['summary'][field]}")
+   PY
+   ```
+
+6. Repeat several paired runs (same device, starting screen, variables, pool
+   warm-up and cache conditions). Export before restarting the server because
+   run records are in memory. Compare successful runs and per-step timings as
+   well as totals; run UOB under the same conditions as the unchanged control.
+   To repeat a baseline, disable ROI on those two PBe waits, retaining your
+   measured coordinates in an exported workflow copy.
+
+Regression commands from the repository root:
+
+```sh
+cd camera_phone_control
+PHONE_INPUT_BACKEND=appium PHONE_MANUAL_INPUT_BACKEND=appium PYTHONPATH=.:tests \
+  ../appium_phone_poc/venv/bin/python -m unittest \
+  test_text_suggestions test_screen_state test_screen_stability \
+  test_workflow_timing test_ocr_pool test_camera_ocr_worker test_workflows test_multi_camera
+node --test tests/test_workflow_ui.js
+```
+
+The backend overrides isolate these tests from the local `.env` Pi settings;
+OCR tests use deterministic fake worker responses. Real PBe accuracy and
+latency measurements require the measured rectangles and the connected phone.

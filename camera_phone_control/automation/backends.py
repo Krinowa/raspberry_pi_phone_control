@@ -8,6 +8,7 @@ from .input.raspberry_pi import RaspberryPiWorkflowInput
 from hardware.raspberry_pi_input import RaspberryPiInputBridge
 from .screen.appium import AppiumScreenProvider, DeferredAppiumScreenProvider
 from .screen.base import ScreenProvider
+from .workflows.timing import measure_timing
 
 
 class BackendConfigurationError(ValueError):
@@ -28,10 +29,17 @@ def backend_names():
     return input_name, screen_name
 
 
-def select_device(controller, serial=None, *, authorized_only=True, input_backend=None):
+def select_device(
+    controller,
+    serial=None,
+    *,
+    authorized_only=True,
+    input_backend=None,
+    device_id=None,
+):
     input_name = input_backend or backend_names()[0]
     if input_name == "raspberry_pi":
-        target = RaspberryPiInputBridge().target
+        target = RaspberryPiInputBridge(device_id=device_id).target
         if serial is not None and serial != target.serial:
             raise BackendConfigurationError(
                 "Pi input uses PI_API_BASE_URL, not a USB serial."
@@ -57,7 +65,8 @@ class GuardedInput:
         }.get(name, "input " + name)
         with self._context._step(label):
             self._context._check_device()
-            return getattr(self._backend, name)(*args)
+            with measure_timing("hid_api"):
+                return getattr(self._backend, name)(*args)
 
     def tap(self, x, y):
         return self._call("tap", x, y)
