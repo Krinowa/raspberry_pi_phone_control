@@ -51,7 +51,7 @@ def _build_paddle_engine(
     if language == "en":
         options.update(
             text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+            text_recognition_model_name="PP-OCRv5_mobile_rec",
         )
     else:
         options.update(lang=language, ocr_version="PP-OCRv5")
