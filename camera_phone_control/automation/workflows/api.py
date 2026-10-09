@@ -27,7 +27,12 @@ from ..screen.state import ScreenStateError
 from ..screen.text_learning import text_suggestions
 from .capture import inspect_target, tap_preview
 from .recorder import Recorder
-from .runner import WorkflowRunner, screen_keyboard_points, type_with_screen_keyboard
+from .runner import (
+    WorkflowRunner,
+    format_input_value,
+    screen_keyboard_points,
+    type_with_screen_keyboard,
+)
 from .service import WorkflowService
 from .storage import WorkflowStorage
 from hardware.raspberry_pi_input import PiControlTarget
@@ -376,6 +381,34 @@ def register_workflows(
         except KeyError:
             return None
 
+    def ensure_purpose_change_is_unassigned(existing, candidate):
+        """Reject an edit that would leave a device assigned to the wrong role."""
+        if existing.get("purpose") == candidate.get("purpose"):
+            return
+        assignments = app.extensions.get("device_workflow_assignment_store")
+        if assignments is None:
+            return
+        workflow_id = existing["id"]
+        for device_id, integration in assignments.integrations().items():
+            if (
+                integration.get("balance_workflow_id") == workflow_id
+                and candidate.get("purpose") != "balance_check"
+            ):
+                raise ValueError(
+                    f"Workflow is assigned as the Balance Check Workflow for {device_id}; "
+                    "change that assignment before changing its purpose."
+                )
+            allowed = assignments.get(device_id)
+            if (
+                allowed is not None
+                and workflow_id in allowed
+                and candidate.get("purpose") != "payment"
+            ):
+                raise ValueError(
+                    f"Workflow is assigned as the Payment Workflow for {device_id}; "
+                    "change that assignment before changing its purpose."
+                )
+
     # =====================================================================
     # Workflow routes
     # =====================================================================
@@ -438,7 +471,8 @@ def register_workflows(
         if data.get("id") != workflow_id:
             raise ValueError("Workflow ID must match URL.")
 
-        storage.read(workflow_id)
+        existing = storage.read(workflow_id)
+        ensure_purpose_change_is_unassigned(existing, data)
 
         return jsonify(storage.save(data))
 
@@ -483,6 +517,7 @@ def register_workflows(
                     service.start(
                         selected_workflow,
                         data.get("variables"),
+                        device_id=target_device_id,
                     )
                 ),
                 202,
@@ -561,6 +596,7 @@ def register_workflows(
             "name",
             "execute",
             "financial",
+            "purpose",
         }:
             raise ValueError("Unexpected recording option.")
 
@@ -583,6 +619,7 @@ def register_workflows(
                         "financial",
                         False,
                     ),
+                    data.get("purpose", "payment"),
                 )
             )
 
@@ -837,6 +874,7 @@ def register_workflows(
             "sample",
             "type_sample",
             "frame_id",
+            "amount_format",
         }
         required = {"variable", "input_method", "type_sample"}
         if set(data) - allowed or not required <= set(data):
@@ -883,6 +921,12 @@ def register_workflows(
                         variable.get("name") if isinstance(variable, dict) else None
                     ),
                     **(
+                        {"amount_format": data.get("amount_format", "raw")}
+                        if isinstance(variable, dict)
+                        and variable.get("name") == "amount"
+                        else {}
+                    ),
+                    **(
                         {
                             "input_method": "screen_keyboard",
                             "keyboard_id": data.get("keyboard_id"),
@@ -892,6 +936,9 @@ def register_workflows(
                     ),
                 }
                 candidate = recorder.prepare(owner, step, variable)
+                typed_sample = (
+                    format_input_value(step, sample) if data["type_sample"] else sample
+                )
                 keyboard = None
                 if method == "screen_keyboard":
                     keyboard = recorder.workflow.get("keyboards", {}).get(
@@ -903,7 +950,7 @@ def register_workflows(
                         )
                     # Validate the complete sample before sending its first tap.
                     try:
-                        screen_keyboard_points(keyboard, sample)
+                        screen_keyboard_points(keyboard, typed_sample)
                     except UnsupportedOperation as exc:
                         raise ValueError(str(exc)) from None
 
@@ -915,10 +962,13 @@ def register_workflows(
                     if state.pi_bridge is not None:
                         if method == "screen_keyboard":
                             type_with_screen_keyboard(
-                                state.pi_bridge, time.sleep, keyboard, sample
+                                state.pi_bridge,
+                                time.sleep,
+                                keyboard,
+                                typed_sample,
                             )
                         else:
-                            state.pi_bridge.type_text(sample)
+                            state.pi_bridge.type_text(typed_sample)
                     else:
                         context = AutomationContext(
                             device,
@@ -932,10 +982,13 @@ def register_workflows(
                         )
                         if method == "screen_keyboard":
                             type_with_screen_keyboard(
-                                context.input, context.wait, keyboard, sample
+                                context.input,
+                                context.wait,
+                                keyboard,
+                                typed_sample,
                             )
                         else:
-                            context.input.type_text(sample)
+                            context.input.type_text(typed_sample)
                     with state.lock:
                         if state.owner == client:
                             state.renew_lease()
@@ -1003,7 +1056,7 @@ def register_workflows(
                 if state.calibration is None:
                     raise ValueError(
                         "Calibrate the phone "
-                        "display before recording "
+                        "display before ri thinkecording "
                         "preview gestures."
                     )
 
@@ -1247,7 +1300,8 @@ def register_workflows(
                 editing = recorder.editing_existing
 
                 if editing:
-                    storage.read(recorder.workflow["id"])
+                    existing = storage.read(recorder.workflow["id"])
+                    ensure_purpose_change_is_unassigned(existing, recorder.workflow)
 
                 result = storage.save(
                     recorder.workflow,

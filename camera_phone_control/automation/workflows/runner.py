@@ -1,5 +1,6 @@
 """Transport-independent execution. Ownership is supplied by automation.Runner."""
 
+import re
 import time
 
 from .validation import validate_workflow, resolve_variables
@@ -15,6 +16,38 @@ from .timing import WorkflowTiming
 from .values import read_currency
 
 SCREEN_KEYBOARD_KEY_DELAY = 0.08
+AMOUNT_FORMATS = {"raw", "implied_cents", "whole_number"}
+_PLAIN_AMOUNT = re.compile(r"(\d+)(?:\.(\d{1,2}))?")
+
+
+def format_input_value(step, value):
+    """Resolve only this input step's physical representation of an amount."""
+    if step.get("source") != "variable" or step.get("variable") != "amount":
+        return value
+    mode = step.get("amount_format", "raw")
+
+    if mode == "raw":
+        return value
+    if mode not in AMOUNT_FORMATS:
+        raise ValueError("Amount input format is invalid.")
+    if not isinstance(value, str):
+        raise ValueError("Amount input must be a plain nonnegative decimal string.")
+
+    match = _PLAIN_AMOUNT.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "Amount input must be a plain nonnegative decimal with at most 2 decimal places."
+        )
+
+    whole, fraction = match.groups()
+    cents = (fraction or "").ljust(2, "0")
+    if mode == "whole_number":
+        if cents != "00":
+            raise ValueError(
+                f"This bank workflow accepts whole amounts only; received {value}."
+            )
+        return whole.lstrip("0") or "0"
+    return (whole + cents).lstrip("0") or "0"
 
 
 def screen_keyboard_points(keyboard, value):
@@ -267,6 +300,7 @@ class WorkflowRunner:
                     if step["source"] == "fixed"
                     else values[step["variable"]]
                 )
+                value = format_input_value(step, value)
                 if step.get("input_method", "hid") == "screen_keyboard":
                     keyboard = (keyboards or {})[step["keyboard_id"]]
                     type_with_screen_keyboard(ctx.input, ctx.wait, keyboard, value)

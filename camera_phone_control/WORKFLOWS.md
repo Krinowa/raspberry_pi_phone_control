@@ -147,8 +147,8 @@ unchanged. Playback uses its independently configured input backend, including
 Pi when `PHONE_INPUT_BACKEND=raspberry_pi`.
 
 Review supports step names, fixed/variable/manual text, wait duration, deletion,
-and reordering. **Save Workflow** uses the workflow name field; an empty name shows
-“Enter a workflow name”. Recorder tests run without hardware:
+and reordering. **Save Workflow** uses the bank name field; an empty name shows
+“Enter a bank name”. Recorder tests run without hardware:
 
 ```sh
 python -m unittest discover -s tests -p 'test_pi_recording.py' -v

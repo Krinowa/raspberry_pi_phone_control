@@ -45,6 +45,7 @@ let deviceRenderSignature = null;
 let devicePollingStopped = false;
 const deviceDeletesInFlight = new Set();
 const devicePreviewTimers = new Map();
+const devicePreviewLastFrames = new Map();
 let devicePreviewGeneration = 0;
 let cameraSettingsDeviceId = null;
 let deviceRefreshLastSuccessAt = null;
@@ -57,10 +58,15 @@ let deviceWithdrawDetails = {};
 let jobCatalog = [];
 const jobCancelsInFlight = new Set();
 const jobRetriesInFlight = new Set();
+const withdrawReconnectsInFlight = new Set();
+const balanceRefreshesInFlight = new Set();
 let workflowSettingsDeviceId = null;
 let workflowSettingsData = null;
+let workflowSettingsMode = "payment";
 let withdrawSettingsDeviceId = null;
 let withdrawSettingsAssigned = false;
+let withdrawCancelDeviceId = null;
+const withdrawCancelsInFlight = new Set();
 let ocrSettingsDirty = false;
 let ocrStatusTimer = null;
 let ocrStatusInFlight = false;
@@ -90,6 +96,7 @@ let suppressPreviewClick = false;
 let ocrOperationalHealthy = null;
 let workflowRuntime = null;
 let diagnosticsLogs = [];
+let previewConsecutiveFailures = 0;
 
 function setDashboardMode(mode) {
   dashboardMode = mode === "admin" ? "admin" : "operate";
@@ -320,10 +327,13 @@ const deviceService = {
       "GET",
       { monitor: false },
     ),
-  updateWorkflows: (deviceId, workflowIds) =>
+  updateWorkflows: (deviceId, workflowIds, balanceWorkflowId) =>
     api(
       `/api/devices/${encodeURIComponent(deviceId)}/workflows`,
-      { workflow_ids: workflowIds },
+      {
+        workflow_ids: workflowIds,
+        balance_workflow_id: balanceWorkflowId,
+      },
       "PUT",
     ),
   discoverCameras: (refresh = false) =>
@@ -352,6 +362,17 @@ const deviceService = {
       `/api/devices/${encodeURIComponent(deviceId)}/withdraw/login-assign`,
       credentials,
     ),
+  reconnectWithdraw: (deviceId) =>
+    api(`/api/devices/${encodeURIComponent(deviceId)}/withdraw/reconcile`, {}),
+  refreshBalance: (deviceId) =>
+    api(
+      `/api/devices/${encodeURIComponent(deviceId)}/withdraw/balance/refresh`,
+      {},
+    ),
+  cancelWithdrawal: (deviceId, reasonCode) =>
+    api(`/api/devices/${encodeURIComponent(deviceId)}/withdraw/cancel`, {
+      reason_code: reasonCode,
+    }),
 };
 
 const jobService = {
@@ -376,7 +397,15 @@ function availableJobActions(job) {
   if (["QUEUED", "WAITING_FOR_DEVICE", "RUNNING"].includes(job.status))
     return ["cancel"];
   if (!["FAILED", "INTERRUPTED"].includes(job.status)) return [];
-  if (job.recovery_status === "NEEDS_ATTENTION") return ["manual_assistance"];
+  if (job.recovery_status === "NEEDS_ATTENTION")
+    return [
+      "manual_assistance",
+      ...(job.action === "withdraw_v2" &&
+      Number.isInteger(job.failed_step_index)
+        ? ["retry_failed_step"]
+        : []),
+      ...(job.action === "withdraw_v2" ? ["restart"] : []),
+    ];
   if (job.recovery_status !== "READY") return [];
   return [
     ...(Number.isInteger(job.failed_step_index) ? ["retry_failed_step"] : []),
@@ -436,7 +465,7 @@ async function retryExternalJob(job, mode) {
     jobCatalog = [...jobCatalog, retry];
     notice(
       mode === "failed_step"
-        ? "Retry queued from the failed step."
+        ? "Retry queued from the selected failed step."
         : "Workflow restart queued from step 0.",
     );
   } catch (error) {
@@ -765,33 +794,92 @@ function stopDevicePreviews() {
 }
 
 function startDevicePreview(deviceId, image, placeholder) {
-  // Unit-test DOM shims do not decode images. Avoid creating background timers there.
-  if (typeof image.decode !== "function") return;
+  // Keep the last decoded frame visible while the next one is fetched/decoded.
+  // This avoids flashing "Loading camera…" whenever the device card rerenders.
+  if (
+    typeof image.decode !== "function" ||
+    typeof URL?.createObjectURL !== "function"
+  )
+    return;
 
   const generation = devicePreviewGeneration;
+  const cachedFrame = devicePreviewLastFrames.get(deviceId);
+
+  if (cachedFrame) {
+    image.src = cachedFrame;
+    image.hidden = false;
+    placeholder.hidden = true;
+  }
+
   const schedule = (delay) => {
     if (generation !== devicePreviewGeneration || devicePollingStopped) return;
     const timer = setTimeout(() => {
       if (document.hidden) return schedule(PREVIEW_BACKGROUND_MS);
-      image.src = `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`;
+      void loadNextFrame();
     }, delay);
     devicePreviewTimers.set(deviceId, timer);
   };
 
-  image.addEventListener("load", () => {
-    placeholder.hidden = true;
-    image.hidden = false;
-    schedule(333);
-  });
+  const loadNextFrame = async () => {
+    if (generation !== devicePreviewGeneration || devicePollingStopped) return;
 
-  image.addEventListener("error", () => {
-    image.hidden = true;
-    placeholder.hidden = false;
-    placeholder.textContent = "Camera unavailable";
-    schedule(1000);
-  });
+    let nextUrl = null;
 
-  image.src = `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`;
+    try {
+      const response = await fetch(
+        `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`,
+        {
+          cache: "no-store",
+          signal: AbortSignal.timeout(4000),
+        },
+      );
+
+      if (!response.ok) throw new Error("Camera unavailable");
+
+      const blob = await response.blob();
+      nextUrl = URL.createObjectURL(blob);
+
+      // Decode off-DOM first. The currently visible frame remains untouched
+      // until this replacement is fully ready to paint.
+      const preloader = new Image();
+      preloader.src = nextUrl;
+      await preloader.decode();
+
+      if (generation !== devicePreviewGeneration || devicePollingStopped) {
+        URL.revokeObjectURL(nextUrl);
+        return;
+      }
+
+      const previousUrl = devicePreviewLastFrames.get(deviceId);
+      devicePreviewLastFrames.set(deviceId, nextUrl);
+
+      image.src = nextUrl;
+      image.hidden = false;
+      placeholder.hidden = true;
+
+      // The new resource is already decoded. Revoke the older object URL only
+      // after switching the visible image to avoid a blank frame in between.
+      if (previousUrl && previousUrl !== nextUrl) {
+        requestAnimationFrame(() => URL.revokeObjectURL(previousUrl));
+      }
+
+      nextUrl = null;
+      schedule(750);
+    } catch (_error) {
+      if (nextUrl) URL.revokeObjectURL(nextUrl);
+
+      // If we already have a good frame, keep it visible and retry silently.
+      if (!devicePreviewLastFrames.has(deviceId)) {
+        image.hidden = true;
+        placeholder.hidden = false;
+        placeholder.textContent = "Camera unavailable";
+      }
+
+      schedule(1000);
+    }
+  };
+
+  void loadNextFrame();
 }
 
 function createDeviceJobActions(job, deviceId) {
@@ -810,7 +898,7 @@ function createDeviceJobActions(job, deviceId) {
         resolveDeviceIssue(deviceId, job.job_id),
       );
     } else if (action === "retry_failed_step") {
-      button.textContent = "Retry Failed Step";
+      button.textContent = "Retry from Failed Step";
       button.disabled = jobRetriesInFlight.has(job.job_id);
       button.addEventListener("click", () =>
         retryExternalJob(job, "failed_step"),
@@ -835,11 +923,146 @@ function createDeviceJobActions(job, deviceId) {
   return actions;
 }
 
+function formatPayerBalance(value) {
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(value ?? ""));
+  if (!match) return null;
+  const integer = match[1].replace(/^0+(?=\d)/, "");
+  const cents = (match[2] || "").padEnd(2, "0");
+  return `${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${cents}`;
+}
+
+function payerBalanceView(details) {
+  const status = details?.status || {};
+  const observed = new Date(status.balance_observed_at || "");
+  const checkedAt = Number.isNaN(observed.getTime())
+    ? null
+    : observed.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+  if (status.balance_state === "VALID" && status.balance_valid === true) {
+    const amount = formatPayerBalance(status.last_balance);
+    return { value: amount || "Unavailable", checkedAt, stateLabel: null };
+  }
+
+  if (status.balance_state === "REFRESHING") {
+    const amount = formatPayerBalance(status.last_balance);
+    return {
+      value: amount || "Checking…",
+      checkedAt: amount ? checkedAt : null,
+      stateLabel: amount ? "Refreshing…" : null,
+    };
+  }
+
+  if (status.balance_state === "STALE" && status.last_balance != null) {
+    const amount = formatPayerBalance(status.last_balance);
+    return {
+      value: amount || "Unavailable",
+      checkedAt,
+      stateLabel: amount ? "Stale" : null,
+    };
+  }
+  return { value: "Unavailable", checkedAt: null, stateLabel: null };
+}
+
+function canManuallyCancelWithdrawal(details) {
+  const status = details?.status || {};
+  if (status.cancel_allowed === true) return true;
+  return (
+    Number.isInteger(status.withdraw_id) &&
+    status.withdraw_id > 0 &&
+    !status.job_id &&
+    ["LOCKED", "NEEDS_ATTENTION"].includes(status.phase)
+  );
+}
+
+function withdrawRuntimeView(details) {
+  const status = details?.status || {};
+  const ready =
+    status.session_state === "READY" &&
+    status.reconciliation_complete === true &&
+    !["AUTH_FAILED", "NEEDS_ATTENTION", "CONFIGURATION_ERROR"].includes(
+      status.state,
+    );
+
+  if (ready) return { session: "Connected", realtime: "Connected", ready };
+  if (status.state === "AUTH_FAILED")
+    return {
+      session: "Authentication required",
+      realtime: "Disconnected",
+      ready,
+    };
+  if (status.state === "NEEDS_ATTENTION")
+    return { session: "Needs attention", realtime: "Disconnected", ready };
+  if (status.state === "CONFIGURATION_ERROR")
+    return {
+      session: "Configuration required",
+      realtime: "Disconnected",
+      ready,
+    };
+  if (["CONNECTING", "WAITING_FOR_CONNECTION"].includes(status.state))
+    return {
+      session:
+        status.state === "CONNECTING" ? "Authenticating" : "Reconnecting",
+      realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
+      ready,
+    };
+  return {
+    session: "Disconnected",
+    realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
+    ready,
+  };
+}
+
+async function reconnectWithdraw(deviceId) {
+  if (withdrawReconnectsInFlight.has(deviceId)) return;
+  withdrawReconnectsInFlight.add(deviceId);
+  deviceRenderSignature = null;
+  renderDevices();
+
+  try {
+    await deviceService.reconnectWithdraw(deviceId);
+    notice("Withdraw session reconnect requested.");
+    await loadDevices();
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    withdrawReconnectsInFlight.delete(deviceId);
+    deviceRenderSignature = null;
+    renderDevices();
+  }
+}
+
+async function refreshWithdrawBalance(deviceId) {
+  if (balanceRefreshesInFlight.has(deviceId)) return;
+  balanceRefreshesInFlight.add(deviceId);
+  deviceRenderSignature = null;
+  renderDevices();
+
+  try {
+    await deviceService.refreshBalance(deviceId);
+    notice("Balance refresh requested.");
+    await loadDevices();
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    balanceRefreshesInFlight.delete(deviceId);
+    deviceRenderSignature = null;
+    renderDevices();
+  }
+}
+
 function renderDevices() {
   stopDevicePreviews();
   const devices = Array.isArray(deviceCatalog?.devices)
     ? deviceCatalog.devices
     : [];
+
+  const currentDeviceIds = new Set(devices.map((device) => device.id));
+  for (const [deviceId, frameUrl] of devicePreviewLastFrames) {
+    if (currentDeviceIds.has(deviceId)) continue;
+    URL.revokeObjectURL(frameUrl);
+    devicePreviewLastFrames.delete(deviceId);
+  }
+
   const enrollment = deviceCatalog?.enrollment || { active: false };
   const selected = deviceCatalog?.selected_device;
 
@@ -1002,7 +1225,7 @@ function renderDevices() {
     const workflowSummary = document.createElement("div");
     workflowSummary.className = "account-summary admin-only";
     const workflowHeading = document.createElement("strong");
-    workflowHeading.textContent = "Assigned Workflow";
+    workflowHeading.textContent = "Payment Workflow";
     const workflowNames = document.createElement("span");
     const assignedWorkflow = workflowAssignment.assigned_workflows?.[0];
 
@@ -1021,13 +1244,98 @@ function renderDevices() {
       : assignedWorkflow
         ? assignedWorkflow.id
         : "Execution disabled";
-    workflowSummary.append(workflowHeading, workflowNames, workflowCount);
+
+    const paymentWorkflowAction = document.createElement("button");
+    paymentWorkflowAction.type = "button";
+    paymentWorkflowAction.textContent = assignedWorkflow ? "Change" : "Assign";
+    paymentWorkflowAction.disabled = deviceManagementBlocked();
+    paymentWorkflowAction.addEventListener("click", () =>
+      openWorkflowSettings(device, "payment"),
+    );
+
+    const balanceWorkflowHeading = document.createElement("strong");
+    balanceWorkflowHeading.textContent = "Balance Check Workflow";
+
+    const balanceWorkflow = document.createElement("span");
+    balanceWorkflow.textContent = workflowAssignment.balance_workflow
+      ? workflowAssignment.balance_workflow.missing
+        ? `${workflowAssignment.balance_workflow.id} · Missing`
+        : workflowAssignment.balance_workflow.name ||
+          workflowAssignment.balance_workflow.id
+      : "Not assigned";
+
+    const balanceWorkflowAction = document.createElement("button");
+    balanceWorkflowAction.type = "button";
+    balanceWorkflowAction.textContent = workflowAssignment.balance_workflow
+      ? "Change"
+      : "Assign";
+
+    balanceWorkflowAction.disabled = deviceManagementBlocked();
+    balanceWorkflowAction.addEventListener("click", () =>
+      openWorkflowSettings(device, "balance"),
+    );
+
+    workflowSummary.append(
+      workflowHeading,
+      workflowNames,
+      workflowCount,
+      paymentWorkflowAction,
+      balanceWorkflowHeading,
+      balanceWorkflow,
+      balanceWorkflowAction,
+    );
 
     const withdraw = deviceWithdrawDetails?.[device.id] || {};
     const withdrawApi = withdraw.withdraw_api || {};
     const withdrawAssigned =
       withdraw.assigned === true ||
       (Number.isInteger(withdrawApi.operator_id) && !!withdrawApi.username);
+    const balance = payerBalanceView(withdraw);
+    const balanceSummary = document.createElement("div");
+    balanceSummary.className = "account-summary device-balance-summary";
+    const balanceHeading = document.createElement("strong");
+    balanceHeading.textContent = "Balance";
+    const balanceValue = document.createElement("span");
+    balanceValue.className = "device-balance-value";
+    balanceValue.textContent = balance.value;
+    balanceSummary.append(balanceHeading, balanceValue);
+
+    if (balance.stateLabel) {
+      const balanceState = document.createElement("span");
+      balanceState.className = "device-balance-state";
+      balanceState.textContent = balance.stateLabel;
+      balanceSummary.append(balanceState);
+    }
+
+    if (balance.checkedAt) {
+      const checked = document.createElement("span");
+      checked.className = "device-balance-time";
+      checked.textContent = `Last checked: ${balance.checkedAt}`;
+      balanceSummary.append(checked);
+    }
+    if (withdrawAssigned) {
+      const refreshBalance = document.createElement("button");
+      refreshBalance.type = "button";
+      refreshBalance.textContent = balanceRefreshesInFlight.has(device.id)
+        ? "Requesting…"
+        : "Refresh Balance";
+      refreshBalance.disabled =
+        withdraw.status?.balance_workflow_ready !== true ||
+        balanceRefreshesInFlight.has(device.id);
+      refreshBalance.addEventListener("click", () =>
+        refreshWithdrawBalance(device.id),
+      );
+      balanceSummary.append(refreshBalance);
+
+      if (withdraw.status?.balance_workflow_ready !== true) {
+        const balanceHelp = document.createElement("span");
+        balanceHelp.className = "device-balance-help";
+        balanceHelp.textContent =
+          withdraw.status?.balance_workflow_error ||
+          "Assign a Balance Check Workflow first.";
+        balanceSummary.append(balanceHelp);
+      }
+    }
     const withdrawSummary = document.createElement("div");
     withdrawSummary.className =
       "account-summary withdraw-account-summary admin-only";
@@ -1037,11 +1345,46 @@ function renderDevices() {
     withdrawStatus.textContent = `Account Status: ${withdrawAssigned ? "Assigned" : "Not Assigned"}`;
     withdrawSummary.append(withdrawHeading, withdrawStatus);
     if (withdrawAssigned) {
+      const runtime = withdrawRuntimeView(withdraw);
       const identity = document.createElement("span");
       identity.textContent = `Username: ${withdrawApi.username} · Account ID: ${withdrawApi.operator_id}`;
       const records = document.createElement("span");
       records.textContent = `Payment Records: ${withdrawApi.payment_records?.length ? withdrawApi.payment_records.join(", ") : "None"}`;
-      withdrawSummary.append(identity, records);
+      const session = document.createElement("span");
+      session.textContent = `Session: ${runtime.session} · Realtime: ${runtime.realtime}`;
+      withdrawSummary.append(identity, records, session);
+      if (typeof withdraw.status?.payment_ready === "boolean") {
+        const readiness = document.createElement("span");
+        readiness.className = withdraw.status.payment_ready
+          ? "withdraw-payment-ready"
+          : "withdraw-payment-warning";
+        readiness.textContent = withdraw.status.payment_ready
+          ? "Payment readiness: Ready"
+          : "Payment readiness: Not ready";
+        withdrawSummary.append(readiness);
+        if (
+          !withdraw.status.payment_ready &&
+          withdraw.status.payment_readiness_error
+        ) {
+          const readinessDetail = document.createElement("span");
+          readinessDetail.className = "withdraw-payment-warning-detail";
+          readinessDetail.textContent = withdraw.status.payment_readiness_error;
+          withdrawSummary.append(readinessDetail);
+        }
+      }
+
+      if (!runtime.ready) {
+        const reconnect = document.createElement("button");
+        reconnect.type = "button";
+        reconnect.textContent = withdrawReconnectsInFlight.has(device.id)
+          ? "Reconnecting…"
+          : "Reconnect";
+        reconnect.disabled =
+          deviceManagementBlocked() ||
+          withdrawReconnectsInFlight.has(device.id);
+        reconnect.addEventListener("click", () => reconnectWithdraw(device.id));
+        withdrawSummary.append(reconnect);
+      }
     }
     const withdrawButton = document.createElement("button");
     withdrawButton.type = "button";
@@ -1101,6 +1444,19 @@ function renderDevices() {
     select.addEventListener("click", () => selectDashboardDevice(device.id));
 
     const jobActions = createDeviceJobActions(latestJob, device.id);
+    if (canManuallyCancelWithdrawal(withdraw)) {
+      const cancelWithdrawal = document.createElement("button");
+      cancelWithdrawal.type = "button";
+      cancelWithdrawal.className = "stop danger-action";
+      cancelWithdrawal.textContent = withdrawCancelsInFlight.has(device.id)
+        ? "Cancelling Withdrawal…"
+        : "Cancel Withdrawal";
+      cancelWithdrawal.disabled = withdrawCancelsInFlight.has(device.id);
+      cancelWithdrawal.addEventListener("click", () =>
+        openWithdrawCancel(device),
+      );
+      jobActions.append(cancelWithdrawal);
+    }
     if (!latestJob && manualWorkflowNeedsAttention) {
       const assist = document.createElement("button");
       assist.type = "button";
@@ -1120,13 +1476,6 @@ function renderDevices() {
     settings.disabled = deviceManagementBlocked();
     settings.addEventListener("click", () => openCameraSettings(device));
 
-    const workflows = document.createElement("button");
-    workflows.className = "admin-only";
-    workflows.type = "button";
-    workflows.textContent = "Assigned Workflow";
-    workflows.disabled = deviceManagementBlocked();
-    workflows.addEventListener("click", () => openWorkflowSettings(device));
-
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "stop admin-only";
@@ -1140,7 +1489,6 @@ function renderDevices() {
       ...(jobActions.children.length ? [jobActions] : []),
       select,
       settings,
-      workflows,
       remove,
     );
     card.append(
@@ -1149,6 +1497,7 @@ function renderDevices() {
       mac,
       preview,
       summary,
+      balanceSummary,
       workflowSummary,
       withdrawSummary,
     );
@@ -1758,14 +2107,91 @@ function setWorkflowSettingsError(message = "") {
 function closeWorkflowSettings() {
   workflowSettingsDeviceId = null;
   workflowSettingsData = null;
+  workflowSettingsMode = "payment";
   $("workflow-settings-dialog").hidden = true;
   $("workflow-settings-search").value = "";
+  $("workflow-settings-balance-search").value = "";
+  $("workflow-settings-payment-section").hidden = false;
+  $("workflow-settings-balance-section").hidden = false;
   setWorkflowSettingsError();
 }
 
 function setWithdrawSettingsError(message = "") {
   $("withdraw-settings-error").textContent = message;
   $("withdraw-settings-error").hidden = !message;
+}
+
+function setWithdrawCancelError(message = "") {
+  $("withdraw-cancel-error").textContent = message;
+  $("withdraw-cancel-error").hidden = !message;
+}
+
+function closeWithdrawCancel() {
+  if (
+    withdrawCancelDeviceId &&
+    withdrawCancelsInFlight.has(withdrawCancelDeviceId)
+  )
+    return;
+  withdrawCancelDeviceId = null;
+  $("withdraw-cancel-reason").value = "";
+  $("withdraw-cancel-confirm").disabled = true;
+  $("withdraw-cancel-dialog").hidden = true;
+  setWithdrawCancelError();
+}
+
+function openWithdrawCancel(device) {
+  withdrawCancelDeviceId = device.id;
+  $("withdraw-cancel-title").textContent =
+    `Cancel Withdrawal · ${device.name || device.id}`;
+  $("withdraw-cancel-reason").value = "";
+  $("withdraw-cancel-confirm").disabled = true;
+  $("withdraw-cancel-dialog").hidden = false;
+  setWithdrawCancelError();
+  $("withdraw-cancel-reason").focus();
+}
+
+function updateWithdrawCancelConfirm() {
+  $("withdraw-cancel-confirm").disabled =
+    !withdrawCancelDeviceId ||
+    !$("withdraw-cancel-reason").value ||
+    withdrawCancelsInFlight.has(withdrawCancelDeviceId);
+}
+
+async function confirmWithdrawCancel(event) {
+  event.preventDefault();
+  const deviceId = withdrawCancelDeviceId;
+  const reasonCode = $("withdraw-cancel-reason").value;
+  if (!deviceId || !reasonCode || withdrawCancelsInFlight.has(deviceId)) return;
+
+  withdrawCancelsInFlight.add(deviceId);
+  updateWithdrawCancelConfirm();
+  setWithdrawCancelError();
+  deviceRenderSignature = null;
+  renderDevices();
+
+  try {
+    const status = await deviceService.cancelWithdrawal(deviceId, reasonCode);
+    deviceWithdrawDetails[deviceId] = {
+      ...(deviceWithdrawDetails[deviceId] || {}),
+      status,
+    };
+    withdrawCancelsInFlight.delete(deviceId);
+    closeWithdrawCancel();
+    deviceRenderSignature = null;
+    renderDevices();
+    notice("Withdrawal cancelled successfully.");
+    await loadDevices();
+  } catch (_error) {
+    setWithdrawCancelError(
+      "Unable to confirm cancellation. This withdrawal remains under manual attention.",
+    );
+    await loadDevices().catch(() => {});
+  } finally {
+    withdrawCancelsInFlight.delete(deviceId);
+    updateWithdrawCancelConfirm();
+    deviceRenderSignature = null;
+    renderDevices();
+  }
 }
 
 function closeWithdrawSettings() {
@@ -1856,6 +2282,7 @@ function renderWorkflowSettingsOptions() {
     (workflow) => ({
       id: workflow.id,
       name: workflow.name,
+      purpose: workflow.purpose,
       missing: false,
     }),
   );
@@ -1863,6 +2290,7 @@ function renderWorkflowSettingsOptions() {
     available.push({ id: workflowId, name: "Missing workflow", missing: true });
 
   const options = available
+    .filter((workflow) => workflow.purpose === "payment" || workflow.missing)
     .filter((workflow) =>
       `${workflow.name} ${workflow.id}`.toLocaleLowerCase().includes(query),
     )
@@ -1889,22 +2317,120 @@ function renderWorkflowSettingsOptions() {
   $("workflow-settings-list").replaceChildren(...options);
 }
 
-async function openWorkflowSettings(device) {
+function renderBalanceWorkflowOptions() {
+  if (!workflowSettingsData) return;
+  const query = $("workflow-settings-balance-search")
+    .value.trim()
+    .toLocaleLowerCase();
+  const assignedId = workflowSettingsData.balance_workflow_id || "";
+  const assigned = workflowSettingsData.balance_workflow;
+
+  const available = workflowSettingsData.available_workflows
+    .filter(
+      (workflow) =>
+        workflow.purpose === "balance_check" &&
+        workflow.balance_check_eligible === true,
+    )
+    .filter((workflow) =>
+      `${workflow.name} ${workflow.id}`.toLocaleLowerCase().includes(query),
+    );
+
+  const options = [];
+
+  const noneLabel = document.createElement("label");
+  noneLabel.className = "workflow-assignment-option";
+  noneLabel.dataset.workflowId = "";
+  const noneInput = document.createElement("input");
+  noneInput.type = "radio";
+  noneInput.name = "device-balance-workflow";
+  noneInput.checked = !assignedId;
+  const noneText = document.createElement("span");
+  const noneName = document.createElement("strong");
+  noneName.textContent = "No Balance Check Workflow assigned";
+  const noneHint = document.createElement("small");
+  noneHint.textContent = "Disable automatic balance checks for this phone";
+  noneText.append(noneName, noneHint);
+  noneLabel.append(noneInput, noneText);
+  options.push(noneLabel);
+
+  for (const workflow of available) {
+    const label = document.createElement("label");
+    label.className = "workflow-assignment-option";
+    label.dataset.workflowId = workflow.id;
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "device-balance-workflow";
+    input.checked = workflow.id === assignedId;
+    const text = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = workflow.name;
+    const id = document.createElement("small");
+    id.textContent = workflow.id;
+    text.append(name, id);
+    label.append(input, text);
+    options.push(label);
+  }
+
+  // Keep a broken existing assignment visible so the operator understands why
+  // balance refresh is unavailable and can deliberately replace or remove it.
+  if (
+    assignedId &&
+    assigned &&
+    (assigned.missing || assigned.balance_check_eligible === false) &&
+    !available.some((workflow) => workflow.id === assignedId)
+  ) {
+    const label = document.createElement("label");
+    label.className = "workflow-assignment-option missing";
+    label.dataset.workflowId = assignedId;
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "device-balance-workflow";
+    input.checked = true;
+    input.disabled = true;
+    const text = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = assigned.missing
+      ? "Missing Balance Check Workflow"
+      : "Invalid Balance Check Workflow";
+    const id = document.createElement("small");
+    id.textContent = assigned.name
+      ? `${assigned.name} · ${assigned.id}`
+      : assigned.id;
+    text.append(name, id);
+    label.append(input, text);
+    options.push(label);
+  }
+
+  $("workflow-settings-balance-list").replaceChildren(...options);
+}
+
+async function openWorkflowSettings(device, mode = "payment") {
   workflowSettingsDeviceId = device.id;
   workflowSettingsData = null;
+  workflowSettingsMode = mode === "balance" ? "balance" : "payment";
+
+  const balanceMode = workflowSettingsMode === "balance";
   $("workflow-settings-title").textContent =
-    `Assigned Workflow · ${device.name || device.id}`;
+    `${balanceMode ? "Balance Check Workflow" : "Payment Workflow"} · ${device.name || device.id}`;
   $("workflow-settings-help").textContent = "Loading workflows…";
+  $("workflow-settings-payment-section").hidden = balanceMode;
+  $("workflow-settings-balance-section").hidden = !balanceMode;
+  $("workflow-settings-save").textContent = balanceMode
+    ? "Save Balance Check Workflow"
+    : "Save Payment Workflow";
   $("workflow-settings-list").replaceChildren();
   $("workflow-settings-dialog").hidden = false;
   setWorkflowSettingsError();
+
   try {
     workflowSettingsData = await deviceService.workflows(device.id);
-    $("workflow-settings-help").textContent = workflowSettingsData.unrestricted
-      ? "Choose the workflow assigned to this phone."
-      : "Only the selected workflow may run on this phone.";
+    $("workflow-settings-help").textContent = balanceMode
+      ? "Choose the Balance Check Workflow used to read this payer's balance."
+      : "Choose the Payment Workflow that may run on this phone.";
     renderWorkflowSettingsOptions();
-    $("workflow-settings-search").focus();
+    renderBalanceWorkflowOptions();
+    if (balanceMode) $("workflow-settings-balance-search").focus();
+    else $("workflow-settings-search").focus();
   } catch (error) {
     setWorkflowSettingsError(error.message);
   }
@@ -1913,20 +2439,50 @@ async function openWorkflowSettings(device) {
 async function saveWorkflowSettings(event) {
   event.preventDefault();
   if (!workflowSettingsDeviceId || !workflowSettingsData) return;
-  const selected = Array.from($("workflow-settings-list").children).find(
-    (option) => option.children[0]?.checked,
-  );
-  const workflowIds = selected ? [selected.dataset.workflowId] : [];
+
+  const savingMode = workflowSettingsMode;
+  let workflowIds;
+  let balanceWorkflowId;
+
+  if (savingMode === "balance") {
+    // Preserve the Payment Workflow exactly as it was while editing only the
+    // Balance Check Workflow.
+    workflowIds = workflowSettingsData.unrestricted
+      ? []
+      : [...(workflowSettingsData.allowed_workflow_ids || [])];
+    const selectedBalance = Array.from(
+      $("workflow-settings-balance-list").children,
+    ).find(
+      (option) => option.children[0]?.checked && !option.children[0]?.disabled,
+    );
+    balanceWorkflowId = selectedBalance?.dataset.workflowId || null;
+  } else {
+    const selected = Array.from($("workflow-settings-list").children).find(
+      (option) => option.children[0]?.checked,
+    );
+    workflowIds = selected ? [selected.dataset.workflowId] : [];
+    // Preserve the Balance Check Workflow while editing only Payment Workflow.
+    balanceWorkflowId = workflowSettingsData.balance_workflow_id || null;
+  }
+
   const button = $("workflow-settings-save");
   button.disabled = true;
   setWorkflowSettingsError();
   try {
-    await deviceService.updateWorkflows(workflowSettingsDeviceId, workflowIds);
+    await deviceService.updateWorkflows(
+      workflowSettingsDeviceId,
+      workflowIds,
+      balanceWorkflowId,
+    );
     closeWorkflowSettings();
     deviceRenderSignature = null;
     await loadDevices();
     await window.phoneRecorder?.workflowAssignmentsChanged?.();
-    notice("Assigned workflow saved.");
+    notice(
+      savingMode === "balance"
+        ? "Balance Check Workflow saved."
+        : "Payment Workflow saved.",
+    );
   } catch (error) {
     setWorkflowSettingsError(error.message);
   } finally {
@@ -1961,6 +2517,82 @@ function reconcileAddPhonePanel(devices, enrollment) {
     // typed ID available for a deliberate retry when the user reopens Add Phone.
     addPhoneEnrollmentTarget = null;
   }
+}
+
+function deviceRenderSnapshot(catalog, cameras, withdrawDetails, jobs) {
+  return {
+    devices: (catalog.devices || []).map((device) => ({
+      id: device.id,
+      name: device.name,
+      connected: device.connected,
+      default: device.default,
+      bluetooth_address: device.bluetooth_address,
+      workflow_assignment: device.workflow_assignment,
+    })),
+
+    enrollment: catalog.enrollment
+      ? {
+          active: catalog.enrollment.active,
+          target_device_id: catalog.enrollment.target_device_id,
+          remaining_seconds: catalog.enrollment.remaining_seconds,
+        }
+      : null,
+
+    default_device: catalog.default_device,
+    selected_device: catalog.selected_device,
+
+    cameras: Object.fromEntries(
+      Object.entries(cameras || {}).map(([deviceId, details]) => [
+        deviceId,
+        {
+          config: details?.config,
+          status: {
+            ready: details?.status?.ready,
+            poll_failed: details?.status?.poll_failed,
+            width: details?.status?.width,
+            height: details?.status?.height,
+          },
+        },
+      ]),
+    ),
+
+    withdraw: Object.fromEntries(
+      Object.entries(withdrawDetails || {}).map(([deviceId, details]) => [
+        deviceId,
+        {
+          assigned: details?.assigned,
+          credentials_saved: details?.credentials_saved,
+          withdraw_api: details?.withdraw_api,
+          status: {
+            state: details?.status?.state,
+            phase: details?.status?.phase,
+            session_state: details?.status?.session_state,
+            reconciliation_complete: details?.status?.reconciliation_complete,
+            physical_socket_connected:
+              details?.status?.physical_socket_connected,
+
+            payment_ready: details?.status?.payment_ready,
+            payment_readiness_error: details?.status?.payment_readiness_error,
+
+            balance_state: details?.status?.balance_state,
+            balance_valid: details?.status?.balance_valid,
+            last_balance: details?.status?.last_balance,
+            balance_observed_at: details?.status?.balance_observed_at,
+            balance_workflow_ready: details?.status?.balance_workflow_ready,
+            balance_workflow_error: details?.status?.balance_workflow_error,
+
+            cancel_allowed: details?.status?.cancel_allowed,
+            withdraw_id: details?.status?.withdraw_id,
+            job_id: details?.status?.job_id,
+          },
+        },
+      ]),
+    ),
+
+    jobs: jobs,
+
+    status_unavailable: false,
+  };
 }
 
 async function loadDevices() {
@@ -2012,16 +2644,14 @@ async function loadDevices() {
       withdrawEntries.filter(([, value]) => value),
     );
     jobCatalog = Array.isArray(jobResult.jobs) ? jobResult.jobs : jobCatalog;
-    const nextSignature = JSON.stringify({
-      devices: nextCatalog.devices,
-      enrollment: nextCatalog.enrollment,
-      default_device: nextCatalog.default_device,
-      selected_device: nextCatalog.selected_device,
-      cameras: nextCameras,
-      withdraw: deviceWithdrawDetails,
-      jobs: jobCatalog,
-      status_unavailable: false,
-    });
+    const nextSignature = JSON.stringify(
+      deviceRenderSnapshot(
+        nextCatalog,
+        nextCameras,
+        deviceWithdrawDetails,
+        jobCatalog,
+      ),
+    );
     deviceCameraDetails = nextCameras;
     deviceRefreshLastSuccessAt = Date.now();
     deviceRefreshError = "";
@@ -2069,6 +2699,8 @@ async function loadDevices() {
     );
   }
 }
+
+window.refreshDeviceReadiness = () => loadDevices();
 
 async function selectDashboardDevice(deviceId) {
   setDeviceError();
@@ -2858,18 +3490,33 @@ async function videoLoop() {
       notice("Camera resolution changed. Recalibrate the display.", true);
     }
 
-    bitmap?.close();
+    const previousBitmap = bitmap;
+
+    // Only resize when resolution actually changed.
+    // Setting canvas.width / canvas.height clears the canvas.
+    if (canvas.width !== next.width || canvas.height !== next.height) {
+      canvas.width = next.width;
+      canvas.height = next.height;
+    }
+
     bitmap = next;
-    canvas.width = next.width;
-    canvas.height = next.height;
+
     if (frameId !== nextId) {
       frameAt = performance.now();
       frameId = nextId;
     }
 
     $("video-placeholder").classList.add("hidden");
+
     draw();
+
+    // Only close the old frame AFTER the new frame has been drawn.
+    previousBitmap?.close();
+
+    previewConsecutiveFailures = 0;
+
     render();
+
     const renderedAt = performance.now();
     recordPreviewTiming(
       responseAt - previewStarted,
@@ -2879,13 +3526,30 @@ async function videoLoop() {
     );
     succeeded = true;
   } catch (error) {
-    frameAt = 0;
-    const wasManual = manual;
-    manual = false;
-    if (wasManual) api("/api/control", { enabled: false }).catch(() => {});
-    $("video-placeholder").textContent = error.message;
-    $("video-placeholder").classList.remove("hidden");
-    render();
+    previewConsecutiveFailures++;
+
+    // If we already have a good frame, keep showing it.
+    // One dropped frame should NOT flash the placeholder.
+    if (bitmap && previewConsecutiveFailures < 5) {
+      console.debug(
+        `Camera frame missed (${previewConsecutiveFailures}/5):`,
+        error.message,
+      );
+    } else {
+      frameAt = 0;
+
+      const wasManual = manual;
+      manual = false;
+
+      if (wasManual) {
+        api("/api/control", { enabled: false }).catch(() => {});
+      }
+
+      $("video-placeholder").textContent = error.message;
+      $("video-placeholder").classList.remove("hidden");
+
+      render();
+    }
   } finally {
     previewInFlight = false;
     const elapsed = performance.now() - cycleStarted;
@@ -3485,6 +4149,10 @@ $("workflow-settings-search").addEventListener(
   "input",
   renderWorkflowSettingsOptions,
 );
+$("workflow-settings-balance-search").addEventListener(
+  "input",
+  renderBalanceWorkflowOptions,
+);
 $("workflow-settings-cancel").addEventListener("click", closeWorkflowSettings);
 $("workflow-settings-close").addEventListener("click", closeWorkflowSettings);
 $("workflow-settings-dialog").addEventListener("click", (event) => {
@@ -3495,6 +4163,16 @@ $("withdraw-settings-cancel").addEventListener("click", closeWithdrawSettings);
 $("withdraw-settings-close").addEventListener("click", closeWithdrawSettings);
 $("withdraw-settings-dialog").addEventListener("click", (event) => {
   if (event.target === $("withdraw-settings-dialog")) closeWithdrawSettings();
+});
+$("withdraw-cancel-form").addEventListener("submit", confirmWithdrawCancel);
+$("withdraw-cancel-reason").addEventListener(
+  "change",
+  updateWithdrawCancelConfirm,
+);
+$("withdraw-cancel-back").addEventListener("click", closeWithdrawCancel);
+$("withdraw-cancel-close").addEventListener("click", closeWithdrawCancel);
+$("withdraw-cancel-dialog").addEventListener("click", (event) => {
+  if (event.target === $("withdraw-cancel-dialog")) closeWithdrawCancel();
 });
 $("camera-settings-form").addEventListener("submit", saveDeviceCamera);
 $("camera-settings-test").addEventListener("click", testCameraSettings);

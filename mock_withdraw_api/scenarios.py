@@ -1,0 +1,27 @@
+"""Supported deterministic fault modes."""
+
+SCENARIOS = {
+    "normal",
+    "lock_404",
+    "lock_409",
+    "lock_423",
+    "lock_timeout_before_apply",
+    "lock_timeout_after_apply",
+    "renew_timeout_before_apply",
+    "renew_timeout_after_apply",
+    "renew_409",
+    "release_timeout_before_apply",
+    "release_timeout_after_apply",
+    "cancel_timeout_before_apply",
+    "cancel_timeout_after_apply",
+    "confirm_timeout_before_apply",
+    "confirm_timeout_after_apply",
+    "delayed_action_result",
+    "duplicate_action_result",
+    "duplicate_queue_changed",
+    "out_of_order_action_result",
+    "socket_disconnect",
+    "session_expired",
+    "short_lock_ttl",
+    "auth_failure",
+}

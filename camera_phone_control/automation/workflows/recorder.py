@@ -184,14 +184,14 @@ class Recorder:
         if self.owner != owner or self.workflow is None:
             raise ValueError("No recording belongs to this browser.")
 
-    def start(self, owner, name, execute=False, financial=False):
+    def start(self, owner, name, execute=False, financial=False, purpose="payment"):
         if self.workflow is not None:
             raise ValueError("Save or cancel the current recording first.")
 
         if type(execute) is not bool or type(financial) is not bool:
             raise ValueError("Recording options must be booleans.")
 
-        workflow = new_workflow(name)
+        workflow = new_workflow(name, purpose)
         workflow["financial"] = financial
         validate_workflow(workflow, allow_empty=True)
 
@@ -558,6 +558,8 @@ class Recorder:
 
         if operation == "rename_flow":
             candidate["name"] = data.get("name")
+            if "purpose" in data:
+                candidate["purpose"] = data["purpose"]
             if "financial" in data:
                 candidate["financial"] = data["financial"]
             if "recovery_workflow_id" in data:
@@ -681,6 +683,16 @@ class Recorder:
                     }
                 else:
                     old["label"] = label
+            elif operation == "set_critical":
+                critical = data.get("critical")
+                if type(critical) is not bool:
+                    raise ValueError(
+                        "Irreversible payment marker must be true or false."
+                    )
+                if critical:
+                    old["critical"] = True
+                else:
+                    old.pop("critical", None)
             elif operation == "move":
                 destination = data.get("index")
                 if type(destination) is not int or not 0 <= destination < len(siblings):
@@ -751,6 +763,7 @@ class Recorder:
                                 "value",
                                 "input_method",
                                 "keyboard_id",
+                                "amount_format",
                             }
                         },
                         "id": old["id"],
@@ -815,6 +828,11 @@ class Recorder:
                             "source": "variable",
                             "variable": variable.get("name"),
                             "label": old.get("label", ""),
+                            **(
+                                {"amount_format": data.get("amount_format", "raw")}
+                                if variable.get("name") == "amount"
+                                else {}
+                            ),
                             **method_fields,
                         }
                 else:

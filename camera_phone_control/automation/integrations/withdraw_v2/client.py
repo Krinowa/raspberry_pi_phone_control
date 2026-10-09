@@ -3,6 +3,7 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -28,8 +29,13 @@ class UncertainResult(APIError):
 
 def base_origin(value):
     parsed = urlsplit(value)
+    insecure_local = (
+        os.environ.get("WITHDRAW_ALLOW_INSECURE_LOCALHOST") == "1"
+        and parsed.scheme == "http"
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+    )
     if (
-        parsed.scheme != "https"
+        (parsed.scheme != "https" and not insecure_local)
         or not parsed.hostname
         or parsed.username
         or parsed.password
@@ -38,7 +44,8 @@ def base_origin(value):
         or parsed.path not in ("", "/", API_PATH, API_PATH + "/")
     ):
         raise ValueError(
-            "Withdraw API base_url must be an HTTPS host (optionally with the v2 path)."
+            "Withdraw API base_url must be an HTTPS host (optionally with the v2 path). "
+            "Plain HTTP is available only for explicit localhost mock testing."
         )
     return f"{parsed.scheme}://{parsed.netloc}"
 

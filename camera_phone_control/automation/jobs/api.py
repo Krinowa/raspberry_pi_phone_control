@@ -131,6 +131,10 @@ def register_jobs(
         if not binding.enabled:
             raise RecordConflict("Account binding is disabled.")
         workflow = workflow_storage.read(data["workflow"])
+        if workflow.get("purpose") != "payment":
+            raise RecordConflict(
+                "Only a Payment purpose workflow can be queued as device payment work."
+            )
         if not device_workflow_store.allows(binding.device_id, workflow["id"]):
             raise RecordConflict(
                 f"Workflow is not assigned to device {binding.device_id}."
@@ -181,7 +185,16 @@ def register_jobs(
         data = payload()
         if set(data) != {"mode"}:
             raise ValueError("Retry expects mode only.")
-        retry = scheduler.create_retry(job_id, data["mode"])
+        original = scheduler.get_job(job_id)
+        if original.action == "withdraw_v2":
+            manager = app.extensions.get("withdraw_manager")
+            if manager is None:
+                raise RecordConflict(
+                    "Withdraw Bot retry is unavailable because its session is not running."
+                )
+            retry = manager.retry_job(job_id, data["mode"])
+        else:
+            retry = scheduler.create_retry(job_id, data["mode"])
         executor.wake()
         return jsonify(scheduler.public(retry)), 202
 

@@ -72,7 +72,14 @@
       const variable = recording.workflow?.variables.find(
         (v) => v.name === step.variable,
       );
-      return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}`;
+      const format =
+        step.variable === "amount"
+          ? {
+              implied_cents: "Implied cents",
+              whole_number: "Whole amount only",
+            }[step.amount_format]
+          : null;
+      return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}${format ? " · " + format : ""}`;
     }
 
     if (step.type === "wait_until_stable")
@@ -87,7 +94,7 @@
 
     if (step.type === "capture_screen") {
       const label = typeof suffix === "string" ? suffix.trim() : "";
-      return `Capture Screenshot${label && label.toLocaleLowerCase() !== "screenshot" ? " — " + label : ""}`;
+      return `Capture Screenshot${label && !["screenshot", "receipt screenshot"].includes(label.toLocaleLowerCase()) ? " — " + label : ""}`;
     }
 
     if (step.type === "wait") return `Wait ${step.seconds} seconds`;
@@ -454,7 +461,8 @@
       return;
     }
 
-    $("flow-name").value = draft.name;
+    $("flow-name").value = draft.name === "New Recording" ? "" : draft.name;
+    $("flow-purpose").value = draft.purpose || "payment";
     const renderRows = (steps, nested = false) =>
       steps.map((step, index) => {
         const row = document.createElement("li"),
@@ -463,6 +471,13 @@
         row.dataset.stepId = step.id;
         title.textContent = describe(step, index);
         row.append(title);
+
+        if (step.critical === true) {
+          const warning = document.createElement("p");
+          warning.className = "small";
+          warning.textContent = "Irreversible payment submission";
+          row.append(warning);
+        }
 
         if (step.type === "tap") {
           const detail = document.createElement("p");
@@ -892,6 +907,13 @@
     $("input-method-fields").hidden = source === "manual";
     $("input-keyboard-field").hidden =
       source === "manual" || $("input-method").value !== "screen_keyboard";
+    $("amount-format-field").hidden =
+      source !== "variable" || $("variable-name").value !== "amount";
+  }
+
+  function recordAmountFormatFields() {
+    $("record-amount-format-field").hidden =
+      $("record-variable-name").value !== "amount";
   }
 
   function variableName(selectId, customId) {
@@ -900,7 +922,7 @@
   }
 
   function variableChoiceFields(selectId, customFieldId, customId, name) {
-    const predefined = ["account_number", "amount"];
+    const predefined = ["account_number", "amount", "bank_name"];
     if (name === "__custom__") {
       $(selectId).value = name;
       $(customFieldId).hidden = false;
@@ -921,6 +943,7 @@
     );
 
     $("step-name").value = step.label || "";
+    $("step-critical").checked = step.critical === true;
 
     // Show/hide step-specific controls.
     setSectionVisible("step-tap-options", step.type === "tap");
@@ -935,11 +958,6 @@
 
     setSectionVisible("step-stable-options", step.type === "wait_until_stable");
     setSectionVisible("step-value-options", step.type === "ocr_value");
-    setSectionVisible(
-      "step-screenshot-options",
-      step.type === "capture_screen",
-    );
-    $("step-screenshot-output").value = step.output_key || "";
     $("step-value-parser").value = step.parser || "currency";
     $("step-value-output").value = step.output || "payer_balance";
     valueROIPicker.reset(step.type === "ocr_value" ? step.roi : null);
@@ -1007,6 +1025,7 @@
       definition?.name,
     );
     $("variable-default").value = definition?.default ?? "";
+    $("amount-format").value = step.amount_format || "raw";
     $("input-method").value = step.input_method || "hid";
 
     const keyboards = keyboardOptions($("input-keyboard"));
@@ -1021,12 +1040,11 @@
   }
 
   $("input-source").addEventListener("change", sourceFields);
-  $("variable-name").addEventListener(
-    "change",
-    () =>
-      ($("variable-custom-field").hidden =
-        $("variable-name").value !== "__custom__"),
-  );
+  $("variable-name").addEventListener("change", () => {
+    $("variable-custom-field").hidden =
+      $("variable-name").value !== "__custom__";
+    sourceFields();
+  });
   $("input-method").addEventListener("change", sourceFields);
 
   $("step-close").addEventListener("click", () => {
@@ -1098,6 +1116,8 @@
             ask_when_running: true,
           };
       input.variable = variable;
+      if (name === "amount")
+        input.amount_format = $("amount-format").value || "raw";
     }
 
     task(async () => {
@@ -1195,14 +1215,6 @@
           fields: valueFields("step", valueROIPicker),
         });
       }
-      if (old.type === "capture_screen") {
-        await review({
-          operation: "fields",
-          step_id,
-          fields: { output_key: $("step-screenshot-output").value.trim() },
-        });
-      }
-
       if (["wait_for_text", "if_text"].includes(old.type)) {
         await review({
           operation: "fields",
@@ -1222,6 +1234,12 @@
           seconds,
         });
       }
+
+      await review({
+        operation: "set_critical",
+        step_id,
+        critical: $("step-critical").checked,
+      });
 
       await review({
         operation: "rename_step",
@@ -1605,9 +1623,7 @@
         insertionPayload({
           type: "capture_screen",
           label: "Screenshot",
-          ...($("record-screenshot-output").value.trim()
-            ? { output_key: $("record-screenshot-output").value.trim() }
-            : {}),
+          output_key: "receipt_path",
         }),
       ),
     ),
@@ -1901,9 +1917,13 @@
       await enqueueRecording(async () => {
         recording = await api("/api/recorder/step", {
           capture: false,
-          step: { type: "capture_screen", label: "Screenshot" },
+          step: {
+            type: "capture_screen",
+            label: "Screenshot",
+            output_key: "receipt_path",
+          },
         });
-        show("Screenshot marker added. Recording continues.");
+        show("Screenshot added. Recording continues.");
       });
     }),
   );
@@ -1915,6 +1935,13 @@
 
   $("record-input-variable").addEventListener("click", () => {
     variableInputOpen = true;
+    if (
+      !["raw", "implied_cents", "whole_number"].includes(
+        $("record-amount-format").value,
+      )
+    )
+      $("record-amount-format").value = "raw";
+
     if (!["hid", "screen_keyboard"].includes($("record-variable-method").value))
       $("record-variable-method").value = "screen_keyboard";
     const current = $("record-variable-keyboard").value;
@@ -1931,16 +1958,16 @@
       "record-variable-custom-name",
       $("record-variable-name").value,
     );
+    recordAmountFormatFields();
     renderRecording();
   });
 
   $("record-variable-method").addEventListener("change", variableMethodFields);
-  $("record-variable-name").addEventListener(
-    "change",
-    () =>
-      ($("record-variable-custom-field").hidden =
-        $("record-variable-name").value !== "__custom__"),
-  );
+  $("record-variable-name").addEventListener("change", () => {
+    $("record-variable-custom-field").hidden =
+      $("record-variable-name").value !== "__custom__";
+    recordAmountFormatFields();
+  });
   $("record-variable-keyboard").addEventListener("change", () => {
     if ($("record-variable-keyboard").value !== "__capture__") return;
     returnToVariableInput = true;
@@ -1975,14 +2002,20 @@
         variable: {
           name,
           label:
-            { account_number: "Account Number", amount: "Amount" }[name] ||
-            name.replaceAll("_", " "),
+            {
+              account_number: "Account Number",
+              amount: "Amount",
+              bank_name: "Bank Name",
+            }[name] || name.replaceAll("_", " "),
           type: "text",
           required: true,
           default: defaultValue === "" ? null : defaultValue,
           ask_when_running: true,
         },
         input_method: method,
+        ...(name === "amount"
+          ? { amount_format: $("record-amount-format").value || "raw" }
+          : {}),
         ...(method === "screen_keyboard" ? { keyboard_id: keyboardId } : {}),
         sample: defaultValue,
         type_sample: typeNow,
@@ -2162,7 +2195,7 @@
         closeExpectedText();
         if (piManual() || backend !== "mock") await disable();
         show(
-          "Recording stopped. Review your steps, name your workflow, then save.",
+          "Recording stopped. Review your steps, enter the bank name, then save.",
         );
         renderRecording();
         $("review-flow").scrollIntoView?.({
@@ -2215,6 +2248,7 @@
       await review({
         operation: "rename_flow",
         name: $("flow-name").value.trim(),
+        purpose: $("flow-purpose").value,
       });
 
       const saved = await api("/api/recorder/save", {});
@@ -2231,6 +2265,7 @@
 
       await loadFlows();
       await selectFlow(saved.id);
+      await window.refreshDeviceReadiness?.();
     }),
   );
 
@@ -2553,6 +2588,7 @@
 
       label.textContent =
         `${flow.name} · ` +
+        `${flow.purpose === "balance_check" ? "Balance Check" : "Payment"} · ` +
         `${flow.step_count} steps · ` +
         `${flow.variable_count} variables · ` +
         `Created ${
@@ -2760,6 +2796,7 @@
     if (nextRunStateSignature !== runStateSignature) {
       runStateSignature = nextRunStateSignature;
       window.phoneRuntimeStateChanged?.(running);
+      if (terminal.has(running.status)) void window.refreshDeviceReadiness?.();
     }
     $("flow-run-state").textContent =
       `${running.status} · Step ${running.step_index || 0}/${running.step_count || 0} · ${running.preview ? describe(running.preview, (running.step_index || 1) - 1) : "Starting"}${running.checkpoint_message ? " — " + running.checkpoint_message : ""}${terminal.has(running.status) ? " — " + (running.message || "") : ""}`;

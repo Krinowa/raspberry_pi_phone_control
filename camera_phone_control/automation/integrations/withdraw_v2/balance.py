@@ -11,6 +11,40 @@ from automation.jobs.storage import RecordConflict
 from automation.workflows.values import parse_currency
 
 
+def _workflow_steps(steps):
+    for step in steps:
+        yield step
+        if step.get("type") == "if_text":
+            for branch in ("then_steps", "else_steps"):
+                yield from _workflow_steps(step.get(branch, []))
+
+
+def balance_check_workflow(workflow):
+    """Validate purpose and safety invariants for a dedicated balance route."""
+    if workflow.get("purpose") != "balance_check":
+        raise ValueError(
+            "Only a Balance Check purpose workflow can be assigned as a "
+            "Balance Check Workflow."
+        )
+    steps = list(_workflow_steps(workflow.get("steps", [])))
+    if any(step.get("critical") is True for step in steps):
+        raise ValueError(
+            "This workflow cannot be used as a Balance Check Workflow because "
+            "it contains an irreversible payment step."
+        )
+    if not any(
+        step.get("type") == "ocr_value"
+        and step.get("parser") == "currency"
+        and step.get("output") == "payer_balance"
+        for step in steps
+    ):
+        raise ValueError(
+            "This workflow cannot be used as a Balance Check Workflow because "
+            "it does not contain Read Balance."
+        )
+    return workflow
+
+
 class BalanceProvider(Protocol):
     def get_available_balance(self, device_id: str) -> Decimal | None: ...
 
@@ -32,16 +66,7 @@ class CameraOCRBalanceProvider:
         workflow_id = self.workflow_for_device(device_id)
         if not workflow_id:
             raise ValueError("No balance-check workflow is assigned to this device.")
-        workflow = self.workflows.read(workflow_id)
-        if not any(
-            step.get("type") == "ocr_value"
-            and step.get("parser") == "currency"
-            and step.get("output") == "payer_balance"
-            for step in workflow["steps"]
-        ):
-            raise ValueError(
-                "Balance workflow must produce payer_balance with Read Balance."
-            )
+        workflow = balance_check_workflow(self.workflows.read(workflow_id))
         reservation = object()
         with self.scheduler.lock:
             if not self.scheduler.is_device_ready(device_id)["ready"]:
@@ -54,11 +79,19 @@ class CameraOCRBalanceProvider:
         try:
             started = self.service.start(workflow, {}, device_id=device_id)
             completed = self.service.wait(started["run_id"])
-            if not completed or completed.get("status") != "passed":
+            if not completed:
                 raise ValueError(
                     "Balance workflow did not complete; balance is unknown."
                 )
-            return parse_currency(completed.get("outputs", {}).get("payer_balance"))
+            # A Read Balance step can publish a valid value before a later
+            # cleanup/navigation step fails or is cancelled. Keep that value,
+            # matching the workflow-completion listener's semantics.
+            try:
+                return parse_currency(completed.get("outputs", {}).get("payer_balance"))
+            except (AttributeError, ValueError):
+                raise ValueError(
+                    "Balance workflow did not produce a valid payer balance."
+                ) from None
         finally:
             with self.scheduler.lock:
                 if self.scheduler.reservations.get(device_id) is reservation:
@@ -75,16 +108,21 @@ class BalanceCache:
     observed_at: str | None = None
     observed_monotonic: float = 0.0
     invalidated: bool = True
+    context: tuple | None = None
 
-    def valid(self, *, now=None):
+    def belongs_to(self, context):
+        return context is None or self.context == context
+
+    def valid(self, *, now=None, context=None):
         stamp = time.monotonic() if now is None else now
         return (
-            not self.invalidated
+            self.belongs_to(context)
+            and not self.invalidated
             and self.available_balance is not None
             and 0 <= stamp - self.observed_monotonic < self.refresh_seconds
         )
 
-    def observe(self, amount, *, now=None):
+    def observe(self, amount, *, now=None, context=None):
         if not isinstance(amount, Decimal) or not amount.is_finite() or amount < 0:
             self.invalidate()
             raise ValueError("Balance must be a finite nonnegative Decimal.")
@@ -92,9 +130,19 @@ class BalanceCache:
         self.observed_monotonic = time.monotonic() if now is None else now
         self.observed_at = datetime.now(timezone.utc).isoformat()
         self.invalidated = False
+        self.context = context
 
     def invalidate(self):
+        """Expire trust while retaining the last observation for display."""
         self.invalidated = True
+
+    def clear(self):
+        """Discard an observation that belongs to a different payer context."""
+        self.available_balance = None
+        self.observed_at = None
+        self.observed_monotonic = 0.0
+        self.invalidated = True
+        self.context = None
 
     def confirmed_payment(self, amount):
         if not isinstance(amount, Decimal) or not amount.is_finite() or amount <= 0:

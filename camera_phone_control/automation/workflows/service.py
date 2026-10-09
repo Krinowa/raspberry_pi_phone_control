@@ -45,11 +45,36 @@ class WorkflowService:
         self.screenshot_store = screenshot_store or WorkflowScreenshotStore()
         self.lock = threading.RLock()
         self.runs = {}
+        self.completion_listeners = []
+
+    def add_completion_listener(self, listener):
+        """Observe immutable completion snapshots without affecting run status."""
+        if not callable(listener):
+            raise ValueError("Workflow completion listener must be callable.")
+        with self.lock:
+            if listener not in self.completion_listeners:
+                self.completion_listeners.append(listener)
+
+    def remove_completion_listener(self, listener):
+        with self.lock:
+            if listener in self.completion_listeners:
+                self.completion_listeners.remove(listener)
+
+    def _notify_completion(self, snapshot):
+        with self.lock:
+            listeners = list(self.completion_listeners)
+        for listener in listeners:
+            try:
+                listener(deepcopy(snapshot))
+            except Exception:
+                logging.getLogger("workflow_service").exception(
+                    "Workflow completion listener failed."
+                )
 
     def has_active_run(self, device_id=None):
         with self.lock:
             return any(
-                item["thread"].is_alive()
+                item.get("active", item["thread"].is_alive())
                 and (device_id is None or item.get("device_id") == device_id)
                 for item in self.runs.values()
             )
@@ -96,6 +121,7 @@ class WorkflowService:
                 "steps": self.preview_steps(workflow),
                 "timing": WorkflowTiming(),
                 "completed": completed,
+                "active": True,
                 "screenshots": [],
                 "outputs": {},
             }
@@ -151,7 +177,15 @@ class WorkflowService:
                 finally:
                     if isinstance(variables, dict):
                         variables.clear()
-                    completed.set()
+                    # Physical workflow execution has ended. Mark it inactive
+                    # before publishing outputs so downstream device readiness
+                    # cannot invalidate a newly observed balance as still busy.
+                    with self.lock:
+                        item["active"] = False
+                    try:
+                        self._notify_completion(self.snapshot(run_id))
+                    finally:
+                        completed.set()
 
             thread = threading.Thread(
                 target=execute, name="workflow-" + run_id, daemon=True

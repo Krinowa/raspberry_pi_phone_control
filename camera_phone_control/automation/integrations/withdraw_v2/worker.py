@@ -1,14 +1,16 @@
 """One external session per logical phone; physical execution stays in jobs."""
 
 import logging
+import hashlib
+import json
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from automation.jobs.storage import RecordConflict
+from automation.jobs.storage import RecordConflict, RecordNotFound
 from automation.workflows.validation import resolve_variables
-from .balance import BalanceCache, final_amount, select_pending
+from .balance import BalanceCache, balance_check_workflow, final_amount
 from .client import APIError
 from .config import load_credentials
 from .journal import TERMINAL
@@ -16,6 +18,10 @@ from .normalization import normalize_locked_withdrawal, retained_withdrawal
 from .socket import PusherSocket
 
 LOG = logging.getLogger("withdraw_v2")
+
+
+class AuthenticationFailed(ValueError):
+    """Stored credentials or assigned identity require operator intervention."""
 
 
 def expiry(value):
@@ -28,21 +34,88 @@ def expiry(value):
         raise ValueError("External lock/session expiry is invalid.") from None
 
 
+def receipt_contract(workflow):
+    """Require top-level success detection followed by a receipt screenshot."""
+    steps = workflow.get("steps", [])
+    screenshots = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("type") == "capture_screen"
+    ]
+    receipt_indexes = [
+        index for index, step in screenshots if step.get("output_key") == "receipt_path"
+    ]
+    result = {
+        "wait_for_text_found": any(
+            step.get("type") == "wait_for_text" for step in steps
+        ),
+        "screenshot_found": bool(screenshots),
+        "screenshot_output": (
+            screenshots[-1][1].get("output_key") if screenshots else None
+        ),
+        "valid": False,
+        "reason": None,
+    }
+    if not receipt_indexes:
+        result["reason"] = "Add a Capture Screenshot step after the success check."
+        return result
+
+    has_ordered_pair = any(
+        step.get("type") == "wait_for_text"
+        for receipt_index in receipt_indexes
+        for step in steps[:receipt_index]
+    )
+    if not has_ordered_pair:
+        result["reason"] = "Add a success check before Capture Screenshot."
+        return result
+
+    result.update(
+        wait_for_text_found=True,
+        screenshot_found=True,
+        screenshot_output="receipt_path",
+        valid=True,
+    )
+    return result
+
+
 def payment_workflow(workflow):
-    # Conservative V1 proof contract: the final two top-level steps must verify
-    # the configured successful bank screen, then capture the receipt. A mere
-    # screenshot or a branch that skips verification is not payment evidence.
-    steps = workflow["steps"]
-    if (
-        len(steps) < 2
-        or steps[-2]["type"] != "wait_for_text"
-        or steps[-1]["type"] != "capture_screen"
-        or steps[-1].get("output_key") != "receipt_path"
-    ):
-        raise ValueError(
-            "Payment workflow must end with success-screen Wait for Text then Screenshot output receipt_path."
-        )
+    if workflow.get("purpose", "payment") != "payment":
+        raise ValueError("Only a Payment purpose workflow can be assigned for payment.")
+    contract = receipt_contract(workflow)
+    if not contract["valid"]:
+        raise ValueError(contract["reason"])
     return workflow
+
+
+def contains_irreversible_step(step):
+    if step.get("critical") is True:
+        return True
+    if step.get("type") != "if_text":
+        return False
+    return any(
+        contains_irreversible_step(child)
+        for branch in ("then_steps", "else_steps")
+        for child in step.get(branch, [])
+    )
+
+
+def irreversible_step_indexes(workflow):
+    return [
+        index
+        for index, step in enumerate(workflow.get("steps", []))
+        if contains_irreversible_step(step)
+    ]
+
+
+def workflow_execution_signature(workflow):
+    encoded = json.dumps(
+        workflow,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class WithdrawWorker:
@@ -61,6 +134,8 @@ class WithdrawWorker:
         client,
         screenshot_root,
         socket_factory=PusherSocket,
+        realtime_transport=None,
+        dispatcher=None,
         credentials=load_credentials,
         renew_seconds=300
     ):
@@ -75,12 +150,16 @@ class WithdrawWorker:
         self.balance_provider, self.client = balance_provider, client
         self.screenshot_root = Path(screenshot_root).resolve()
         self.socket_factory, self.credentials = socket_factory, credentials
+        self.realtime_transport = realtime_transport
+        self.dispatcher = dispatcher
         self.cache = BalanceCache(
             device_id, refresh_seconds=self.api.get("balance_refresh_seconds", 60)
         )
         self.stop = threading.Event()
         self.wake = threading.Event()
+        self.reauthenticate = threading.Event()
         self.lock = threading.RLock()
+        self.withdrawal_operation = threading.Lock()
         self.thread = None
         self.socket = None
         self.state = "STOPPED"
@@ -89,12 +168,25 @@ class WithdrawWorker:
             None  # Runtime-only authorization; never restored after restart.
         )
         self.renew_seconds = renew_seconds
-        self.queue_due = None
-        self.next_pending = 0
         self.renew_stop = threading.Event()
         self.renew_thread = None
         self.lock_lost = threading.Event()
-        self.session_max = 0
+        profile = getattr(client, "profile", None)
+        self.session_max = (
+            expiry(profile.get("session_max_expires_at"))
+            if isinstance(profile, dict) and profile.get("session_max_expires_at")
+            else 0
+        )
+        self.reconciled_generation = 0
+        self.reconciliation_complete = False
+        self.assigned = None
+        self.retry_waiting_job_id = None
+        self.retry_job_id = None
+        self.balance_refreshing = False
+        self.balance_refresh_request_reason = None
+        self.balance_initial_attempted = False
+        self.balance_pending_required = False
+        self.balance_retry_at = 0.0
 
     def set_state(self, state, error=None):
         with self.lock:
@@ -110,13 +202,29 @@ class WithdrawWorker:
 
     def status(self):
         current = self.journal.current(self.device_id)
+        cancel_allowed = self.can_cancel_withdrawal(current)
         with self.lock:
-            valid = self.cache.valid()
+            context = self.balance_context()
+            if self.cache.available_balance is not None and not self.cache.belongs_to(
+                context
+            ):
+                self.cache.clear()
+                self.balance_initial_attempted = False
+            valid = self.cache.valid(context=context)
+            refreshing = bool(
+                self.balance_refreshing or self.balance_refresh_request_reason
+            )
             balance_state = (
-                "VALID"
-                if valid
+                "REFRESHING"
+                if refreshing
                 else (
-                    "STALE" if self.cache.available_balance is not None else "UNKNOWN"
+                    "VALID"
+                    if valid
+                    else (
+                        "STALE"
+                        if self.cache.available_balance is not None
+                        else "UNKNOWN"
+                    )
                 )
             )
             return {
@@ -124,9 +232,14 @@ class WithdrawWorker:
                 "operator_id": self.api["operator_id"],
                 "username": self.api["username"],
                 "state": self.state,
-                "session_state": self.state,
+                "session_state": (
+                    self.socket.session_state if self.socket else "DISCONNECTED"
+                ),
+                "reconciliation_complete": self.reconciliation_complete,
                 "error": self.error,
-                "socket_connected": bool(self.socket and self.socket.connected),
+                "physical_socket_connected": bool(
+                    self.socket and self.socket.physical_connected
+                ),
                 "withdraw_id": current.get("withdraw_id"),
                 "tx_id": current.get("tx_id"),
                 "phase": current.get("phase"),
@@ -139,7 +252,165 @@ class WithdrawWorker:
                     else None
                 ),
                 "balance_observed_at": self.cache.observed_at,
+                "cancel_allowed": cancel_allowed,
             }
+
+    def balance_context(self):
+        """Identity of the payer whose balance the assigned workflow reads."""
+        records = tuple(
+            sorted(str(value) for value in self.api.get("payment_records", []))
+        )
+        return (
+            self.device_id,
+            self.api.get("base_url"),
+            self.api.get("operator_id"),
+            self.api.get("username"),
+            records,
+            self.config.get("balance_workflow_id"),
+        )
+
+    def balance_valid(self):
+        with self.lock:
+            return self.cache.valid(context=self.balance_context())
+
+    def observe_balance(self, amount):
+        """Publish one valid observation for the worker's current payer identity."""
+        with self.lock:
+            self.cache.observe(amount, context=self.balance_context())
+            self.balance_initial_attempted = True
+            self.balance_refresh_request_reason = None
+            if self.balance_pending_required:
+                self.balance_retry_at = time.monotonic() + self.cache.refresh_seconds
+
+    def invalidate_balance_configuration(self):
+        """Discard observations when the assigned reader is no longer trusted."""
+        with self.lock:
+            self.cache.clear()
+            self.balance_initial_attempted = False
+            self.balance_refresh_request_reason = None
+
+    def request_balance_refresh(self, reason="manual"):
+        """Queue one refresh; the worker executes it only when the phone is safe."""
+        if reason not in {"manual", "pending"}:
+            raise ValueError("Balance refresh reason is invalid.")
+        with self.lock:
+            if reason == "pending":
+                self.balance_pending_required = True
+                self.balance_retry_at = 0.0
+            if self.balance_refresh_request_reason != "manual":
+                self.balance_refresh_request_reason = reason
+            already_active = self.balance_refreshing
+        self.wake.set()
+        return not already_active
+
+    def note_pending_balance(self, reason):
+        """Retain pending demand and schedule immediate or cadence-based OCR."""
+        now = time.monotonic()
+        with self.lock:
+            was_required = self.balance_pending_required
+            self.balance_pending_required = True
+            if reason in {"unknown", "stale"}:
+                self.balance_retry_at = 0.0
+                if self.balance_refresh_request_reason != "manual":
+                    self.balance_refresh_request_reason = "pending"
+            elif reason == "insufficient" and not was_required:
+                self.balance_retry_at = now + self.cache.refresh_seconds
+        self.wake.set()
+
+    def clear_pending_balance_requirement(self):
+        with self.lock:
+            self.balance_pending_required = False
+            self.balance_retry_at = 0.0
+            if self.balance_refresh_request_reason == "pending":
+                self.balance_refresh_request_reason = None
+
+    def _maybe_refresh_balance(self):
+        """Run a deferred single-flight balance workflow when the device is idle."""
+        context = self.balance_context()
+        now = time.monotonic()
+        with self.lock:
+            if self.cache.available_balance is not None and not self.cache.belongs_to(
+                context
+            ):
+                self.cache.clear()
+                self.balance_initial_attempted = False
+            reason = self.balance_refresh_request_reason
+            if reason is None and not self.balance_initial_attempted:
+                reason = "initial"
+            elif (
+                reason is None
+                and self.balance_pending_required
+                and now >= self.balance_retry_at
+            ):
+                reason = "pending"
+            if reason is None or self.balance_refreshing:
+                return False
+            if self.assigned is not None or self.state in {
+                "DISPATCH_RESERVED",
+                "PAYING",
+                "CONFIRMING",
+                "NEEDS_ATTENTION",
+                "CONFIGURATION_ERROR",
+                "AUTH_FAILED",
+            }:
+                return False
+
+        if not self.session_available():
+            return False
+        ready, _ = self.balance_readiness()
+        if not ready:
+            return False
+        with self.scheduler.lock:
+            if (
+                not self.scheduler.is_device_ready(self.device_id)["ready"]
+                or self.scheduler.next_job_for_device(self.device_id) is not None
+                or self.device_id in self.scheduler.reservations
+            ):
+                return False
+            with self.lock:
+                if self.balance_refreshing:
+                    return False
+                self.balance_refreshing = True
+                if reason == "initial":
+                    self.balance_initial_attempted = True
+
+        LOG.info("balance_refresh_started device=%s reason=%s", self.device_id, reason)
+        deferred = False
+        try:
+            amount = self.balance_provider.get_available_balance(self.device_id)
+            self.observe_balance(amount)
+            LOG.info(
+                "balance_refresh_completed device=%s value=%s",
+                self.device_id,
+                format(amount, ".2f"),
+            )
+        except RecordConflict:
+            # Work appeared after the eligibility check. Leave the request
+            # queued and retry once the ordinary device locks are free.
+            deferred = True
+            with self.lock:
+                if reason == "initial":
+                    self.balance_initial_attempted = False
+            return False
+        except Exception as exc:
+            LOG.warning(
+                "balance_refresh_failed device=%s reason=%s error=%s",
+                self.device_id,
+                reason,
+                exc,
+            )
+        finally:
+            with self.lock:
+                self.balance_refreshing = False
+                if not deferred and self.balance_refresh_request_reason == reason:
+                    self.balance_refresh_request_reason = None
+                if not deferred and self.balance_pending_required:
+                    self.balance_retry_at = (
+                        time.monotonic() + self.cache.refresh_seconds
+                    )
+            if self.dispatcher:
+                self.dispatcher.wake()
+        return True
 
     def start(self):
         self.thread = threading.Thread(
@@ -148,30 +419,60 @@ class WithdrawWorker:
         self.thread.start()
 
     def queue_changed(self):
-        with self.lock:
-            self.queue_due = time.monotonic() + 1
-        self.wake.set()
+        if self.dispatcher:
+            self.dispatcher.wake()
 
     def login(self):
-        password, secret = self.credentials(self.api["credential_reference"])
-        profile = self.client.login(
-            self.api["username"], password, secret, self.api["operator_id"]
-        )
-        self.session_max = expiry(profile["session_max_expires_at"])
-        return profile
+        try:
+            password, secret = self.credentials(self.api["credential_reference"])
+            profile = self.client.login(
+                self.api["username"], password, secret, self.api["operator_id"]
+            )
+            self.session_max = expiry(profile["session_max_expires_at"])
+            return profile
+        except APIError as exc:
+            if exc.code in {401, 403, 422}:
+                raise AuthenticationFailed(
+                    "Stored Withdraw credentials were rejected. Login again or reconnect after correcting the account."
+                ) from None
+            raise
+        except ValueError:
+            raise AuthenticationFailed(
+                "Stored Withdraw credentials or session metadata are invalid. Login again to update the account."
+            ) from None
 
     def connect_socket(self):
-        self.disconnect_socket()
-        self.socket = self.socket_factory(
-            self.client, device_id=self.device_id, on_queue_changed=self.queue_changed
-        )
+        if self.socket is None:
+            kwargs = {
+                "device_id": self.device_id,
+                "on_queue_changed": self.queue_changed,
+            }
+            if self.realtime_transport is not None:
+                kwargs["transport"] = self.realtime_transport
+            self.socket = self.socket_factory(self.client, **kwargs)
+
         self.socket.connect(self.client.profile["realtime"])
+        self.cache.invalidate()
+        self.balance_initial_attempted = False
+        self.reconciled_generation = 0
+        self.reconciliation_complete = False
 
     def disconnect_socket(self):
         if self.socket:
             self.socket.close()
             self.socket = None
         self.cache.invalidate()
+        self.reconciled_generation = 0
+        self.reconciliation_complete = False
+
+    def request_reconnect(self, *, force_reauthentication=False):
+        """Wake this worker for reconciliation or a fresh credential login."""
+        with self.lock:
+            self.reconciliation_complete = False
+            self.reconciled_generation = 0
+            if force_reauthentication:
+                self.reauthenticate.set()
+        self.wake.set()
 
     def action(self, name, **fields):
         if self.socket is None:
@@ -203,11 +504,167 @@ class WithdrawWorker:
         self.journal.update(self.device_id, phase="NEEDS_ATTENTION", error=message)
         self.set_state("NEEDS_ATTENTION", message)
 
+    def authorize_retry(self, original_job_id, retry_job_id):
+        """Authorize one validated retry while retaining this worker's lock lease."""
+        with self.lock:
+            if self.retry_waiting_job_id != original_job_id:
+                raise RecordConflict(
+                    "The live Withdraw worker is not waiting for this failed job."
+                )
+            if self.retry_job_id is not None:
+                raise RecordConflict("A retry for this withdrawal is already active.")
+            self.allowed_job = retry_job_id
+            self.retry_job_id = retry_job_id
+            self.error = None
+        try:
+            self.journal.update(
+                self.device_id,
+                phase="QUEUED",
+                job_id=retry_job_id,
+                error=None,
+            )
+        except Exception:
+            with self.lock:
+                if self.retry_job_id == retry_job_id:
+                    self.retry_job_id = None
+                    self.allowed_job = None
+            raise
+        self.set_state("PAYING")
+        self.wake.set()
+
+    def _pending_retry(self, current):
+        job_id = current.get("job_id")
+        if not job_id or current.get("phase") not in {"QUEUED", "NEEDS_ATTENTION"}:
+            return None
+        try:
+            job = self.scheduler.get_job(job_id)
+        except RecordNotFound:
+            return None
+        if (
+            job.action != "withdraw_v2"
+            or not job.retry_of_job_id
+            or job.device_id != self.device_id
+            or job.external_ref != current.get("tx_id")
+            or job.status not in {"QUEUED", "WAITING_FOR_DEVICE", "RUNNING"}
+        ):
+            return None
+        return job
+
+    def _adopt_pending_retry(self, current, locked=None):
+        """Attach a persisted retry to this fresh logical session."""
+        job = self._pending_retry(current)
+        if job is None:
+            return False
+        if locked is None:
+            locked = self.get_my_locked()
+        if (
+            not isinstance(locked, dict)
+            or locked.get("id") != current.get("withdraw_id")
+            or locked.get("tx_id") != current.get("tx_id")
+        ):
+            self.attention(
+                "Retry is queued, but this session does not currently own the external withdrawal lock. Reconnect or cancel the withdrawal before continuing."
+            )
+            return False
+        raw = retained_withdrawal(locked)
+        if expiry(raw.get("lock_expires_at")) <= time.time():
+            self.attention(
+                "Retry is queued, but the external withdrawal lock has expired. Reconnect or cancel the withdrawal before continuing."
+            )
+            return False
+
+        self._start_renewal()
+        with self.lock:
+            self.assigned = (raw, None)
+            self.allowed_job = job.job_id
+            self.retry_job_id = job.job_id
+            self.error = None
+        self.journal.update(
+            self.device_id,
+            phase="QUEUED",
+            job_id=job.job_id,
+            raw_withdrawal=raw,
+            lock_expires_at=raw.get("lock_expires_at"),
+            error=None,
+        )
+        self.set_state("PAYING")
+        self.executor.wake()
+        return True
+
+    def can_cancel_withdrawal(self, current=None):
+        """Allow cancellation only before local payment may have been submitted."""
+        current = current or self.journal.current(self.device_id)
+        if (
+            current.get("phase") not in {"LOCKED", "NEEDS_ATTENTION", "QUEUED"}
+            or type(current.get("withdraw_id")) is not int
+            or current.get("assigned_device_id") != self.device_id
+        ):
+            return False
+        job_id = current.get("job_id")
+        if not job_id:
+            return True
+        get_job = getattr(self.scheduler, "get_job", None)
+        if not callable(get_job):
+            return False
+        try:
+            job = get_job(job_id)
+        except RecordNotFound:
+            return False
+        if job.status in {"QUEUED", "WAITING_FOR_DEVICE"}:
+            return True
+        if job.status not in {"FAILED", "INTERRUPTED"}:
+            return False
+        boundaries = current.get("irreversible_step_indexes")
+        return bool(
+            isinstance(boundaries, list)
+            and len(boundaries) == 1
+            and type(job.failed_step_index) is int
+            and job.failed_step_index < boundaries[0]
+        )
+
+    def _wait_for_retry(self, job):
+        """Keep renewing the lock while the operator restores and resumes safely."""
+        message = (
+            "Payment workflow failed. Restore the phone, then retry from a safe step "
+            "while this Withdraw session retains the external lock."
+        )
+        with self.lock:
+            self.retry_waiting_job_id = job.job_id
+            self.retry_job_id = None
+        self.attention(message)
+        try:
+            while True:
+                current = self.journal.current(self.device_id)
+                if (
+                    self.stop.is_set()
+                    or self.lock_lost.is_set()
+                    or not self.socket
+                    or not self.socket.connected
+                    or expiry(current.get("lock_expires_at")) <= time.time()
+                ):
+                    raise ValueError(
+                        "External lock/session was lost while waiting for retry. Reconciliation is required."
+                    )
+                with self.lock:
+                    retry_job_id = self.retry_job_id
+                if retry_job_id is not None:
+                    return self.scheduler.get_job(retry_job_id)
+                self.wake.wait(0.2)
+                self.wake.clear()
+        finally:
+            with self.lock:
+                self.retry_waiting_job_id = None
+                self.retry_job_id = None
+
     def reconcile(self):
         """Called after every subscription, before any pending/physical work."""
         self.cache.invalidate()
         locked = self.get_my_locked()
         current = self.journal.current(self.device_id)
+        if current and current.get("phase") not in TERMINAL:
+            pending_retry = self._pending_retry(current)
+            if pending_retry is not None:
+                return self._adopt_pending_retry(current, locked)
         if current and current.get("phase") not in TERMINAL:
             if current.get("tx_id") and current.get("withdraw_id"):
                 if self.client.reconcile_confirmation(
@@ -255,7 +712,17 @@ class WithdrawWorker:
             self.renew_thread.join(timeout=12)
             self.renew_thread = None
 
-    def lock_withdrawal(self, item):
+    def _start_renewal(self):
+        if self.renew_thread and self.renew_thread.is_alive():
+            return
+        self.lock_lost.clear()
+        self.renew_stop.clear()
+        self.renew_thread = threading.Thread(
+            target=self._renew, name="withdraw-renew-" + self.device_id, daemon=True
+        )
+        self.renew_thread.start()
+
+    def lock_withdrawal(self, item, *, claimed=False):
         if (
             type(item.get("id")) is not int
             or item["id"] <= 0
@@ -263,16 +730,20 @@ class WithdrawWorker:
             or not item["tx_id"]
         ):
             raise ValueError("Pending withdrawal identifiers are invalid.")
-        if self.journal.was_confirmed(self.device_id, item["tx_id"]):
+        if not claimed and self.journal.was_confirmed(self.device_id, item["tx_id"]):
             raise ValueError(
                 "Previously confirmed transaction appeared in pending; manual review is required."
             )
-        self.journal.begin(
-            self.device_id,
-            phase="LOCK_INTENT",
-            withdraw_id=item["id"],
-            tx_id=item["tx_id"],
-        )
+        if not claimed:
+            self.journal.begin(
+                self.device_id,
+                phase="LOCK_INTENT",
+                withdraw_id=item["id"],
+                tx_id=item["tx_id"],
+                assigned_device_id=self.device_id,
+                operator_id=self.api["operator_id"],
+                final_amount=format(final_amount(item), ".2f"),
+            )
         response = self.action("lock", withdraw_id=item["id"])
         raw = retained_withdrawal(response.get("withdrawal"))
         # Keep the entire response before normalization, including unknown fields.
@@ -281,6 +752,8 @@ class WithdrawWorker:
             phase="LOCKED",
             raw_withdrawal=raw,
             lock_expires_at=raw.get("lock_expires_at"),
+            assigned_device_id=self.device_id,
+            operator_id=self.api["operator_id"],
         )
         if (
             raw.get("id") != item["id"]
@@ -292,12 +765,7 @@ class WithdrawWorker:
             )
         if expiry(raw.get("lock_expires_at")) <= time.time() + 30:
             raise ValueError("External lock has insufficient remaining time.")
-        self.lock_lost.clear()
-        self.renew_stop.clear()
-        self.renew_thread = threading.Thread(
-            target=self._renew, name="withdraw-renew-" + self.device_id, daemon=True
-        )
-        self.renew_thread.start()
+        self._start_renewal()
         return raw
 
     def release_withdrawal(self):
@@ -316,11 +784,72 @@ class WithdrawWorker:
             raise ValueError(
                 "A genuine withdrawal-problem reason (1–200 characters) is required."
             )
-        current = self.journal.current(self.device_id)
-        self.action("cancel", withdraw_id=current["withdraw_id"], reason=reason)
-        self.journal.update(self.device_id, phase="CANCELLED")
-        self.cache.invalidate()
-        self.stop_renewal()
+        if not self.withdrawal_operation.acquire(blocking=False):
+            raise RecordConflict(
+                "Withdrawal cancellation or payment is already in progress."
+            )
+
+        try:
+            current = self.journal.current(self.device_id)
+            if (
+                type(current.get("withdraw_id")) is not int
+                or current["withdraw_id"] <= 0
+                or current.get("assigned_device_id") != self.device_id
+            ):
+                raise RecordConflict(
+                    "This phone does not own an active withdrawal that can be cancelled."
+                )
+            if current.get("phase") not in {"LOCKED", "NEEDS_ATTENTION", "QUEUED"}:
+                raise RecordConflict(
+                    "Withdrawal cannot be cancelled in its current state."
+                )
+            if not self.can_cancel_withdrawal(current):
+                raise RecordConflict(
+                    "Withdrawal cannot be cancelled after physical payment may have started."
+                )
+            job_id = current.get("job_id")
+            if job_id:
+                job = self.scheduler.get_job(job_id)
+                if job.status in {"QUEUED", "WAITING_FOR_DEVICE"}:
+                    cancelled = self.executor.cancel(job_id)
+                    if cancelled.status != "CANCELLED":
+                        raise RecordConflict(
+                            "The local retry already started and can no longer be cancelled safely."
+                        )
+            with self.lock:
+                assignment = self.assigned
+            if current.get("phase") == "LOCKED" and assignment is None:
+                raise RecordConflict(
+                    "The locked withdrawal is not currently owned by this worker."
+                )
+
+            try:
+                self.action("cancel", withdraw_id=current["withdraw_id"], reason=reason)
+                self.journal.update(self.device_id, phase="CANCELLED", error=None)
+            except Exception:
+                message = (
+                    "Unable to confirm cancellation. This withdrawal remains "
+                    "under manual attention."
+                )
+                self.attention(message)
+                raise RecordConflict(message) from None
+
+            self.cache.invalidate()
+            self.stop_renewal()
+
+            with self.lock:
+                if self.assigned == assignment:
+                    self.assigned = None
+            if assignment is not None:
+                _, reservation = assignment
+                with self.scheduler.lock:
+                    if self.scheduler.reservations.get(self.device_id) == reservation:
+                        del self.scheduler.reservations[self.device_id]
+            self.set_state("IDLE")
+            if self.dispatcher:
+                self.dispatcher.wake()
+        finally:
+            self.withdrawal_operation.release()
 
     def _route(self):
         allowed = self.assignments.get(self.device_id)
@@ -338,7 +867,39 @@ class WithdrawWorker:
             raise ValueError("Assign an enabled local account to this device.")
         return account, payment_workflow(self.workflows.read(allowed[0]))
 
-    def _pay(self, raw, account, workflow):
+    def payment_readiness(self):
+        """Validate payment eligibility without changing the logical session."""
+        try:
+            self._route()
+            balance_ready, balance_error = self.balance_readiness()
+            if not balance_ready:
+                raise ValueError(balance_error)
+        except (KeyError, ValueError) as error:
+            return False, str(error)
+        return True, None
+
+    def _balance_workflow(self):
+        balance_workflow_id = self.assignments.integration(self.device_id).get(
+            "balance_workflow_id"
+        )
+        if not balance_workflow_id:
+            raise ValueError("Assign a Balance Check Workflow to this device.")
+        try:
+            workflow = self.workflows.read(balance_workflow_id)
+        except FileNotFoundError:
+            raise ValueError("Assigned Balance Check Workflow was not found.") from None
+        return balance_check_workflow(workflow)
+
+    def balance_readiness(self):
+        """Validate only the dedicated balance route and its safety contract."""
+        try:
+            self._balance_workflow()
+        except (KeyError, ValueError) as error:
+            self.invalidate_balance_configuration()
+            return False, str(error)
+        return True, None
+
+    def _pay(self, raw, account, workflow, *, dispatch_reservation=None):
         variables = normalize_locked_withdrawal(raw)
         # Workflow input declarations own their schema; ignore other API fields.
         values = {
@@ -348,6 +909,15 @@ class WithdrawWorker:
         }
         resolve_variables(workflow, values)
         with self.scheduler.lock:
+            if dispatch_reservation is not None:
+                if (
+                    self.scheduler.reservations.get(self.device_id)
+                    != dispatch_reservation
+                ):
+                    raise RecordConflict(
+                        "Selected phone no longer owns its dispatch reservation."
+                    )
+                del self.scheduler.reservations[self.device_id]
             if self.scheduler.next_job_for_device(self.device_id) is not None:
                 raise RecordConflict(
                     "Queued device work appeared before payment; review the held withdrawal."
@@ -360,9 +930,21 @@ class WithdrawWorker:
                 action="withdraw_v2",
                 recovery_workflow_id=workflow.get("recovery_workflow_id"),
             )
-            self.journal.update(self.device_id, phase="QUEUED", job_id=job.job_id)
+            self.journal.update(
+                self.device_id,
+                phase="QUEUED",
+                job_id=job.job_id,
+                workflow_id=workflow["id"],
+                workflow_signature=workflow_execution_signature(workflow),
+                workflow_step_ids=[step.get("id") for step in workflow["steps"]],
+                irreversible_step_indexes=irreversible_step_indexes(workflow),
+            )
             self.allowed_job = job.job_id
         self.executor.wake()
+        self._finish_payment_job(raw, job)
+
+    def _finish_payment_job(self, raw, job):
+        """Monitor an existing local payment job and preserve confirmation."""
         self.set_state("PAYING")
         while True:
             job = self.scheduler.get_job(job.job_id)
@@ -377,7 +959,10 @@ class WithdrawWorker:
                 raise ValueError(
                     "Payment interrupted or lock/session lost. Do not replay; reconciliation is required."
                 )
-            if job.status in {"FAILED", "INTERRUPTED", "CANCELLED"}:
+            if job.status in {"FAILED", "INTERRUPTED"}:
+                job = self._wait_for_retry(job)
+                continue
+            if job.status == "CANCELLED":
                 raise ValueError(
                     "Payment workflow did not prove success. Restore the phone and reconcile externally."
                 )
@@ -414,86 +999,175 @@ class WithdrawWorker:
         self.executor.wake()
         self.set_state("IDLE")
 
-    def cycle(self):
-        if not self.scheduler.is_device_ready(self.device_id)["ready"]:
-            self.cache.invalidate()
-            self.set_state("WAITING_FOR_DEVICE")
-            return
-        if self.scheduler.next_job_for_device(self.device_id) is not None:
-            self.cache.invalidate()
-            return
-        account, workflow = self._route()
-        if not self.config.get("balance_workflow_id"):
-            self.set_state(
-                "BALANCE_UNAVAILABLE",
-                "Assign a balance-check workflow before taking withdrawals.",
-            )
-            return
-        if not self.cache.valid():
-            self.set_state("READING_BALANCE")
-            balance = self.balance_provider.get_available_balance(self.device_id)
-            self.cache.observe(balance)
+    def session_available(self):
+        with self.lock:
+            state = self.state
+        return bool(
+            self.reconciliation_complete
+            and self.socket
+            and self.socket.connected
+            and self.reconciled_generation == self.socket.generation
+            and state not in {"NEEDS_ATTENTION", "CONFIGURATION_ERROR", "AUTH_FAILED"}
+        )
 
-        pending = self.request_pending()
-        item = select_pending(pending, self.cache.available_balance)
+    def dispatch_available(self):
+        with self.lock:
+            assigned = self.assigned
+            state = self.state
+            balance_refreshing = self.balance_refreshing
+        return bool(
+            self.session_available()
+            and not self.stop.is_set()
+            and not balance_refreshing
+            and assigned is None
+            and state
+            not in {
+                "NEEDS_ATTENTION",
+                "CONFIGURATION_ERROR",
+                "PAYING",
+                "CONFIRMING",
+                "DISPATCH_RESERVED",
+            }
+            and time.time() < self.session_max - 60
+        )
 
-        if item is None:
-            self.set_state("IDLE")
+    def mark_dispatch_reserved(self):
+        with self.lock:
+            self.state = "DISPATCH_RESERVED"
+            self.error = None
+
+    def accept_locked(self, raw, reservation):
+        """Hand a successfully locked withdrawal to this phone's worker thread."""
+        with self.lock:
+            if self.assigned is not None:
+                raise RecordConflict("Phone already owns a dispatched withdrawal.")
+            self.assigned = (raw, reservation)
+        self.wake.set()
+
+    def _execute_assigned(self):
+        with self.lock:
+            assignment = self.assigned
+            retry_job_id = self.retry_job_id
+        if assignment is None:
             return
+        raw, reservation = assignment
         try:
-            raw = self.lock_withdrawal(item)
+            if retry_job_id is not None:
+                self._finish_payment_job(raw, self.scheduler.get_job(retry_job_id))
+                return
+            account, workflow = self._route()
             if (
-                not self.cache.valid()
+                not self.cache.valid(context=self.balance_context())
                 or final_amount(raw) > self.cache.available_balance
             ):
-                self.release_withdrawal()  # No payment job has been created.
+                self.release_withdrawal()
                 return
-            self._pay(raw, account, workflow)
+            LOG.info(
+                "[withdraw-worker] starting workflow device=%s workflow=%s withdrawal=%s",
+                self.device_id,
+                workflow.get("name") or workflow.get("id"),
+                raw.get("id"),
+            )
+            self._pay(
+                raw,
+                account,
+                workflow,
+                dispatch_reservation=reservation,
+            )
         finally:
             self.stop_renewal()
+            with self.scheduler.lock:
+                if (
+                    reservation is not None
+                    and self.scheduler.reservations.get(self.device_id) == reservation
+                ):
+                    del self.scheduler.reservations[self.device_id]
+            with self.lock:
+                if self.assigned == assignment:
+                    self.assigned = None
+                if self.retry_job_id == retry_job_id:
+                    self.retry_job_id = None
+            if self.journal.current(self.device_id).get("phase") in TERMINAL:
+                self.set_state("IDLE")
+            if self.dispatcher:
+                self.dispatcher.wake()
+
+    def ensure_realtime(self):
+        """Authenticate this session and reconcile it once per physical generation."""
+        if self.reauthenticate.is_set():
+            self.disconnect_socket()
+            self.client.token = self.client.profile = None
+            self.session_max = 0
+            self.reauthenticate.clear()
+        refresh = self.client.profile is None or time.time() >= self.session_max - 60
+        if self.socket is None or refresh:
+            self.set_state("CONNECTING")
+            if refresh:
+                self.login()
+            self.connect_socket()
+        elif not self.socket.connected:
+            self.cache.invalidate()
+            self.reconciliation_complete = False
+            self.set_state("WAITING_FOR_CONNECTION")
+            if not self.socket.wait_ready(10):
+                return False
+
+        generation = self.socket.generation
+        if generation != self.reconciled_generation:
+            self.reconciliation_complete = False
+            reconciled = self.reconcile()
+            self.reconciliation_complete = True
+            if not reconciled:
+                self.reconciled_generation = generation
+                if self.dispatcher:
+                    self.dispatcher.wake()
+                return False
+            self.reconciled_generation = generation
+            if self.dispatcher:
+                self.dispatcher.wake()
+        if self.state in {
+            "STOPPED",
+            "CONNECTING",
+            "WAITING_FOR_CONNECTION",
+        }:
+            self.set_state("IDLE")
+        return True
 
     def run(self):
         backoff = 5
         while not self.stop.is_set():
             try:
-                if (
-                    self.socket is None
-                    or not self.socket.connected
-                    or time.time() >= self.session_max - 60
-                ):
-                    self.set_state("CONNECTING")
-                    if (
-                        self.client.profile is None
-                        or time.time() >= self.session_max - 60
-                    ):
-                        self.login()
-                    self.connect_socket()
-                    if not self.reconcile():
-                        self.wake.wait(60)
-                        self.wake.clear()
-                        self.disconnect_socket()
-                        continue
-                    self.next_pending = 0
-
-                stamp = time.monotonic()
-                # Invalidate during observable manual/recovery/disconnect states,
-                # including between periodic queue fetches.
-                if not self.scheduler.is_device_ready(self.device_id)["ready"]:
-                    self.cache.invalidate()
                 with self.lock:
-                    due = self.queue_due is not None and stamp >= self.queue_due
-                    if due:
-                        self.queue_due = None
-                if due or stamp >= self.next_pending:
-                    self.cycle()
-                    self.next_pending = time.monotonic() + 60
+                    has_assignment = self.assigned is not None
+                if has_assignment:
+                    with self.withdrawal_operation:
+                        self._execute_assigned()
+                else:
+                    if not self.ensure_realtime():
+                        if self.state == "NEEDS_ATTENTION":
+                            self.wake.wait(60)
+                            self.wake.clear()
+                        else:
+                            self.wake.wait(0.5)
+                            self.wake.clear()
+                        continue
+                    current = self.journal.current(self.device_id)
+                    if self._pending_retry(current) is not None:
+                        if self._adopt_pending_retry(current):
+                            continue
+                    self._maybe_refresh_balance()
 
                 backoff = 5
                 self.wake.wait(0.5)
                 self.wake.clear()
             except Exception as exc:
                 self.cache.invalidate()
+                if self.stop.is_set():
+                    break
                 current = self.journal.current(self.device_id)
+                requires_intervention = isinstance(
+                    exc, (AuthenticationFailed, ValueError)
+                ) or (isinstance(exc, APIError) and exc.code in {403, 422})
                 if current and current.get("phase") not in TERMINAL:
                     self.attention(
                         "Withdrawal state is unresolved. Manual/external reconciliation is required."
@@ -501,9 +1175,13 @@ class WithdrawWorker:
                 else:
                     self.set_state(
                         (
-                            "CONFIGURATION_ERROR"
-                            if isinstance(exc, ValueError)
-                            else "WAITING_FOR_CONNECTION"
+                            "AUTH_FAILED"
+                            if isinstance(exc, AuthenticationFailed)
+                            else (
+                                "CONFIGURATION_ERROR"
+                                if requires_intervention
+                                else "WAITING_FOR_CONNECTION"
+                            )
                         ),
                         (
                             str(exc)
@@ -513,26 +1191,32 @@ class WithdrawWorker:
                     )
                 if isinstance(exc, APIError) and exc.code == 401:
                     self.client.token = self.client.profile = None
-                self.disconnect_socket()
+                self.reconciled_generation = 0
+                self.reconciliation_complete = False
 
-                if isinstance(exc, APIError) and exc.code in (403, 422):
-                    self.set_state("CONFIGURATION_ERROR", str(exc))
-                    break
+                if requires_intervention:
+                    # Remove only this logical session. Other phones continue on
+                    # the shared socket. A deliberate reconnect/status action can
+                    # wake this worker after credentials or remote state changes.
+                    self.disconnect_socket()
+                    self.wake.wait()
+                    self.wake.clear()
+                    backoff = 5
+                    continue
                 delay = (
                     exc.retry_after
                     if isinstance(exc, APIError) and exc.code == 429
                     else backoff
                 )
-                self.stop.wait(delay)
+                self.wake.wait(delay)
+                self.wake.clear()
                 backoff = min(60, backoff * 2)
 
         self.stop_renewal()
         self.disconnect_socket()
         # Logout releases locks. Never logout an unresolved/uncertain withdrawal.
-        if (
-            self.client.token
-            and self.journal.current(self.device_id).get("phase") in TERMINAL
-        ):
+        current = self.journal.current(self.device_id)
+        if self.client.token and (not current or current.get("phase") in TERMINAL):
             try:
                 self.client.logout()
             except APIError:

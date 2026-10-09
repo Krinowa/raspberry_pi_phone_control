@@ -181,18 +181,25 @@ class JobScheduler:
             )
             return self.store.create(job)
 
-    def create_retry(self, job_id, mode):
+    def create_retry(self, job_id, mode, *, withdraw_authorized=False):
         """Create a new, device-pinned job after explicit phone recovery."""
         with self.lock:
             original = self.get_job(job_id)
 
-            if original.action == "withdraw_v2":
+            if original.action == "withdraw_v2" and not withdraw_authorized:
                 raise RecordConflict(
-                    "Withdraw Bot payments cannot be retried locally. Reconcile the external transaction first."
+                    "Withdraw Bot retry requires integration safety validation."
                 )
             if original.status not in {"FAILED", "INTERRUPTED"}:
                 raise RecordConflict("Only failed or interrupted jobs can be retried.")
-            if original.recovery_status != "READY":
+            allowed_recovery_states = {"READY"}
+            if original.action == "withdraw_v2" and withdraw_authorized:
+                # Choosing either Withdraw retry mode is itself an explicit
+                # recovery decision. The retry may remain waiting for a live
+                # Withdraw session, but its durable creation must not depend on
+                # the old session or recovery worker still existing.
+                allowed_recovery_states.add("NEEDS_ATTENTION")
+            if original.recovery_status not in allowed_recovery_states:
                 raise RecordConflict(
                     "The phone must be restored and marked ready before retrying."
                 )
@@ -206,6 +213,21 @@ class JobScheduler:
                 start_step_index = 0
             else:
                 raise ValueError("Retry mode must be failed_step or restart.")
+
+            if any(
+                candidate.status in PENDING_JOB_STATES | {"RUNNING"}
+                and (
+                    candidate.retry_of_job_id == original.job_id
+                    or (
+                        original.action == "withdraw_v2"
+                        and candidate.action == "withdraw_v2"
+                        and candidate.device_id == original.device_id
+                        and candidate.external_ref == original.external_ref
+                    )
+                )
+                for candidate in self.list_jobs()
+            ):
+                raise RecordConflict("A retry for this job is already active.")
 
             ready = self.is_device_ready(original.device_id)["ready"]
             retry = Job.create(
@@ -221,7 +243,17 @@ class JobScheduler:
                 retry_of_job_id=original.job_id,
                 start_step_index=start_step_index,
             )
-            return self.store.create(retry)
+            retry = self.store.create(retry)
+            if original.recovery_status == "NEEDS_ATTENTION":
+                self.store.replace(
+                    replace(
+                        original,
+                        recovery_status="READY",
+                        recovered_at=now(),
+                        recovery_error=None,
+                    )
+                )
+            return retry
 
     def get_job(self, job_id):
         return self.store.get(job_id)

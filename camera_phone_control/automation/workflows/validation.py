@@ -7,7 +7,7 @@ import re
 import unicodedata
 from copy import deepcopy
 from ..coordinates import unit, normalized_roi
-from .models import STEP_TYPES, VARIABLE_TYPES
+from .models import STEP_TYPES, VARIABLE_TYPES, WORKFLOW_PURPOSES
 
 IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,79}")
 SENSITIVE = re.compile(
@@ -97,6 +97,10 @@ def normalize_workflow(workflow):
     if not isinstance(workflow, dict):
         return workflow
     normalized = deepcopy(workflow)
+    # Version 1 workflows created before purpose metadata were ordinary
+    # payment/automation recipes. Startup migration upgrades the safe subset
+    # already assigned as balance readers before normal reads begin.
+    normalized.setdefault("purpose", "payment")
     normalized.pop("visual_references", None)
     steps = normalized.get("steps")
     if isinstance(steps, list):
@@ -211,6 +215,7 @@ def validate_workflow(workflow, *, allow_empty=False):
             "created_at",
             "updated_at",
             "financial",
+            "purpose",
             "recovery_workflow_id",
         },
         {"id", "name", "version", "variables", "steps"},
@@ -223,6 +228,8 @@ def validate_workflow(workflow, *, allow_empty=False):
         raise ValueError("Unsupported workflow version.")
     if type(workflow.get("financial", False)) is not bool:
         raise ValueError("financial must be a boolean.")
+    if workflow.get("purpose") not in WORKFLOW_PURPOSES:
+        raise ValueError("Workflow purpose must be payment or balance_check.")
 
     recovery_workflow_id = workflow.get("recovery_workflow_id")
     if recovery_workflow_id is not None:
@@ -327,6 +334,7 @@ def validate_workflow(workflow, *, allow_empty=False):
                 "sensitive",
                 "input_method",
                 "keyboard_id",
+                "amount_format",
             },
             "key": {"key"},
             "wait": {"seconds"},
@@ -518,6 +526,17 @@ def validate_workflow(workflow, *, allow_empty=False):
                     raise ValueError("Manual inputs cannot contain stored values.")
             else:
                 raise ValueError("Input source must be fixed, variable, or manual.")
+            if "amount_format" in step:
+                if source != "variable" or step.get("variable") != "amount":
+                    raise ValueError(
+                        "Amount input format is only valid for the amount variable."
+                    )
+                if step["amount_format"] not in {
+                    "raw",
+                    "implied_cents",
+                    "whole_number",
+                }:
+                    raise ValueError("Unsupported amount input format.")
             input_method = step.get("input_method", "hid")
             if source == "manual":
                 if "input_method" in step or "keyboard_id" in step:

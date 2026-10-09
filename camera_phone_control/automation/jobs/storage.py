@@ -195,6 +195,23 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
             self._save(assignments)
         return tuple(normalized)
 
+    def set_routes(self, device_id, workflow_ids, balance_workflow_id):
+        """Atomically persist the main and balance routes for one device."""
+        validate_device_id(device_id)
+        if not isinstance(workflow_ids, list) or len(workflow_ids) > 1:
+            raise ValueError("Only one workflow can be assigned to a phone.")
+        normalized = [identifier(workflow_id) for workflow_id in workflow_ids]
+        balance = (
+            identifier(balance_workflow_id) if balance_workflow_id is not None else None
+        )
+        with self.lock:
+            records = self._read()
+            record = records.setdefault(device_id, {})
+            record["allowed_workflow_ids"] = normalized
+            record["balance_workflow_id"] = balance
+            self._write(records)
+        return tuple(normalized), balance
+
     def delete(self, device_id):
         validate_device_id(device_id)
         with self.lock:

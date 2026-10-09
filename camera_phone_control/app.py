@@ -40,6 +40,7 @@ from automation.diagnostics import install_recent_log_handler
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
 from automation.jobs.storage import DeviceWorkflowAssignmentStore
+from automation.integrations.withdraw_v2.balance import balance_check_workflow
 from automation.integrations.withdraw_v2.manager import register_withdraw
 from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
 from hardware.device_config import DEFAULT_DEVICE_ID
@@ -651,13 +652,26 @@ def create_app(
     def workflow_assignment_details(device_id, *, include_available=False):
         store = app.extensions["device_workflow_assignment_store"]
         allowed = store.get(device_id)
-        workflows = app.extensions["workflow_storage"].list()
+        integration = store.integration(device_id)
+        balance_workflow_id = integration.get("balance_workflow_id")
+        workflow_storage = app.extensions["workflow_storage"]
+        workflows = workflow_storage.list()
+        if include_available:
+            for item in workflows:
+                try:
+                    balance_check_workflow(workflow_storage.read(item["id"]))
+                    item["balance_check_eligible"] = True
+                    item["balance_check_error"] = None
+                except ValueError as error:
+                    item["balance_check_eligible"] = False
+                    item["balance_check_error"] = str(error)
         known = {item["id"]: item for item in workflows}
         assigned_ids = list(known) if allowed is None else list(allowed)
         assigned = [
             {
                 "id": workflow_id,
                 "name": known.get(workflow_id, {}).get("name"),
+                "purpose": known.get(workflow_id, {}).get("purpose"),
                 "missing": workflow_id not in known,
             }
             for workflow_id in assigned_ids
@@ -671,6 +685,20 @@ def create_app(
             "missing_workflow_ids": [
                 workflow_id for workflow_id in assigned_ids if workflow_id not in known
             ],
+            "balance_workflow_id": balance_workflow_id,
+            "balance_workflow": (
+                {
+                    "id": balance_workflow_id,
+                    "name": known.get(balance_workflow_id, {}).get("name"),
+                    "purpose": known.get(balance_workflow_id, {}).get("purpose"),
+                    "missing": balance_workflow_id not in known,
+                    "balance_check_eligible": known.get(balance_workflow_id, {}).get(
+                        "balance_check_eligible", False
+                    ),
+                }
+                if balance_workflow_id
+                else None
+            ),
         }
         if include_available:
             result["available_workflows"] = workflows
@@ -870,29 +898,54 @@ def create_app(
 
         data = payload()
 
-        if set(data) != {"workflow_ids"} or not isinstance(data["workflow_ids"], list):
-            raise ValueError("Expected workflow_ids list only.")
+        if (
+            not isinstance(data, dict)
+            or "workflow_ids" not in data
+            or set(data) - {"workflow_ids", "balance_workflow_id"}
+            or not isinstance(data["workflow_ids"], list)
+        ):
+            raise ValueError("Expected workflow_ids and optional balance_workflow_id.")
 
         if len(data["workflow_ids"]) > 1:
             raise ValueError("Only one workflow can be assigned to a phone.")
 
         workflow_storage = app.extensions["workflow_storage"]
+        assignment_store = app.extensions["device_workflow_assignment_store"]
+        balance_workflow_id = data.get(
+            "balance_workflow_id",
+            assignment_store.integration(device_id)["balance_workflow_id"],
+        )
+        if balance_workflow_id is not None and not isinstance(balance_workflow_id, str):
+            raise ValueError("balance_workflow_id must be a workflow ID or null.")
 
-        for workflow_id in data["workflow_ids"]:
+        loaded_workflows = {}
+        for workflow_id in [*data["workflow_ids"], balance_workflow_id]:
+            if workflow_id is None:
+                continue
             try:
-                workflow_storage.read(workflow_id)
+                loaded_workflows[workflow_id] = workflow_storage.read(workflow_id)
             except FileNotFoundError:
                 raise ValueError(
                     f"Workflow {workflow_id!r} does not exist and cannot be assigned."
                 ) from None
+
+        for workflow_id in data["workflow_ids"]:
+            if loaded_workflows[workflow_id].get("purpose") != "payment":
+                raise ValueError(
+                    "Only a Payment purpose workflow can be assigned as the "
+                    "Payment Workflow."
+                )
+
+        if balance_workflow_id is not None:
+            balance_check_workflow(loaded_workflows[balance_workflow_id])
 
         withdraw_manager = app.extensions.get("withdraw_manager")
         if withdraw_manager is not None:
             withdraw_manager.workflow_assignment_changed(
                 device_id, data["workflow_ids"]
             )
-        app.extensions["device_workflow_assignment_store"].set(
-            device_id, data["workflow_ids"]
+        assignment_store.set_routes(
+            device_id, data["workflow_ids"], balance_workflow_id
         )
         if withdraw_manager is not None:
             withdraw_manager.reload_after_workflow_assignment(device_id)
@@ -1507,6 +1560,43 @@ def create_app(
         admin_required=local_dashboard_access,
         require_admin=allow_local_dashboard,
     )
+    assignment_store = app.extensions["device_workflow_assignment_store"]
+    legacy_balance_workflow_ids = {
+        integration["balance_workflow_id"]
+        for integration in assignment_store.integrations().values()
+        if integration.get("balance_workflow_id")
+    }
+    workflow_store = app.extensions["workflow_storage"]
+    workflow_store.migrate_legacy_purposes(
+        legacy_balance_workflow_ids,
+        balance_check_workflow,
+    )
+    # A legacy workflow may have occupied both roles. Once it is classified as
+    # Balance Check it must not remain silently authorized as the device's
+    # Payment Workflow. Preserve the balance route and clear only that
+    # incompatible payment assignment.
+    for assigned_device_id, integration in assignment_store.integrations().items():
+        allowed = assignment_store.get(assigned_device_id)
+        if not allowed:
+            continue
+        try:
+            incompatible = any(
+                workflow_store.read(workflow_id).get("purpose") != "payment"
+                for workflow_id in allowed
+            )
+        except FileNotFoundError:
+            incompatible = False
+        if incompatible:
+            assignment_store.set_routes(
+                assigned_device_id,
+                [],
+                integration.get("balance_workflow_id"),
+            )
+            LOG.warning(
+                "Cleared incompatible Payment Workflow assignment for %s after "
+                "workflow-purpose migration.",
+                assigned_device_id,
+            )
     register_jobs(
         app,
         state,

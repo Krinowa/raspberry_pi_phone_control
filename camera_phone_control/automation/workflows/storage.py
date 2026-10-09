@@ -83,6 +83,50 @@ class WorkflowStorage:
                     os.unlink(temporary)
             return data
 
+    def migrate_legacy_purposes(self, balance_workflow_ids, balance_validator):
+        """Persist deterministic purpose metadata on pre-purpose documents.
+
+        Legacy workflows default to payment. A workflow already assigned as a
+        balance route is promoted only when the existing safety validator says
+        its structured steps are safe; names are deliberately ignored.
+        """
+        balance_workflow_ids = set(balance_workflow_ids)
+        migrated = []
+        with self.lock:
+            for path in sorted(self.directory.glob("*.json")):
+                if path.is_symlink():
+                    continue
+                with path.open(encoding="utf-8") as stream:
+                    raw = json.load(stream)
+                if not isinstance(raw, dict) or "purpose" in raw:
+                    continue
+                purpose = "payment"
+                if raw.get("id") in balance_workflow_ids:
+                    candidate = {**raw, "purpose": "balance_check"}
+                    try:
+                        balance_validator(candidate)
+                    except ValueError:
+                        pass
+                    else:
+                        purpose = "balance_check"
+                candidate = {**raw, "purpose": purpose}
+                validate_workflow(candidate)
+                fd, temporary = tempfile.mkstemp(
+                    dir=self.directory, prefix=".workflow-purpose-", suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "w") as stream:
+                        json.dump(candidate, stream, indent=2, allow_nan=False)
+                        stream.write("\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+                migrated.append((candidate["id"], purpose))
+        return migrated
+
     def delete(self, workflow_id):
         with self.lock:
             if self._recovery_referrers(workflow_id):
@@ -115,6 +159,7 @@ class WorkflowStorage:
                         for key in (
                             "id",
                             "name",
+                            "purpose",
                             "created_at",
                             "updated_at",
                             "recovery_workflow_id",

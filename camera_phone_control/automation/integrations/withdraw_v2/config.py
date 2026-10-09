@@ -169,9 +169,14 @@ def validate_configuration(data):
     ):
         raise ValueError("payment_records must contain safe text identifiers.")
     api["payment_records"] = records
+    # Backward-compatible dual cadence: observations older than this become
+    # stale (their value is retained), and insufficient pending work is read
+    # again no sooner than this interval.
     refresh = api.get("balance_refresh_seconds", 60)
     if type(refresh) not in (int, float) or not 1 <= refresh <= 300:
-        raise ValueError("Balance refresh interval must be 1–300 seconds.")
+        raise ValueError(
+            "Balance freshness and pending-retry interval must be 1–300 seconds."
+        )
     if api["enabled"] and not all(
         api.get(key)
         for key in ("base_url", "operator_id", "username", "credential_reference")
