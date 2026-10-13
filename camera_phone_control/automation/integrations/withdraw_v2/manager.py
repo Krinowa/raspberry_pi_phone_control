@@ -6,7 +6,11 @@ import threading
 from pathlib import Path
 
 from automation.jobs.storage import RecordConflict, RecordNotFound
-from .balance import CameraOCRBalanceProvider, balance_check_workflow
+from .balance import (
+    CameraOCRBalanceProvider,
+    balance_check_workflow,
+    final_amount as withdrawal_final_amount,
+)
 from .client import APIError, WithdrawClient
 from .config import WithdrawCredentialStore
 from .dispatcher import WithdrawDispatcher
@@ -15,9 +19,7 @@ from .socket import SharedPusherTransport
 from .worker import (
     WithdrawWorker,
     expiry,
-    irreversible_step_indexes,
     payment_workflow,
-    workflow_execution_signature,
 )
 from automation.workflows.values import parse_currency
 from flask import jsonify, request
@@ -62,6 +64,7 @@ class WithdrawManager:
         self.realtime_transport = realtime_transport or SharedPusherTransport()
         self.enabled = start_workers
         self.workers = {}
+        self.account_binding_errors = {}
         self.lock = threading.RLock()
         self.dispatcher = WithdrawDispatcher(
             lambda: self.workers, scheduler, self.journal
@@ -79,7 +82,7 @@ class WithdrawManager:
             lambda device: assignments.integration(device)["balance_workflow_id"],
         )
 
-        scheduler.integration_gate = self.blocked
+        scheduler.integration_gate = self.withdraw_job_blocked
         # Brand-new queued payments from a previous process are never replayed.
         # Operator-created retries remain gated for fresh-session adoption.
         # A journal write can fail after enqueue; scan jobs as well as the journal.
@@ -94,19 +97,133 @@ class WithdrawManager:
                 and not job.retry_of_job_id
             ):
                 scheduler.cancel_job(job.job_id)
-                self.journal.update(
-                    job.device_id,
-                    phase="NEEDS_ATTENTION",
-                    job_id=job.job_id,
-                    tx_id=job.external_ref,
-                    error="Queued withdrawal was interrupted by restart and was not replayed.",
-                )
+                self._recover_interrupted_job(job)
 
         for device_id, config in assignments.integrations().items():
             if config["withdraw_api"]["enabled"]:
                 self._create(device_id, config)
         if self.enabled:
             self.dispatcher.start()
+
+    @staticmethod
+    def _startup_recovery_fields(job):
+        """Rebuild only identity that is durably and consistently stored on job."""
+        metadata = (
+            job.protected_metadata if isinstance(job.protected_metadata, dict) else {}
+        )
+        anchored = (
+            metadata.get("version") == 1
+            and metadata.get("assigned_device_id") == job.device_id
+            and metadata.get("account_id") == job.account_id
+            and metadata.get("tx_id") == job.external_ref
+            and metadata.get("workflow_id") == job.workflow
+        )
+        raw = metadata.get("raw_withdrawal") if anchored else None
+        if not isinstance(raw, dict):
+            raw = None
+        withdraw_id = metadata.get("withdraw_id") if anchored else None
+        if type(withdraw_id) is not int or withdraw_id <= 0:
+            withdraw_id = None
+        if raw is not None and (
+            raw.get("id") != withdraw_id or raw.get("tx_id") != job.external_ref
+        ):
+            raw = None
+
+        operator_id = metadata.get("operator_id") if anchored else None
+        lock_expires_at = metadata.get("lock_expires_at") if anchored else None
+        final_amount = metadata.get("final_amount") if anchored else None
+        if raw is not None and raw.get("lock_expires_at") != lock_expires_at:
+            raw = None
+            lock_expires_at = None
+        if raw is not None:
+            try:
+                amount_matches = (
+                    format(withdrawal_final_amount(raw), ".2f") == final_amount
+                )
+            except (TypeError, ValueError):
+                amount_matches = False
+            if not amount_matches:
+                final_amount = None
+        if final_amount is None and isinstance(job.payload, dict):
+            amount = job.payload.get("amount")
+            final_amount = amount if isinstance(amount, str) and amount else None
+
+        missing = [
+            name
+            for name, value in (
+                ("withdraw_id", withdraw_id),
+                ("tx_id", job.external_ref),
+                ("operator_id", operator_id),
+                ("raw_withdrawal", raw),
+                ("lock_expires_at", lock_expires_at),
+                ("final_amount", final_amount),
+            )
+            if value is None
+        ]
+        return {
+            "phase": "NEEDS_ATTENTION",
+            "withdraw_id": withdraw_id,
+            "tx_id": job.external_ref,
+            "assigned_device_id": job.device_id,
+            "operator_id": operator_id,
+            "account_id": job.account_id,
+            "workflow_id": job.workflow,
+            "job_id": job.job_id,
+            "retry_of_job_id": job.retry_of_job_id,
+            "final_amount": final_amount,
+            "raw_withdrawal": raw,
+            "lock_expires_at": lock_expires_at,
+            "recovery_identity_complete": not missing,
+            "missing_recovery_fields": missing,
+            "error": "Queued withdrawal was interrupted by restart and was not replayed.",
+        }
+
+    def _recover_interrupted_job(self, job):
+        fields = self._startup_recovery_fields(job)
+        current = self.journal.current(job.device_id)
+        if current:
+            identity_fields = (
+                "withdraw_id",
+                "tx_id",
+                "assigned_device_id",
+                "operator_id",
+                "account_id",
+                "workflow_id",
+                "job_id",
+            )
+            conflicts = [
+                name
+                for name in identity_fields
+                if current.get(name) is not None
+                and fields.get(name) is not None
+                and current[name] != fields[name]
+            ]
+            if conflicts:
+                LOG.error(
+                    "Startup recovery preserved conflicting journal for job %s; fields=%s",
+                    job.job_id,
+                    ",".join(conflicts),
+                )
+                return False
+            self.journal.update(
+                job.device_id,
+                phase="NEEDS_ATTENTION",
+                job_id=job.job_id,
+                workflow_id=current.get("workflow_id") or job.workflow,
+                account_id=current.get("account_id") or job.account_id,
+                error=fields["error"],
+            )
+            return True
+        try:
+            self.journal.recover_missing(job.device_id, **fields)
+        except RecordConflict as error:
+            LOG.error(
+                "Startup recovery did not overwrite journal for job %s: %s",
+                job.job_id,
+                error,
+            )
+            return False
+        return True
 
     def workflow_completed(self, snapshot):
         """Publish a successful explicit balance read to its own device cache."""
@@ -153,7 +270,7 @@ class WithdrawManager:
         )
         self.dispatcher.wake()
 
-    def blocked(self, device_id):
+    def withdraw_job_blocked(self, device_id):
         record = self.journal.current(device_id)
         if not record or record.get("phase") in TERMINAL:
             return False
@@ -189,6 +306,11 @@ class WithdrawManager:
             realtime_transport=self.realtime_transport,
             dispatcher=self.dispatcher,
             credentials=self.credential_store.load,
+            account_binding_provisioner=lambda: self._provision_withdraw_account_binding(
+                device_id,
+                config["withdraw_api"]["operator_id"],
+                config["withdraw_api"]["username"],
+            ),
         )
         self.workers[device_id] = worker
         if self.enabled:
@@ -256,10 +378,18 @@ class WithdrawManager:
             allowed = self.assignments.get(device_id)
             if not allowed or len(allowed) != 1:
                 raise ValueError("Assign one main payment workflow to this device.")
-            if not any(
+            has_account = any(
                 account.device_id == device_id and account.enabled
                 for account in self.accounts.list()
-            ):
+            )
+            if has_account:
+                with self.lock:
+                    self.account_binding_errors.pop(device_id, None)
+            else:
+                with self.lock:
+                    provisioning_error = self.account_binding_errors.get(device_id)
+                if provisioning_error:
+                    raise ValueError(provisioning_error)
                 raise ValueError("Assign an enabled local account to this device.")
             payment_workflow(self.workflows.read(allowed[0]))
 
@@ -269,6 +399,99 @@ class WithdrawManager:
         except (KeyError, RecordNotFound, ValueError) as error:
             return False, str(error)
         return True, None
+
+    def _ensure_withdraw_account_binding(self, device_id, operator_id, username):
+        """Keep the existing job router usable for a validated Withdraw operator."""
+        account_id = f"withdraw_operator_{operator_id}"
+        bindings = self.accounts.list()
+        assigned = next(
+            (account for account in bindings if account.device_id == device_id), None
+        )
+        if assigned is not None:
+            if assigned.enabled:
+                return assigned
+            raise RecordConflict(
+                f"Local account {assigned.account_id!r} for {device_id} is disabled; "
+                "enable it before using Withdraw Bot."
+            )
+
+        conflict = next(
+            (
+                account
+                for account in bindings
+                if account.account_id == account_id and account.device_id != device_id
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise RecordConflict(
+                f"Withdraw compatibility account {account_id!r} is already assigned "
+                f"to {conflict.device_id}; refusing to overwrite it."
+            )
+
+        try:
+            return self.accounts.create(
+                {
+                    "account_id": account_id,
+                    "display_name": username,
+                    "provider": None,
+                    "device_id": device_id,
+                    "enabled": True,
+                }
+            )
+        except RecordConflict:
+            # Another request/process may have created a binding after list().
+            # Accept only the same safe outcomes; never move or overwrite one.
+            bindings = self.accounts.list()
+            assigned = next(
+                (
+                    account
+                    for account in bindings
+                    if account.device_id == device_id and account.enabled
+                ),
+                None,
+            )
+            if assigned is not None:
+                return assigned
+            conflict = next(
+                (account for account in bindings if account.account_id == account_id),
+                None,
+            )
+            if conflict is not None and conflict.device_id != device_id:
+                raise RecordConflict(
+                    f"Withdraw compatibility account {account_id!r} is already "
+                    f"assigned to {conflict.device_id}; refusing to overwrite it."
+                ) from None
+            raise
+
+    def _provision_withdraw_account_binding(self, device_id, operator_id, username):
+        """Attempt local routing setup without affecting the external session."""
+        try:
+            self._ensure_withdraw_account_binding(device_id, operator_id, username)
+        except Exception as error:
+            if isinstance(error, (OSError, TypeError, ValueError)):
+                detail = str(error) or type(error).__name__
+            else:
+                LOG.exception(
+                    "Unexpected Withdraw account binding failure device_id=%s",
+                    device_id,
+                )
+                detail = "local account binding persistence failed"
+            message = f"Local payment routing could not be initialized: {detail}"
+            with self.lock:
+                self.account_binding_errors[device_id] = message
+            LOG.error("%s", message)
+        else:
+            message = None
+            with self.lock:
+                self.account_binding_errors.pop(device_id, None)
+            self.dispatcher.wake()
+
+        worker = self.workers.get(device_id)
+        set_error = getattr(worker, "set_account_binding_error", None)
+        if callable(set_error):
+            set_error(message)
+        return message
 
     def balance_readiness(self, device_id):
         """Validate the explicitly assigned, non-payment balance route."""
@@ -382,6 +605,49 @@ class WithdrawManager:
             )
 
     @staticmethod
+    def _same_withdraw_identity(api, origin, operator_id):
+        """Compare the stable external identity, not its editable display name."""
+        return bool(
+            api.get("operator_id") == operator_id and api.get("base_url") == origin
+        )
+
+    def _reauthenticate_same_account(self, device_id, config, client):
+        """Refresh one assigned operator without invoking account-change guards."""
+        with self.lock:
+            normalized = self.assignments.set_integration(device_id, config)
+            worker = self.workers.get(device_id)
+            if (
+                worker is not None
+                and worker.thread is not None
+                and worker.thread.is_alive()
+            ):
+                worker.adopt_authenticated_client(client, normalized)
+                self.dispatcher.wake()
+                return normalized
+            stale = worker
+            if stale is not None:
+                stale.stop.set()
+                stale.wake.set()
+
+        if stale is not None:
+            stale.close()
+
+        with self.lock:
+            current = self.workers.get(device_id)
+            if current is stale or current is None:
+                self.workers.pop(device_id, None)
+                self._create(device_id, normalized, client=client)
+            else:
+                if current.thread and current.thread.is_alive():
+                    current.adopt_authenticated_client(client, normalized)
+                else:
+                    raise RecordConflict(
+                        "Withdraw session is still stopping; reconnect again shortly."
+                    )
+            self.dispatcher.wake()
+            return normalized
+
+    @staticmethod
     def _login_error(error):
         if isinstance(error, ValueError):
             return ValueError(
@@ -421,7 +687,6 @@ class WithdrawManager:
         if not isinstance(secret, str) or not secret.strip() or len(secret) > 256:
             raise ValueError("Google 2FA secret is required.")
 
-        self._ensure_account_change_safe(device_id)
         current = self.assignments.integration(device_id)
         api = current["withdraw_api"]
         base_url = api.get("base_url") or os.environ.get("WITHDRAW_API_BASE_URL")
@@ -476,6 +741,12 @@ class WithdrawManager:
                     )
                 payment_records.append(value)
 
+            same_identity = self._same_withdraw_identity(
+                api, client.origin, operator_id
+            )
+            if not same_identity:
+                self._ensure_account_change_safe(device_id)
+
             for other_device, other in self.assignments.integrations().items():
                 other_api = other["withdraw_api"]
                 if (
@@ -505,11 +776,18 @@ class WithdrawManager:
             }
             old_reference = api.get("credential_reference")
             try:
-                self.configure(
-                    device_id,
-                    replacement,
-                    authenticated_client=client,
-                )
+                if same_identity:
+                    self._reauthenticate_same_account(
+                        device_id,
+                        replacement,
+                        client,
+                    )
+                else:
+                    self.configure(
+                        device_id,
+                        replacement,
+                        authenticated_client=client,
+                    )
                 client_transferred = True
             except Exception:
                 self.credential_store.delete(new_reference)
@@ -643,7 +921,15 @@ class WithdrawManager:
                 return self.scheduler.create_retry(job_id, mode)
             if original.status not in {"FAILED", "INTERRUPTED"}:
                 raise RecordConflict("Only failed or interrupted jobs can be retried.")
-            if original.recovery_status not in {"READY", "NEEDS_ATTENTION"}:
+            if mode == "restart" and original.recovery_status != "READY":
+                raise RecordConflict(
+                    "Phone is not verified ready. Use Manual Assistance and "
+                    "Verify Phone Ready before restarting the workflow."
+                )
+            if mode == "failed_step" and original.recovery_status not in {
+                "READY",
+                "NEEDS_ATTENTION",
+            }:
                 raise RecordConflict(
                     "The phone must be restored and marked ready before retrying."
                 )
@@ -672,23 +958,9 @@ class WithdrawManager:
 
             workflow = self.workflows.read(original.workflow)
             steps = workflow.get("steps", [])
-            recorded_step_ids = current.get("workflow_step_ids")
-            current_step_ids = [step.get("id") for step in steps]
-            recorded_irreversible = current.get("irreversible_step_indexes")
-            current_irreversible = irreversible_step_indexes(workflow)
-            if (
-                current.get("workflow_id") != original.workflow
-                or current.get("workflow_signature")
-                != workflow_execution_signature(workflow)
-                or recorded_step_ids != current_step_ids
-                or recorded_irreversible != current_irreversible
-            ):
+            if current.get("workflow_id") != original.workflow:
                 raise RecordConflict(
-                    "Retry unavailable because the payment workflow changed or its irreversible boundary was not recorded for the original run. Reconcile the withdrawal first."
-                )
-            if len(recorded_irreversible) != 1:
-                raise RecordConflict(
-                    "Retry unavailable because the original payment workflow did not record exactly one irreversible payment-submission step."
+                    "The current withdrawal does not reference the failed job's workflow."
                 )
             if mode == "failed_step":
                 failed = original.failed_step_index
@@ -698,7 +970,7 @@ class WithdrawManager:
                     )
                 if steps[failed].get("id") != original.failed_step_id:
                     raise RecordConflict(
-                        "Retry unavailable because the payment workflow changed after the failure."
+                        "The failed workflow step no longer exists at its original index; restart the workflow instead."
                     )
             elif mode == "restart":
                 pass

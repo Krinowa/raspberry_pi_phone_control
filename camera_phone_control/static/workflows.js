@@ -153,12 +153,23 @@
     return element;
   }
 
+  function scrollToSavedFlows() {
+    requestAnimationFrame(() => {
+      $("saved-flow-panel")?.scrollIntoView({
+        block: "start",
+        behavior: "smooth",
+      });
+    });
+  }
+
   let expectedActionId = null,
     expectedMode = null,
     expectedOriginalROI = null,
     keyboardSetupOpen = false,
     variableInputOpen = false,
     readValueOpen = false,
+    liveWaitOpen = false,
+    addStepType = "wait",
     returnToVariableInput = false,
     alternateSetupOpen = false,
     specialCaseAfterStepId = null,
@@ -171,6 +182,7 @@
     !!recording.keyboard_capture ||
     variableInputOpen ||
     readValueOpen ||
+    liveWaitOpen ||
     alternateSetupOpen;
 
   function keyboardOptions(select, captureOption = false) {
@@ -441,6 +453,55 @@
       step,
     };
   }
+
+  const addStepSections = {
+    wait: "add-step-wait",
+    wait_for_text: "add-step-text",
+    capture_screen: "add-step-screenshot",
+    ocr_value: "add-step-value",
+  };
+
+  function renderAddStepType() {
+    for (const [type, id] of Object.entries(addStepSections)) {
+      $(id).hidden = addStepType !== type;
+    }
+
+    document.querySelectorAll("[data-add-step-type]").forEach((button) => {
+      button.setAttribute(
+        "aria-pressed",
+        String(button.dataset.addStepType === addStepType),
+      );
+    });
+  }
+
+  function closeAddStep() {
+    $("review-insert").open = false;
+    addStepType = "wait";
+    renderAddStepType();
+  }
+
+  document.querySelectorAll("[data-add-step-type]").forEach((button) => {
+    button.addEventListener("click", () => {
+      addStepType = button.dataset.addStepType;
+      renderAddStepType();
+
+      const focusTarget = {
+        wait: "record-wait-seconds",
+        wait_for_text: "record-text-value",
+        ocr_value: "record-value-preset",
+      }[addStepType];
+
+      if (focusTarget) requestAnimationFrame(() => $(focusTarget)?.focus());
+    });
+  });
+
+  document.querySelectorAll("[data-add-step-cancel]").forEach((button) => {
+    button.addEventListener("click", closeAddStep);
+  });
+
+  $("review-insert").addEventListener("toggle", () => {
+    if ($("review-insert").open) renderAddStepType();
+  });
 
   function renderTimeline() {
     const draft = recording.workflow;
@@ -754,6 +815,21 @@
 
     $("record-live").hidden = !live;
 
+    const waitControls = $("record-wait-controls");
+    const waitSlot = live
+      ? $("record-wait-live-slot")
+      : $("record-wait-review-slot");
+
+    if (waitControls.parentElement !== waitSlot) {
+      waitSlot.append(waitControls);
+    }
+
+    $("record-wait-live-slot").hidden = !live || !liveWaitOpen;
+    waitControls.hidden = live && !liveWaitOpen;
+    $("record-wait").textContent = live ? "Add Wait" : "Insert Wait";
+
+    if (!live) renderAddStepType();
+
     $("review-flow").hidden = !draft || live;
 
     $("saved-flow-panel").hidden = !!draft;
@@ -787,6 +863,7 @@
 
     $("record-expect-current").disabled = stopping || annotationBusy();
     $("record-read-value").disabled = stopping || annotationBusy();
+    $("record-wait-here").disabled = stopping || annotationBusy();
     $("record-capture-keyboard").disabled = stopping || annotationBusy();
     $("review-capture-keyboard").disabled = annotationBusy();
     $("record-input-variable").disabled = stopping || annotationBusy();
@@ -1256,12 +1333,6 @@
     });
   });
 
-  $("flow-rename").addEventListener("click", () =>
-    task(() =>
-      review({ operation: "rename_flow", name: $("flow-name").value }),
-    ),
-  );
-
   function stabilityFields(prefix) {
     const stable_ms = Number($(`${prefix}-stable-ms`).value);
     const timeout_seconds = Number($(`${prefix}-stable-timeout`).value);
@@ -1518,21 +1589,59 @@
           ...textWaitFields("record"),
         }),
       );
+
+      closeAddStep();
       recordROIPicker.reset(null);
       $("record-text-advanced").open = false;
     }),
   );
 
   $("record-wait").addEventListener("click", () =>
-    task(() =>
-      review(
+    task(async () => {
+      const seconds = Number($("record-wait-seconds").value);
+
+      if (!Number.isFinite(seconds) || seconds < 0 || seconds > 3600) {
+        throw new Error("Wait duration must be between 0 and 3600 seconds.");
+      }
+
+      if (recording.active) {
+        await pendingManual;
+        await captureQueue;
+
+        liveWaitOpen = false;
+
+        recording = await api("/api/recorder/step", {
+          capture: false,
+          step: {
+            type: "wait",
+            seconds,
+          },
+        });
+
+        show(`Wait ${seconds}s added. Recording continues.`);
+        return;
+      }
+
+      await review(
         insertionPayload({
           type: "wait",
-          seconds: Number($("record-wait-seconds").value),
+          seconds,
         }),
-      ),
-    ),
+      );
+
+      closeAddStep();
+    }),
   );
+
+  $("record-wait-cancel").addEventListener("click", () => {
+    if (recording.active) {
+      liveWaitOpen = false;
+      renderRecording();
+      return;
+    }
+
+    closeAddStep();
+  });
 
   function valueFields(prefix, picker) {
     const fields = picker.fields();
@@ -1565,15 +1674,17 @@
   );
 
   $("record-value").addEventListener("click", () =>
-    task(() =>
-      review(
+    task(async () => {
+      await review(
         insertionPayload({
           type: "ocr_value",
           label: $("record-value-name").value.trim() || "Read Balance",
           ...valueFields("record", recordValueROIPicker),
         }),
-      ),
-    ),
+      );
+
+      closeAddStep();
+    }),
   );
 
   $("record-read-value").addEventListener("click", () =>
@@ -1618,15 +1729,17 @@
   });
 
   $("record-screenshot").addEventListener("click", () =>
-    task(() =>
-      review(
+    task(async () => {
+      await review(
         insertionPayload({
           type: "capture_screen",
           label: "Screenshot",
           output_key: "receipt_path",
         }),
-      ),
-    ),
+      );
+
+      closeAddStep();
+    }),
   );
 
   async function capture(step, extra) {
@@ -1909,6 +2022,24 @@
     }),
   );
 
+  $("record-wait-here").addEventListener("click", () =>
+    task(async () => {
+      if (!recording.active || stopping || annotationBusy()) return;
+
+      await pendingManual;
+      await flushText();
+      await captureQueue;
+
+      liveWaitOpen = true;
+      renderRecording();
+
+      requestAnimationFrame(() => {
+        $("record-wait-seconds").focus();
+        $("record-wait-seconds").select();
+      });
+    }),
+  );
+
   $("record-screenshot-here").addEventListener("click", () =>
     task(async () => {
       if (!recording.active || stopping || annotationBusy()) return;
@@ -2143,6 +2274,9 @@
         keyboardSetupOpen = false;
         variableInputOpen = false;
         readValueOpen = false;
+        liveWaitOpen = false;
+        addStepType = "wait";
+        $("review-insert").open = false;
         returnToVariableInput = false;
         alternateSetupOpen = false;
         specialCaseAfterStepId = null;
@@ -2189,6 +2323,7 @@
         keyboardSetupOpen = false;
         variableInputOpen = false;
         readValueOpen = false;
+        liveWaitOpen = false;
         returnToVariableInput = false;
         alternateSetupOpen = false;
         specialCaseAfterStepId = null;
@@ -2222,17 +2357,26 @@
       const editingExisting = !!recording.editing_existing;
 
       recording = await api("/api/recorder/cancel", {});
+
       keyboardSetupOpen = false;
       variableInputOpen = false;
       readValueOpen = false;
+      liveWaitOpen = false;
+      addStepType = "wait";
       returnToVariableInput = false;
       alternateSetupOpen = false;
       specialCaseAfterStepId = null;
+
       closeExpectedText();
+
+      await loadFlows();
+      renderRecording();
 
       show(editingExisting ? "Changes discarded." : "Recording discarded.");
 
-      await loadFlows();
+      if (editingExisting) {
+        scrollToSavedFlows();
+      }
     }),
   );
 
@@ -2258,14 +2402,17 @@
         workflow: null,
         editing_existing: false,
       };
+      liveWaitOpen = false;
       alternateSetupOpen = false;
       specialCaseAfterStepId = null;
 
       show(editingExisting ? "Workflow updated" : "Workflow saved");
 
       await loadFlows();
-      await selectFlow(saved.id);
+      renderRecording();
       await window.refreshDeviceReadiness?.();
+
+      scrollToSavedFlows();
     }),
   );
 

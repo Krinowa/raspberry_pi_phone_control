@@ -2408,3 +2408,42 @@ summary {
 .withdraw-account-summary .withdraw-payment-warning-detail {
   overflow-wrap: anywhere;
 }
+
+.add-step-builder {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.add-step-section {
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--border, #d9d9d9);
+  border-radius: 12px;
+}
+
+.add-step-section legend {
+  padding: 0 8px;
+  font-weight: 600;
+}
+
+.add-step-type-buttons {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.add-step-type-buttons button[aria-pressed="true"] {
+  font-weight: 700;
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
+}
+
+.add-step-section > section {
+  display: grid;
+  gap: 12px;
+}
+
+.add-step-section > section[hidden] {
+  display: none;
+}

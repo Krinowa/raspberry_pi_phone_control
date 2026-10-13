@@ -197,6 +197,7 @@ class Job:
     start_step_index: int = 0
     screenshots: list = field(default_factory=list)
     outputs: dict = field(default_factory=dict)
+    protected_metadata: dict = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -213,6 +214,7 @@ class Job:
         recovery_workflow_id=None,
         retry_of_job_id=None,
         start_step_index=0,
+        protected_metadata=None,
     ):
         account_id = identifier(account_id)
         validate_device_id(device_id)
@@ -230,6 +232,18 @@ class Job:
 
         if len(encoded.encode("utf-8")) > 64 * 1024:
             raise ValueError("payload is too large.")
+
+        protected_metadata = protected_metadata or {}
+        if not isinstance(protected_metadata, dict):
+            raise ValueError("protected_metadata must be a JSON object.")
+        try:
+            protected_encoded = json.dumps(protected_metadata, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "protected_metadata must contain valid JSON values."
+            ) from exc
+        if len(protected_encoded.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("protected_metadata is too large.")
 
         external_ref = _plain_text(external_ref, "external_ref", 256, required=False)
         bank = _plain_text(bank, "bank", 80, required=False)
@@ -255,6 +269,7 @@ class Job:
             recovery_workflow_id=recovery_workflow_id,
             retry_of_job_id=retry_of_job_id,
             start_step_index=start_step_index,
+            protected_metadata=deepcopy(protected_metadata),
         )
 
     @classmethod
@@ -278,6 +293,7 @@ class Job:
             "start_step_index",
             "screenshots",
             "outputs",
+            "protected_metadata",
         }
         required_fields = fields - optional_fields
         if set(data) - fields or not required_fields.issubset(data):
@@ -287,11 +303,12 @@ class Job:
             **{
                 field: None
                 for field in optional_fields
-                - {"screenshots", "start_step_index", "outputs"}
+                - {"screenshots", "start_step_index", "outputs", "protected_metadata"}
             },
             "start_step_index": 0,
             "screenshots": [],
             "outputs": {},
+            "protected_metadata": {},
             **data,
         }
 
@@ -363,14 +380,23 @@ class Job:
         for key, value in data["outputs"].items():
             identifier(key)
             _plain_text(value, "workflow output", 4096)
+
+        if not isinstance(data["protected_metadata"], dict):
+            raise ValueError("Stored protected metadata must be an object.")
+        try:
+            protected_encoded = json.dumps(data["protected_metadata"], allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Stored protected metadata is invalid.") from exc
+        if len(protected_encoded.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("Stored protected metadata is too large.")
         return cls(**deepcopy(data))
 
     def stored(self):
         return asdict(self)
 
     def public(self, queue_position=None):
-        # Payload is intentionally excluded: status/debug endpoints must not
-        # echo future banking values or credentials.
+        # Payload and protected integration metadata are intentionally excluded:
+        # status/debug endpoints must not echo banking values or raw API records.
         return {
             "job_id": self.job_id,
             "account_id": self.account_id,
