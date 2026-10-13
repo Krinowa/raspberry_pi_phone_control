@@ -15,7 +15,15 @@ LOG = logging.getLogger("withdraw_v2")
 class WithdrawDispatcher:
     """Poll logical sessions once and assign locked withdrawals to safe phones."""
 
-    def __init__(self, workers, scheduler, journal, *, poll_seconds=60):
+    def __init__(
+        self,
+        workers,
+        scheduler,
+        journal,
+        *,
+        poll_seconds=60,
+        ready_for_work=None,
+    ):
         self.workers = workers
         self.scheduler = scheduler
         self.journal = journal
@@ -28,6 +36,7 @@ class WithdrawDispatcher:
         self.queue_due = None
         self.cursor = 0
         self.balance_relevant = set()
+        self.ready_for_work = ready_for_work or (lambda _device_id: True)
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -205,6 +214,9 @@ class WithdrawDispatcher:
         if worker.api.get("enabled") is False:
             unavailable[worker.device_id] = "device_disabled"
             return self._log_skip(worker, item, "device_disabled")
+        if not self.ready_for_work(worker.device_id):
+            unavailable[worker.device_id] = "not_ready_for_work"
+            return self._log_skip(worker, item, "not_ready_for_work")
         if worker.device_id not in visible:
             return self._log_skip(worker, item, "payment_record_not_allowed")
         if (
@@ -315,6 +327,9 @@ class WithdrawDispatcher:
         amount = final_amount(item)
 
         with self.scheduler.lock:
+            if not self.ready_for_work(worker.device_id):
+                self._log_skip(worker, item, "not_ready_for_work")
+                return None
             if not worker.dispatch_available():
                 self._log_skip(worker, item, "device_busy")
                 return None

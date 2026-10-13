@@ -873,11 +873,33 @@ def create_app(
                         workflow_service.device_id = selected
             result["selected_device"] = bridge.device_id
         if isinstance(devices, list):
+            assignment_store = app.extensions["device_workflow_assignment_store"]
             for item in devices:
                 if not isinstance(item, dict) or not isinstance(item.get("id"), str):
                     continue
                 item["workflow_assignment"] = workflow_assignment_details(item["id"])
+                item["ready_for_work"] = assignment_store.ready_for_work(item["id"])
         return jsonify(result)
+
+    @app.put("/api/devices/<device_id>/work-readiness")
+    @local_dashboard_access
+    def device_work_readiness(device_id):
+        _, _, registered = registered_pi_devices()
+        if device_id not in registered:
+            raise PiApiError(
+                f"Pi device {device_id!r} is not registered.", http_status=404
+            )
+        data = payload()
+        if set(data) != {"ready"} or type(data.get("ready")) is not bool:
+            raise ValueError("Expected ready as a boolean.")
+        manager = app.extensions.get("withdraw_manager")
+        if manager is not None:
+            ready = manager.set_work_readiness(device_id, data["ready"])
+        else:
+            ready = app.extensions[
+                "device_workflow_assignment_store"
+            ].set_ready_for_work(device_id, data["ready"])
+        return jsonify(ok=True, device_id=device_id, ready_for_work=ready)
 
     @app.route("/api/devices/<device_id>/workflows", methods=["GET", "PUT"])
     def device_workflows(device_id):
@@ -994,7 +1016,11 @@ def create_app(
             raise ValueError(
                 "This device ID is already registered. Use Replace on its device card."
             )
-        return jsonify(bridge.start_enrollment(data["target_device_id"]))
+        result = bridge.start_enrollment(data["target_device_id"])
+        app.extensions["device_workflow_assignment_store"].set_ready_for_work(
+            data["target_device_id"], False
+        )
+        return jsonify(result)
 
     @app.post("/api/enrollment/stop")
     @local_dashboard_access

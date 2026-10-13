@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import threading
 
+
 import time
 
+
 from copy import deepcopy
+
 
 from dataclasses import replace
 
@@ -21,6 +24,7 @@ from .models import (
     PENDING_JOB_STATES,
     TERMINAL_JOB_STATES,
 )
+
 
 from .storage import RecordConflict
 
@@ -207,13 +211,25 @@ class JobScheduler:
 
 
 
+
+
+
+
     The process-local lock covers queue inspection, readiness checks, durable
+
+
 
     state changes, and reservations. The JSON store writes each resulting
 
+
+
     snapshot atomically. Physical ownership remains guarded by DeviceLocks in
 
+
+
     WorkflowService/Runner.
+
+
 
     """
 
@@ -412,15 +428,29 @@ class JobScheduler:
 
 
 
+
+
+
+
         An explicit operator balance check is recovery work: it still requires
+
+
 
         the physical phone/camera/runtime to be idle and healthy, but it may run
 
+
+
         ahead of payment work which is waiting solely on Withdraw recovery.
+
+
 
         Ordinary/background balance checks retain the normal queue and
 
+
+
         integration-gate priority rules.
+
+
 
         """
 
@@ -577,6 +607,7 @@ class JobScheduler:
         screenshots=None,
         failed_step_index=None,
         failed_step_id=None,
+        failed_step_type=None,
         outputs=None,
     ):
 
@@ -616,6 +647,9 @@ class JobScheduler:
                 failed_step_id=(
                     failed_step_id if status == "FAILED" else job.failed_step_id
                 ),
+                failed_step_type=(
+                    failed_step_type if status == "FAILED" else job.failed_step_type
+                ),
             )
 
             del self.reservations[job.device_id]
@@ -636,6 +670,7 @@ class JobScheduler:
         screenshots=None,
         failed_step_index=None,
         failed_step_id=None,
+        failed_step_type=None,
     ):
 
         return self._finish(
@@ -645,6 +680,7 @@ class JobScheduler:
             screenshots=screenshots,
             failed_step_index=failed_step_index,
             failed_step_id=failed_step_id,
+            failed_step_type=failed_step_type,
         )
 
     def finish_cancelled(self, job_id, result=None, *, screenshots=None):

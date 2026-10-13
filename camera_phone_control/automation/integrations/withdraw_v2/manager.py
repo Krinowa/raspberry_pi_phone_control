@@ -67,7 +67,10 @@ class WithdrawManager:
         self.account_binding_errors = {}
         self.lock = threading.RLock()
         self.dispatcher = WithdrawDispatcher(
-            lambda: self.workers, scheduler, self.journal
+            lambda: self.workers,
+            scheduler,
+            self.journal,
+            ready_for_work=getattr(assignments, "ready_for_work", None),
         )
         self.workflow_completion_listener = self.workflow_completed
         add_completion_listener = getattr(service, "add_completion_listener", None)
@@ -269,6 +272,15 @@ class WithdrawManager:
             format(amount, ".2f"),
         )
         self.dispatcher.wake()
+
+    def set_work_readiness(self, device_id, ready):
+        """Persist the operator gate without changing any active recovery state."""
+        with self.scheduler.lock:
+            previous = self.assignments.ready_for_work(device_id)
+            current = self.assignments.set_ready_for_work(device_id, ready)
+        if current and not previous:
+            self.dispatcher.wake()
+        return current
 
     def withdraw_job_blocked(self, device_id):
         record = self.journal.current(device_id)

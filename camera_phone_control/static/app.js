@@ -60,6 +60,7 @@ const jobCancelsInFlight = new Set();
 const jobRetriesInFlight = new Set();
 const withdrawReconnectsInFlight = new Set();
 const balanceRefreshesInFlight = new Set();
+const workReadinessRequestsInFlight = new Set();
 let workflowSettingsDeviceId = null;
 let workflowSettingsData = null;
 let workflowSettingsMode = "payment";
@@ -348,6 +349,12 @@ const deviceService = {
         workflow_ids: workflowIds,
         balance_workflow_id: balanceWorkflowId,
       },
+      "PUT",
+    ),
+  setWorkReadiness: (deviceId, ready) =>
+    api(
+      `/api/devices/${encodeURIComponent(deviceId)}/work-readiness`,
+      { ready },
       "PUT",
     ),
   discoverCameras: (refresh = false) =>
@@ -1074,6 +1081,45 @@ async function refreshWithdrawBalance(deviceId) {
   }
 }
 
+async function setDeviceWorkReadiness(deviceId, ready) {
+  if (workReadinessRequestsInFlight.has(deviceId)) return;
+  workReadinessRequestsInFlight.add(deviceId);
+  deviceRenderSignature = null;
+  renderDevices();
+
+  try {
+    const result = await deviceService.setWorkReadiness(deviceId, ready);
+    const device = deviceCatalog?.devices?.find((item) => item.id === deviceId);
+    if (device) device.ready_for_work = result.ready_for_work;
+    notice(ready ? "Phone marked Ready for Work." : "Phone set Not Ready.");
+    await loadDevices();
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    workReadinessRequestsInFlight.delete(deviceId);
+    deviceRenderSignature = null;
+    renderDevices();
+  }
+}
+
+function friendlyWorkflowStepType(type) {
+  const labels = {
+    tap: "Tap",
+    swipe: "Swipe",
+    input: "Input",
+    key: "Key",
+    wait: "Wait",
+    wait_until_stable: "Wait Until Stable",
+    wait_for_text: "Wait for Text",
+    manual_checkpoint: "Manual Checkpoint",
+    ocr_value: "Read Value",
+    capture_screen: "Capture Screenshot",
+    if_text: "If Text",
+  };
+
+  return labels[type] || null;
+}
+
 function renderDevices() {
   stopDevicePreviews();
   const devices = Array.isArray(deviceCatalog?.devices)
@@ -1252,6 +1298,43 @@ function renderDevices() {
       assigned_workflows: [],
       missing_workflow_ids: [],
     };
+
+    const readyForWork = device.ready_for_work !== false;
+
+    const workReadiness = document.createElement("div");
+    workReadiness.className = "device-work-readiness";
+
+    const workReadinessLabel = document.createElement("span");
+    workReadinessLabel.className = "device-work-readiness-label";
+    workReadinessLabel.textContent = "Work status";
+
+    const workReadinessState = document.createElement("span");
+    workReadinessState.className = `device-work-readiness-state ${readyForWork ? "ready" : "not-ready"}`;
+    workReadinessState.textContent = readyForWork ? "● Ready" : "● Not Ready";
+
+    const workReadinessAction = document.createElement("button");
+    workReadinessAction.type = "button";
+    workReadinessAction.className = "device-work-readiness-action";
+    workReadinessAction.textContent = workReadinessRequestsInFlight.has(
+      device.id,
+    )
+      ? "Updating…"
+      : readyForWork
+        ? "Set Not Ready"
+        : "Mark Ready";
+
+    workReadinessAction.disabled = workReadinessRequestsInFlight.has(device.id);
+
+    workReadinessAction.addEventListener("click", () =>
+      setDeviceWorkReadiness(device.id, !readyForWork),
+    );
+
+    workReadiness.append(
+      workReadinessLabel,
+      workReadinessState,
+      workReadinessAction,
+    );
+
     const workflowSummary = document.createElement("div");
     workflowSummary.className = "account-summary admin-only";
     const workflowHeading = document.createElement("strong");
@@ -1382,6 +1465,7 @@ function renderDevices() {
       const session = document.createElement("span");
       session.textContent = `Session: ${runtime.session} · Realtime: ${runtime.realtime}`;
       withdrawSummary.append(identity, records, session);
+
       if (typeof withdraw.status?.payment_ready === "boolean") {
         const readiness = document.createElement("span");
         readiness.className = withdraw.status.payment_ready
@@ -1443,15 +1527,54 @@ function renderDevices() {
       const jobState = document.createElement("span");
       jobState.textContent = `${activeJob ? "Current" : "Last"} job: ${latestJob.status}`;
       jobSummary.append(phoneState, jobState);
-      const reason =
-        latestJob.recovery_error || latestJob.error || latestJob.result;
 
-      if (reason) {
+      if (Number.isInteger(latestJob.failed_step_index)) {
+        const failedStep = document.createElement("span");
+        failedStep.className = "job-failed-step";
+
+        const stepNumber = latestJob.failed_step_index + 1;
+        const stepType = friendlyWorkflowStepType(latestJob.failed_step_type);
+
+        failedStep.textContent = stepType
+          ? `Failed step: Step ${stepNumber} · ${stepType}`
+          : `Failed step: Step ${stepNumber}`;
+
+        jobSummary.append(failedStep);
+      }
+
+      const withdrawReason =
+        withdrawNeedsAttention && withdraw.status?.error
+          ? withdraw.status.error
+          : null;
+
+      const error =
+        latestJob.error || latestJob.recovery_error || withdrawReason;
+
+      if (error) {
         const message = document.createElement("span");
-        message.className = latestJob.error ? "job-error" : "job-result";
-        message.textContent = `Reason: ${friendlyOperationalError(String(reason))}`;
+        message.className = "job-error";
+        message.textContent = `Error: ${friendlyOperationalError(String(error))}`;
+
+        jobSummary.append(message);
+      } else if (latestJob.result) {
+        const message = document.createElement("span");
+        message.className = "job-result";
+        message.textContent = `Result: ${latestJob.result}`;
         jobSummary.append(message);
       }
+    } else if (withdrawNeedsAttention) {
+      jobSummary = document.createElement("div");
+      jobSummary.className = "device-job-summary device-issue-summary";
+
+      const issueLabel = document.createElement("strong");
+      issueLabel.textContent = "Phone state: Needs Attention";
+
+      const issueMessage = document.createElement("span");
+      issueMessage.textContent = friendlyOperationalError(
+        withdraw.status?.error || "Withdrawal recovery requires attention.",
+      );
+
+      jobSummary.append(issueLabel, issueMessage);
     } else if (manualWorkflowNeedsAttention) {
       jobSummary = document.createElement("div");
       jobSummary.className = "device-job-summary device-issue-summary";
@@ -1527,6 +1650,7 @@ function renderDevices() {
       mac,
       preview,
       summary,
+      workReadiness,
       balanceSummary,
       workflowSummary,
       withdrawSummary,
@@ -1565,6 +1689,60 @@ function getRootJobId(job, jobsById) {
   }
 
   return current?.job_id || job.job_id;
+}
+
+function latestAttemptForJob(job) {
+  if (!job) return null;
+
+  const jobs = Array.isArray(jobCatalog) ? jobCatalog : [];
+  const jobsById = new Map(jobs.map((item) => [item.job_id, item]));
+  const rootId = getRootJobId(job, jobsById);
+
+  let latest = null;
+
+  for (const candidate of jobs) {
+    if (getRootJobId(candidate, jobsById) === rootId) {
+      latest = candidate;
+    }
+  }
+
+  return latest || job;
+}
+
+function unresolvedRecoveryJob(job) {
+  const latest = latestAttemptForJob(job);
+
+  if (
+    !latest ||
+    !["FAILED", "INTERRUPTED"].includes(latest.status) ||
+    latest.recovery_status === "READY"
+  ) {
+    return null;
+  }
+
+  return latest;
+}
+
+function unresolvedRecoveryJobForDevice(deviceId) {
+  const jobs = Array.isArray(jobCatalog) ? jobCatalog : [];
+  const jobsById = new Map(jobs.map((job) => [job.job_id, job]));
+  const latestByRoot = new Map();
+
+  for (const job of jobs) {
+    const rootId = getRootJobId(job, jobsById);
+    latestByRoot.set(rootId, job);
+  }
+
+  return (
+    [...latestByRoot.values()]
+      .reverse()
+      .find(
+        (job) =>
+          job.device_id === deviceId &&
+          ["FAILED", "INTERRUPTED"].includes(job.status) &&
+          job.recovery_status !== "READY",
+      ) || null
+  );
 }
 
 function groupJobAttempts(jobs) {
@@ -1729,16 +1907,14 @@ function currentOperationalIssue() {
     };
 
   const selectedDeviceId = deviceCatalog?.selected_device;
-  const targetJob = recoveryTargetJobId
+
+  const targetedJob = recoveryTargetJobId
     ? jobCatalog.find((job) => job.job_id === recoveryTargetJobId)
-    : [...jobCatalog]
-        .reverse()
-        .find(
-          (job) =>
-            (!selectedDeviceId || job.device_id === selectedDeviceId) &&
-            ["FAILED", "INTERRUPTED"].includes(job.status) &&
-            job.recovery_status !== "READY",
-        );
+    : null;
+
+  const targetJob = targetedJob
+    ? unresolvedRecoveryJob(targetedJob)
+    : unresolvedRecoveryJobForDevice(selectedDeviceId);
 
   if (targetJob?.recovery_status === "READY") return null;
   if (targetJob?.recovery_status === "RECOVERING")
@@ -1814,16 +1990,18 @@ function currentOperationalIssue() {
 function renderOperationalRecovery() {
   // Lightweight unit-test DOMs and embedded clients may omit the page body.
   if (!document.body) return;
+
   let issue = currentOperationalIssue();
-  const recoveryJob = recoveryTargetJobId
+  const selectedDeviceId = deviceCatalog?.selected_device;
+
+  const targetedJob = recoveryTargetJobId
     ? jobCatalog.find((job) => job.job_id === recoveryTargetJobId)
-    : [...jobCatalog]
-        .reverse()
-        .find(
-          (job) =>
-            ["FAILED", "INTERRUPTED"].includes(job.status) &&
-            job.recovery_status !== "READY",
-        );
+    : null;
+
+  const recoveryJob = targetedJob
+    ? latestAttemptForJob(targetedJob)
+    : unresolvedRecoveryJobForDevice(selectedDeviceId);
+
   const recovered = recoveryJob?.recovery_status === "READY";
   const recoveryAttempted =
     !!recoveryJob?.recovery_run_id ||
@@ -1865,8 +2043,17 @@ function renderOperationalRecovery() {
   const attention = $("operate-attention");
   attention.hidden = !issue;
   if (issue) {
+    const jobsById = new Map(jobCatalog.map((job) => [job.job_id, job]));
+
+    const latestByRoot = new Map();
+
+    for (const job of jobCatalog) {
+      const rootId = getRootJobId(job, jobsById);
+      latestByRoot.set(rootId, job);
+    }
+
     const affectedDevices = new Set(
-      jobCatalog
+      [...latestByRoot.values()]
         .filter(
           (job) =>
             ["FAILED", "INTERRUPTED"].includes(job.status) &&
@@ -1874,6 +2061,7 @@ function renderOperationalRecovery() {
         )
         .map((job) => job.device_id),
     );
+
     $("operate-attention-message").textContent =
       affectedDevices.size > 1
         ? `${affectedDevices.size} devices need attention`
@@ -2572,6 +2760,7 @@ function deviceRenderSnapshot(catalog, cameras, withdrawDetails, jobs) {
       connected: device.connected,
       default: device.default,
       bluetooth_address: device.bluetooth_address,
+      ready_for_work: device.ready_for_work,
       workflow_assignment: device.workflow_assignment,
     })),
 
