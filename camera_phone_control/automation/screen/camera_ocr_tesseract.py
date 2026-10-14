@@ -294,6 +294,7 @@ class CameraOCRScreenStateProvider:
                 stderr=subprocess.PIPE,
                 timeout=self.timeout,
                 check=False,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
         except subprocess.TimeoutExpired as exc:
             raise ScreenStateError(

@@ -154,7 +154,13 @@ def _windows_pnp_devices():
         "-Command",
         "Get-PnpDevice -PresentOnly | Where-Object {$_.Class -in @('Camera','Image')} | Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress",
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     if completed.returncode:
         raise CameraIdentityError("Windows camera identity discovery failed.")
     raw = json.loads(completed.stdout or "[]")
@@ -178,6 +184,7 @@ def _windows_directshow_names():
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return []

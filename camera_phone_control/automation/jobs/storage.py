@@ -51,7 +51,8 @@ class _JsonStore:
             dir=self.path.parent, prefix="." + self.path.stem + "-", suffix=".tmp"
         )
         try:
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(data, stream, indent=2, allow_nan=False)
                 stream.write("\n")

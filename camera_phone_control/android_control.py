@@ -1,6 +1,7 @@
 """Read one USB phone's geometry and send individual, explicit ADB inputs."""
 
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -99,6 +100,7 @@ class AndroidControl:
                 check=False,
                 # A runner's Ctrl+C cancels between commands, not inside ADB.
                 start_new_session=True,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
         except subprocess.TimeoutExpired as exc:
             raise DeviceError(

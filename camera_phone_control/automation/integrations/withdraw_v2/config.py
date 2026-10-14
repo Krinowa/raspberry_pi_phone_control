@@ -48,7 +48,8 @@ class WithdrawCredentialStore:
             suffix=".tmp",
         )
         try:
-            os.fchmod(descriptor, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 json.dump(values, stream, allow_nan=False)
                 stream.write("\n")

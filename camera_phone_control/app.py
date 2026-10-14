@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import secrets
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -390,6 +391,7 @@ def create_app(
     start_withdraw_workers=None,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
+    screenshot_store=None,
     auth_store=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
@@ -423,7 +425,16 @@ def create_app(
             shared_camera=not isinstance(camera, Camera),
         )
     camera = camera_manager.activate(selected_camera_device)
-    app = Flask(__name__)
+    resource_root = (
+        os.fspath(getattr(sys, "_MEIPASS"))
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+        else os.path.dirname(os.path.abspath(__file__))
+    )
+    app = Flask(
+        __name__,
+        static_folder=os.path.join(resource_root, "static"),
+        template_folder=os.path.join(resource_root, "templates"),
+    )
     session_secret = os.environ.get("PHONE_SESSION_SECRET") or secrets.token_hex(32)
     app.config.update(
         MAX_CONTENT_LENGTH=1024 * 1024,
@@ -1583,6 +1594,7 @@ def create_app(
         device_id=device_id,
         ocr_settings_storage=ocr_settings_storage,
         ocr_resource_provider=ocr_resource_provider,
+        screenshot_store=screenshot_store,
         admin_required=local_dashboard_access,
         require_admin=allow_local_dashboard,
     )

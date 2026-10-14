@@ -50,6 +50,7 @@ def register_workflows(
     device_id=None,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
+    screenshot_store=None,
     admin_required,
     require_admin,
 ):
@@ -117,6 +118,7 @@ def register_workflows(
         screen_state_provider,
         device_id=device_id,
         screen_resolver=resolve_job_screen,
+        screenshot_store=screenshot_store,
     )
 
     app.extensions.update(

@@ -8,7 +8,6 @@ import math
 import multiprocessing
 import os
 from pathlib import Path
-import resource
 import threading
 import time
 import uuid
@@ -17,11 +16,27 @@ from collections import deque
 import cv2
 import numpy as np
 
+try:
+    import resource
+except ImportError:  # Windows has no POSIX resource module.
+    resource = None
+
 from ..coordinates import normalized_roi
 from .state import ScreenStateError, TextDetectionUnavailable
 from ..workflows.timing import measure_timing, record_timing
 
 LOG = logging.getLogger("camera_ocr")
+
+
+def _process_cpu_times():
+    if resource is not None:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_utime, usage.ru_stime
+    try:
+        usage = __import__("psutil").Process().cpu_times()
+        return float(usage.user), float(usage.system)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return 0.0, 0.0
 
 
 def _build_paddle_engine(
@@ -55,6 +70,38 @@ def _build_paddle_engine(
         )
     else:
         options.update(lang=language, ocr_version="PP-OCRv5")
+    packaged_models = os.environ.get("PHONE_CONTROLLER_OCR_MODELS_DIR", "").strip()
+    if packaged_models:
+        model_root = Path(packaged_models)
+        detection = model_root / "PP-OCRv5_mobile_det"
+        recognition_name = (
+            "en_PP-OCRv5_mobile_rec" if language == "en" else "PP-OCRv5_mobile_rec"
+        )
+        recognition = model_root / recognition_name
+        missing = [
+            path.name
+            for path in (detection, recognition)
+            if not all(
+                (path / filename).is_file()
+                for filename in ("inference.json", "inference.pdiparams")
+            )
+        ]
+        orientation = model_root / "PP-LCNet_x1_0_textline_ori"
+        if textline_orientation and not all(
+            (orientation / filename).is_file()
+            for filename in ("inference.json", "inference.pdiparams")
+        ):
+            missing.append(orientation.name)
+        if missing:
+            raise TextDetectionUnavailable(
+                "Packaged PaddleOCR models are missing: " + ", ".join(missing)
+            )
+        options.update(
+            text_detection_model_dir=str(detection),
+            text_recognition_model_dir=str(recognition),
+        )
+        if textline_orientation:
+            options["text_line_orientation_model_dir"] = str(orientation)
     return PaddleOCR(**options)
 
 
@@ -127,7 +174,7 @@ def _paddle_worker(connection, config):
                 continue
             _, request_id, image = message
             try:
-                usage_before = resource.getrusage(resource.RUSAGE_SELF)
+                usage_before = _process_cpu_times()
                 try:
                     import psutil
 
@@ -137,7 +184,7 @@ def _paddle_worker(connection, config):
                 started = time.monotonic()
                 results = [_plain_result(item) for item in engine.predict(input=image)]
                 inference = time.monotonic() - started
-                usage_after = resource.getrusage(resource.RUSAGE_SELF)
+                usage_after = _process_cpu_times()
                 connection.send(
                     (
                         "result",
@@ -146,8 +193,8 @@ def _paddle_worker(connection, config):
                         inference,
                         worker_pid,
                         {
-                            "cpu_user": usage_after.ru_utime - usage_before.ru_utime,
-                            "cpu_system": usage_after.ru_stime - usage_before.ru_stime,
+                            "cpu_user": usage_after[0] - usage_before[0],
+                            "cpu_system": usage_after[1] - usage_before[1],
                             "native_threads": native_threads,
                             "input_width": image.shape[1],
                             "input_height": image.shape[0],
