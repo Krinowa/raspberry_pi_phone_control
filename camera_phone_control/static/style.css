@@ -2408,3 +2408,77 @@ summary {
 .withdraw-account-summary .withdraw-payment-warning-detail {
   overflow-wrap: anywhere;
 }
+
+.add-step-builder {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.add-step-section {
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--border, #d9d9d9);
+  border-radius: 12px;
+}
+
+.add-step-section legend {
+  padding: 0 8px;
+  font-weight: 600;
+}
+
+.add-step-type-buttons {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.add-step-type-buttons button[aria-pressed="true"] {
+  font-weight: 700;
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
+}
+
+.add-step-section > section {
+  display: grid;
+  gap: 12px;
+}
+
+.add-step-section > section[hidden] {
+  display: none;
+}
+
+.device-work-readiness {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+  padding: 8px 0;
+  border-bottom: 1px solid #e1e7e4;
+  font-size: 12px;
+}
+
+.device-work-readiness-label {
+  color: #687870;
+  font-weight: 600;
+}
+
+.device-work-readiness-state {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.device-work-readiness-state.ready {
+  color: #24633e;
+}
+
+.device-work-readiness-state.not-ready {
+  color: #8a5a10;
+}
+
+.device-work-readiness-action {
+  padding: 6px 9px;
+  font-size: 11px;
+  white-space: nowrap;
+}

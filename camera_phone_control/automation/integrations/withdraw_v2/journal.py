@@ -1,7 +1,7 @@
 """Private durable reconciliation records, using the existing atomic JSON store."""
 
 from copy import deepcopy
-from automation.jobs.storage import _JsonStore
+from automation.jobs.storage import RecordConflict, _JsonStore
 from automation.workflows.models import now
 
 TERMINAL = {"CONFIRMED", "RELEASED", "CANCELLED", "LOCK_REJECTED"}
@@ -20,24 +20,17 @@ class WithdrawJournal(_JsonStore):
     @classmethod
     def _identity_conflict(cls, data, withdraw_id, tx_id):
         for device_id, item, current in cls._entries(data):
-            if item.get("phase") == "CONFIRMED" and (
-                item.get("withdraw_id") == withdraw_id or item.get("tx_id") == tx_id
-            ):
+            matches = (
+                withdraw_id is not None and item.get("withdraw_id") == withdraw_id
+            ) or (tx_id is not None and item.get("tx_id") == tx_id)
+            if item.get("phase") == "CONFIRMED" and matches:
                 return "confirmed", device_id
-            if (
-                current
-                and item.get("phase") not in TERMINAL
-                and (
-                    item.get("withdraw_id") == withdraw_id or item.get("tx_id") == tx_id
-                )
-            ):
+            if current and item.get("phase") not in TERMINAL and matches:
                 return "unresolved", device_id
             if (
                 item.get("phase") == "CANCELLED"
                 and item.get("assigned_device_id")
-                and (
-                    item.get("withdraw_id") == withdraw_id or item.get("tx_id") == tx_id
-                )
+                and matches
             ):
                 return "previously_locked", device_id
         return None
@@ -71,6 +64,29 @@ class WithdrawJournal(_JsonStore):
             data = self._read()
             device = data.setdefault(device_id, {"current": {}, "history": []})
             device["current"].update(deepcopy(changes), updated_at=now())
+            self._write(data)
+            return deepcopy(device["current"])
+
+    def recover_missing(self, device_id, **fields):
+        """Create one startup recovery record without treating update as create."""
+        with self.lock:
+            data = self._read()
+            device = data.setdefault(device_id, {"current": {}, "history": []})
+            if device.get("current"):
+                raise RecordConflict(
+                    "A journal record already exists for this device; recovery did not overwrite it."
+                )
+
+            conflict = self._identity_conflict(
+                data, fields.get("withdraw_id"), fields.get("tx_id")
+            )
+            if conflict:
+                kind, conflict_device = conflict
+                raise RecordConflict(
+                    f"Startup recovery identity conflicts with {kind} journal state on {conflict_device}."
+                )
+
+            device["current"] = {**deepcopy(fields), "updated_at": now()}
             self._write(data)
             return deepcopy(device["current"])
 

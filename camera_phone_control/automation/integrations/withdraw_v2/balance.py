@@ -26,12 +26,9 @@ def balance_check_workflow(workflow):
             "Only a Balance Check purpose workflow can be assigned as a "
             "Balance Check Workflow."
         )
+
     steps = list(_workflow_steps(workflow.get("steps", [])))
-    if any(step.get("critical") is True for step in steps):
-        raise ValueError(
-            "This workflow cannot be used as a Balance Check Workflow because "
-            "it contains an irreversible payment step."
-        )
+
     if not any(
         step.get("type") == "ocr_value"
         and step.get("parser") == "currency"
@@ -46,7 +43,9 @@ def balance_check_workflow(workflow):
 
 
 class BalanceProvider(Protocol):
-    def get_available_balance(self, device_id: str) -> Decimal | None: ...
+    def get_available_balance(
+        self, device_id: str, *, manual_recovery: bool = False
+    ) -> Decimal | None: ...
 
 
 class CameraOCRBalanceProvider:
@@ -62,20 +61,15 @@ class CameraOCRBalanceProvider:
         self.service = service
         self.workflow_for_device = workflow_for_device
 
-    def get_available_balance(self, device_id):
+    def get_available_balance(self, device_id, *, manual_recovery=False):
         workflow_id = self.workflow_for_device(device_id)
         if not workflow_id:
             raise ValueError("No balance-check workflow is assigned to this device.")
         workflow = balance_check_workflow(self.workflows.read(workflow_id))
         reservation = object()
-        with self.scheduler.lock:
-            if not self.scheduler.is_device_ready(device_id)["ready"]:
-                raise RecordConflict("Device is not ready for a balance check.")
-            if self.scheduler.next_job_for_device(device_id) is not None:
-                raise RecordConflict(
-                    "Queued device work takes priority over a balance check."
-                )
-            self.scheduler.reservations[device_id] = reservation
+        self.scheduler.reserve_balance_workflow(
+            device_id, reservation, manual_recovery=manual_recovery
+        )
         try:
             started = self.service.start(workflow, {}, device_id=device_id)
             completed = self.service.wait(started["run_id"])

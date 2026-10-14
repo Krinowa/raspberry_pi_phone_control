@@ -153,13 +153,19 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
         assignments = {}
         for device_id, value in self._read().items():
             validate_device_id(device_id)
-            if (
-                not isinstance(value, dict)
-                or "allowed_workflow_ids" not in value
-                or set(value)
-                - {"allowed_workflow_ids", "balance_workflow_id", "withdraw_api"}
-            ):
+            if not isinstance(value, dict) or set(value) - {
+                "allowed_workflow_ids",
+                "balance_workflow_id",
+                "withdraw_api",
+                "ready_for_work",
+            }:
                 raise ValueError("Stored device workflow assignment is invalid.")
+            if "ready_for_work" in value and type(value["ready_for_work"]) is not bool:
+                raise ValueError("Stored device work readiness is invalid.")
+            # A readiness-only record must retain the legacy meaning of a
+            # missing workflow allowlist: unrestricted, rather than empty.
+            if "allowed_workflow_ids" not in value:
+                continue
             workflow_ids = value["allowed_workflow_ids"]
             if not isinstance(workflow_ids, list) or len(workflow_ids) > 1:
                 raise ValueError("Only one workflow can be assigned to a phone.")
@@ -212,14 +218,39 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
             self._write(records)
         return tuple(normalized), balance
 
+    def ready_for_work(self, device_id):
+        """Return the explicit operator gate, defaulting legacy records on."""
+        validate_device_id(device_id)
+        with self.lock:
+            value = self._read().get(device_id, {})
+            if not isinstance(value, dict):
+                raise ValueError("Stored device workflow assignment is invalid.")
+            ready = value.get("ready_for_work", True)
+            if type(ready) is not bool:
+                raise ValueError("Stored device work readiness is invalid.")
+            return ready
+
+    def set_ready_for_work(self, device_id, ready):
+        validate_device_id(device_id)
+        if type(ready) is not bool:
+            raise ValueError("ready must be boolean.")
+        with self.lock:
+            records = self._read()
+            record = records.setdefault(device_id, {})
+            if not isinstance(record, dict):
+                raise ValueError("Stored device workflow assignment is invalid.")
+            record["ready_for_work"] = ready
+            self._write(records)
+        return ready
+
     def delete(self, device_id):
         validate_device_id(device_id)
         with self.lock:
-            assignments = self._assignments()
-            removed = assignments.pop(device_id, None)
-            if removed is not None:
-                self._save(assignments)
-            return removed is not None
+            records = self._read()
+            removed = records.pop(device_id, None) is not None
+            if removed:
+                self._write(records)
+            return removed
 
     def allows(self, device_id, workflow_id):
         allowed = self.get(device_id)
@@ -271,15 +302,19 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
 
     def _save(self, assignments):
         previous = self._read()
-        self._write(
-            {
-                device_id: {
-                    **previous.get(device_id, {}),
-                    "allowed_workflow_ids": list(workflow_ids),
-                }
-                for device_id, workflow_ids in sorted(assignments.items())
+        # Keep readiness-only records for other devices. Assignment deletion
+        # goes through delete(), which removes the complete record explicitly.
+        records = {
+            device_id: dict(record)
+            for device_id, record in previous.items()
+            if isinstance(record, dict)
+        }
+        for device_id, workflow_ids in sorted(assignments.items()):
+            records[device_id] = {
+                **records.get(device_id, {}),
+                "allowed_workflow_ids": list(workflow_ids),
             }
-        )
+        self._write({key: records[key] for key in sorted(records)})
 
 
 class JobStore(_JsonStore):

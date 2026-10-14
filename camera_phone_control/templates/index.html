@@ -221,7 +221,7 @@
             <input
               id="device-enrollment-id"
               maxlength="64"
-              pattern="[A-Za-z0-9][A-Za-z0-9\_-]{0,63}"
+              pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
               placeholder="phone_B"
               required
             />
@@ -687,8 +687,10 @@ Select Refresh Logs to load recent activity.</pre
           <div class="section-heading">
             <div>
               <p class="eyebrow">DEVICE AUTOMATION</p>
+
               <h2 id="workflow-settings-title">Workflow Assignment</h2>
             </div>
+
             <button
               id="workflow-settings-close"
               type="button"
@@ -697,12 +699,15 @@ Select Refresh Logs to load recent activity.</pre
               ×
             </button>
           </div>
+
           <p id="workflow-settings-help" class="small"></p>
 
           <div id="workflow-settings-payment-section">
             <h3>Payment Workflow</h3>
+
             <label>
               Search workflows
+
               <input
                 id="workflow-settings-search"
                 type="search"
@@ -710,6 +715,7 @@ Select Refresh Logs to load recent activity.</pre
                 autocomplete="off"
               />
             </label>
+
             <div
               id="workflow-settings-list"
               class="workflow-assignment-list"
@@ -718,8 +724,10 @@ Select Refresh Logs to load recent activity.</pre
 
           <div id="workflow-settings-balance-section">
             <h3>Balance Check Workflow</h3>
+
             <label>
               Search workflows
+
               <input
                 id="workflow-settings-balance-search"
                 type="search"
@@ -727,6 +735,7 @@ Select Refresh Logs to load recent activity.</pre
                 autocomplete="off"
               />
             </label>
+
             <div
               id="workflow-settings-balance-list"
               class="workflow-assignment-list"
@@ -739,10 +748,12 @@ Select Refresh Logs to load recent activity.</pre
             role="alert"
             hidden
           ></p>
+
           <div class="flow-buttons">
             <button id="workflow-settings-save" class="primary" type="submit">
               Save Workflow
             </button>
+
             <button id="workflow-settings-cancel" type="button">Cancel</button>
           </div>
         </form>
@@ -857,6 +868,8 @@ Select Refresh Logs to load recent activity.</pre
                     Expect Current Screen
                   </button>
 
+                  <button id="record-wait-here" type="button">Wait</button>
+
                   <button id="record-read-value" type="button">
                     Read Balance
                   </button>
@@ -871,6 +884,8 @@ Select Refresh Logs to load recent activity.</pre
                     Add Special Case
                   </button>
                 </div>
+
+                <div id="record-wait-live-slot" hidden></div>
 
                 <div
                   id="alternate-screen-active"
@@ -1020,7 +1035,7 @@ Select Refresh Logs to load recent activity.</pre
 
                       <option value="bank_name">Bank Name</option>
 
-                      <option value="\_\_custom\_\_">
+                      <option value="__custom__">
                         Custom workflow variable…
                       </option>
                     </select>
@@ -1305,9 +1320,13 @@ Select Refresh Logs to load recent activity.</pre
               </button> -->
             </div>
 
-            <div class="operate-only manual-assistance-finish">
+            <div
+              id="manual-assistance-finish"
+              class="manual-assistance-finish"
+              hidden
+            >
               <button id="operate-verify-finish" class="primary" type="button">
-                Verify & Finish
+                Verify Phone Ready
               </button>
 
               <button id="operate-close-assistance" type="button">
@@ -1371,7 +1390,7 @@ Select Refresh Logs to load recent activity.</pre
         <button id="reload-dashboard" type="button">Reload Dashboard</button>
       </div>
 
-      <section id="automations" class="card">
+      <section id="automations" class="card admin-only">
         <div class="section-heading">
           <h2>Automations</h2>
         </div>
@@ -1381,6 +1400,7 @@ Select Refresh Logs to load recent activity.</pre
 
           <label>
             Bank Name
+
             <input
               id="flow-name"
               maxlength="160"
@@ -1398,8 +1418,6 @@ Select Refresh Logs to load recent activity.</pre
               <option value="balance_check">Balance Check</option>
             </select>
           </label>
-
-          <button id="flow-rename">Rename</button>
 
           <div class="flow-buttons">
             <button id="review-capture-keyboard" type="button">
@@ -1711,7 +1729,7 @@ Select Refresh Logs to load recent activity.</pre
 
                     <option value="bank_name">Bank Name</option>
 
-                    <option value="\_\_custom\_\_">
+                    <option value="__custom__">
                       Custom workflow variable…
                     </option>
                   </select>
@@ -1794,112 +1812,184 @@ Select Refresh Logs to load recent activity.</pre
           <details id="review-insert">
             <summary>Add Step</summary>
 
-            <label
-              >Insert after
+            <div class="add-step-builder">
+              <fieldset class="add-step-section">
+                <legend>1. Position</legend>
+                <label>
+                  Insert after
+                  <select id="insert-position"></select>
+                </label>
+              </fieldset>
 
-              <select id="insert-position"></select
-            ></label>
+              <fieldset class="add-step-section">
+                <legend>2. Step type</legend>
+                <div
+                  class="flow-buttons add-step-type-buttons"
+                  role="group"
+                  aria-label="Step type"
+                >
+                  <button
+                    type="button"
+                    data-add-step-type="wait"
+                    aria-pressed="true"
+                  >
+                    Wait
+                  </button>
+                  <button
+                    type="button"
+                    data-add-step-type="wait_for_text"
+                    aria-pressed="false"
+                  >
+                    Wait for Text
+                  </button>
+                  <button
+                    type="button"
+                    data-add-step-type="capture_screen"
+                    aria-pressed="false"
+                  >
+                    Screenshot
+                  </button>
+                  <button
+                    type="button"
+                    data-add-step-type="ocr_value"
+                    aria-pressed="false"
+                  >
+                    Read Value
+                  </button>
+                </div>
+              </fieldset>
 
-            <h4>Wait for Text</h4>
+              <fieldset class="add-step-section">
+                <legend>3. Settings</legend>
 
-            <label
-              >Text
+                <section id="add-step-wait">
+                  <div id="record-wait-review-slot">
+                    <div id="record-wait-controls">
+                      <h4>Wait</h4>
+                      <label class="duration-field">
+                        Duration
+                        <span>
+                          <input
+                            id="record-wait-seconds"
+                            type="number"
+                            min="0"
+                            max="3600"
+                            step="0.1"
+                            value="1"
+                            aria-label="Wait seconds"
+                          />
+                          seconds
+                        </span>
+                      </label>
+                      <div class="flow-buttons">
+                        <button id="record-wait-cancel" type="button">
+                          Cancel
+                        </button>
+                        <button id="record-wait" class="primary" type="button">
+                          Insert Step
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </section>
 
-              <input
-                id="record-text-value"
-                maxlength="500"
-                autocomplete="off"
-                placeholder="Transfer"
-              />
-            </label>
+                <section id="add-step-text" hidden>
+                  <h4>Wait for Text</h4>
+                  <label>
+                    Text
+                    <input
+                      id="record-text-value"
+                      maxlength="500"
+                      autocomplete="off"
+                      placeholder="Transfer"
+                    />
+                  </label>
+                  <label class="duration-field">
+                    Wait up to
+                    <span>
+                      <input
+                        id="record-text-timeout"
+                        type="number"
+                        min="0.5"
+                        max="300"
+                        step="any"
+                        value="10"
+                      />
+                      seconds
+                    </span>
+                  </label>
+                  <details id="record-text-advanced" class="advanced-options">
+                    <summary>Advanced options</summary>
+                    <div id="record-roi-picker"></div>
+                  </details>
+                  <div class="flow-buttons">
+                    <button type="button" data-add-step-cancel>Cancel</button>
+                    <button id="record-text" class="primary" type="button">
+                      Insert Step
+                    </button>
+                  </div>
+                </section>
 
-            <label class="duration-field">
-              Wait up to
+                <section id="add-step-screenshot" hidden>
+                  <h4>Capture Screenshot</h4>
+                  <p class="small">
+                    Capture the current phone screen and save it as workflow
+                    evidence.
+                  </p>
+                  <div class="flow-buttons">
+                    <button type="button" data-add-step-cancel>Cancel</button>
+                    <button
+                      id="record-screenshot"
+                      class="primary"
+                      type="button"
+                    >
+                      Insert Step
+                    </button>
+                  </div>
+                </section>
 
-              <span>
-                <input
-                  id="record-text-timeout"
-                  type="number"
-                  min="0.5"
-                  max="300"
-                  step="any"
-                  value="10"
-                />
-
-                seconds
-              </span>
-            </label>
-
-            <details id="record-text-advanced" class="advanced-options">
-              <summary>Advanced options</summary>
-
-              <div id="record-roi-picker"></div>
-            </details>
-
-            <button id="record-text">Insert Wait for Text</button>
-
-            <h4>Screenshot</h4>
-
-            <button id="record-screenshot" type="button">
-              Capture Screenshot
-            </button>
-
-            <h4>Read Balance</h4>
-
-            <label
-              >Read
-
-              <select id="record-value-preset">
-                <option value="balance">Balance</option>
-
-                <option value="custom">Custom Value</option>
-              </select></label
-            >
-
-            <label
-              >Step name
-
-              <input
-                id="record-value-name"
-                value="Available Balance"
-                maxlength="160"
-                readonly
-            /></label>
-
-            <label
-              >Parser
-
-              <select id="record-value-parser">
-                <option value="currency">Currency</option>
-              </select></label
-            >
-
-            <label
-              >Output variable
-
-              <input
-                id="record-value-output"
-                value="payer_balance"
-                maxlength="64"
-                readonly
-            /></label>
-
-            <div id="record-value-roi-picker"></div>
-
-            <button id="record-value" type="button">Insert Read Balance</button>
-
-            <h4>Wait</h4>
-
-            <div class="flow-buttons">
-              <input
-                id="record-wait-seconds"
-                type="number"
-                min="0"
-                max="3600"
-                step="0.1"
-                value="1"
-                aria-label="Wait seconds"
-              /><button id="record-wait">Insert Wait</button>
+                <section id="add-step-value" hidden>
+                  <h4>Read Value</h4>
+                  <label>
+                    Read
+                    <select id="record-value-preset">
+                      <option value="balance">Balance</option>
+                      <option value="custom">Custom Value</option>
+                    </select>
+                  </label>
+                  <label>
+                    Step name
+                    <input
+                      id="record-value-name"
+                      value="Available Balance"
+                      maxlength="160"
+                      readonly
+                    />
+                  </label>
+                  <label>
+                    Parser
+                    <select id="record-value-parser">
+                      <option value="currency">Currency</option>
+                    </select>
+                  </label>
+                  <label>
+                    Output variable
+                    <input
+                      id="record-value-output"
+                      value="payer_balance"
+                      maxlength="64"
+                      readonly
+                    />
+                  </label>
+                  <div id="record-value-roi-picker"></div>
+                  <div class="flow-buttons">
+                    <button type="button" data-add-step-cancel>Cancel</button>
+                    <button id="record-value" class="primary" type="button">
+                      Insert Step
+                    </button>
+                  </div>
+                </section>
+              </fieldset>
             </div>
           </details>
         </div>
