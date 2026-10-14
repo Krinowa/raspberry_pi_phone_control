@@ -76,7 +76,7 @@ let ocrRecommendedWorkerCount = null;
 const DEVICE_REFRESH_MS = 1000;
 const DEVICE_STATUS_STALE_MS = 5000;
 const RUNTIME_STATUS_MS = 2000;
-const PREVIEW_INTERVAL_MS = 65;
+const PREVIEW_INTERVAL_MS = 83;
 const PREVIEW_ERROR_RETRY_MS = 600;
 const PREVIEW_BACKGROUND_MS = 1000;
 let dashboardMode = "operate";
@@ -890,7 +890,7 @@ function startDevicePreview(deviceId, image, placeholder) {
       }
 
       nextUrl = null;
-      schedule(750);
+      schedule(200);
     } catch (_error) {
       if (nextUrl) URL.revokeObjectURL(nextUrl);
 
