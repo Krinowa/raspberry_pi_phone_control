@@ -121,6 +121,29 @@ class AccountBindingStore(_JsonStore):
             self._save_bindings(bindings)
             return binding
 
+    def replace_device_binding(self, device_id, data):
+        """Atomically replace the one local routing binding for a device."""
+        replacement = AccountBinding.create(data)
+        if replacement.device_id != device_id:
+            raise ValueError("Replacement account must remain on the same device.")
+        with self.lock:
+            bindings = self._bindings()
+            existing = next(
+                (item for item in bindings.values() if item.device_id == device_id),
+                None,
+            )
+            conflict = bindings.get(replacement.account_id)
+            if conflict is not None and conflict.device_id != device_id:
+                raise RecordConflict(
+                    "Account binding already exists on another device."
+                )
+            if existing is not None:
+                bindings.pop(existing.account_id)
+            bindings[replacement.account_id] = replacement
+            self._check_device(bindings, replacement, excluding=replacement.account_id)
+            self._save_bindings(bindings)
+            return replacement
+
     @staticmethod
     def _check_device(bindings, binding, excluding=None):
         duplicate = next(

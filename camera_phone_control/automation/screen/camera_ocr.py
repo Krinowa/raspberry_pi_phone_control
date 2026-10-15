@@ -1023,6 +1023,28 @@ class CameraOCRScreenStateProvider:
             pass
         return math.inf, math.inf, index
 
+    @staticmethod
+    def _bounds(box):
+        try:
+            values = np.asarray(box, dtype=float)
+            if values.shape == (4,):
+                left, top, right, bottom = values.tolist()
+            elif values.ndim == 2 and values.shape[1] == 2:
+                left = float(values[:, 0].min())
+                top = float(values[:, 1].min())
+                right = float(values[:, 0].max())
+                bottom = float(values[:, 1].max())
+            else:
+                return None
+            bounds = [float(left), float(top), float(right), float(bottom)]
+            if not all(math.isfinite(value) for value in bounds):
+                return None
+            if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                return None
+            return bounds
+        except (TypeError, ValueError):
+            return None
+
     @classmethod
     def _candidates_from_results(cls, results):
         candidates, position = [], 0
@@ -1050,14 +1072,18 @@ class CameraOCRScreenStateProvider:
                     confidence *= 100
                 confidence = min(confidence, 100.0)
                 box = boxes[index] if index < len(boxes) else None
+                candidate = {
+                    "text": text,
+                    "confidence": confidence,
+                    "min_confidence": confidence,
+                }
+                bounds = cls._bounds(box)
+                if bounds is not None:
+                    candidate["box"] = bounds
                 candidates.append(
                     (
                         cls._position(box, position),
-                        {
-                            "text": text,
-                            "confidence": confidence,
-                            "min_confidence": confidence,
-                        },
+                        candidate,
                     )
                 )
                 position += 1
@@ -1315,6 +1341,23 @@ class CameraOCRScreenStateProvider:
 
     def visible_texts(self):
         return [item["text"] for item in self.visible_text_candidates()]
+
+    def visible_text_candidates_in_roi(self, roi):
+        """Recognize only an explicitly selected normalized screen region."""
+        total_started = time.monotonic()
+        snapshot, sequence, timings = self._capture_snapshot_with_timings()
+        cropped = self._crop_roi(snapshot, roi)
+        candidates = self._recognize_candidates(
+            cropped,
+            timings=timings,
+            total_started=total_started,
+            frame_id=sequence,
+            scope="roi:verify_text:" + repr(tuple(normalized_roi(roi))),
+        )
+        return candidates
+
+    def visible_texts_in_roi(self, roi):
+        return [item["text"] for item in self.visible_text_candidates_in_roi(roi)]
 
     def contains_text(self, text, *, image=None):
         expected = " ".join(text.split()).casefold()

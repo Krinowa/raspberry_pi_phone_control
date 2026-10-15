@@ -1,6 +1,7 @@
 """Dashboard-wide pending selection and phone reservation coordinator."""
 
 import logging
+import re
 import threading
 import time
 import uuid
@@ -10,6 +11,26 @@ from .client import APIError
 from .journal import TERMINAL
 
 LOG = logging.getLogger("withdraw_v2")
+
+
+def _sanitized_lock_reason(error):
+    """Retain useful lock diagnostics without persisting credentials."""
+    reason = str(error).strip() or type(error).__name__
+    reason = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer <redacted>", reason)
+    reason = re.sub(
+        r"(?i)\b(?:authorization|token|password|otp|secret|auth|cookie|set-cookie)\b"
+        r"\s*[:=]\s*[^\s,;]+",
+        "<redacted>",
+        reason,
+    )
+    return reason.replace("\r", " ").replace("\n", " ")[:500]
+
+
+def _sanitized_pending_value(value):
+    """Render an explicitly approved pending field safely for diagnostics."""
+    if value is None:
+        return None
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(value))[:200]
 
 
 class WithdrawDispatcher:
@@ -131,14 +152,34 @@ class WithdrawDispatcher:
                 )
                 continue
 
+            LOG.info(
+                "[withdraw-dispatch] client-pending device=%s result_count=%s",
+                worker.device_id,
+                len(pending),
+            )
             for item in pending:
                 withdraw_id = item.get("id")
                 tx_id = item.get("tx_id")
+                LOG.info(
+                    "[withdraw-dispatch] client-pending device=%s id=%s "
+                    "tx_id=%s final_amount=%s",
+                    worker.device_id,
+                    _sanitized_pending_value(withdraw_id),
+                    _sanitized_pending_value(tx_id),
+                    _sanitized_pending_value(item.get("final_amount")),
+                )
                 if (
                     type(withdraw_id) is not int
                     or not isinstance(tx_id, str)
                     or not tx_id
                 ):
+                    LOG.info(
+                        "[withdraw-dispatch] client-pending skip reason=invalid_identity "
+                        "id=%s tx_id=%s final_amount=%s",
+                        _sanitized_pending_value(withdraw_id),
+                        _sanitized_pending_value(tx_id),
+                        _sanitized_pending_value(item.get("final_amount")),
+                    )
                     continue
 
                 found = by_id.get(withdraw_id)
@@ -146,6 +187,14 @@ class WithdrawDispatcher:
                 if found:
                     if found["item"].get("tx_id") != tx_id:
                         inconsistent.add(withdraw_id)
+                        LOG.info(
+                            "[withdraw-dispatch] client-pending skip "
+                            "reason=inconsistent_identity id=%s tx_id=%s "
+                            "final_amount=%s",
+                            _sanitized_pending_value(withdraw_id),
+                            _sanitized_pending_value(tx_id),
+                            _sanitized_pending_value(item.get("final_amount")),
+                        )
                     found["visible"].add(worker.device_id)
                     continue
 
@@ -171,10 +220,13 @@ class WithdrawDispatcher:
     def _log_skip(worker, item, reason, *, detail=None):
         suffix = f" detail={detail}" if detail else ""
         LOG.info(
-            "[withdraw-dispatch] skip device=%s reason=%s withdrawal=%s%s",
+            "[withdraw-dispatch] client-pending skip device=%s reason=%s "
+            "id=%s tx_id=%s final_amount=%s%s",
             worker.device_id,
             reason,
-            item.get("id"),
+            _sanitized_pending_value(item.get("id")),
+            _sanitized_pending_value(item.get("tx_id")),
+            _sanitized_pending_value(item.get("final_amount")),
             suffix,
         )
         return False
@@ -220,9 +272,9 @@ class WithdrawDispatcher:
         if worker.device_id not in visible:
             return self._log_skip(worker, item, "payment_record_not_allowed")
         if (
-            type(worker.api.get("operator_id")) is not int
+            not worker.api.get("base_url")
+            or type(worker.api.get("operator_id")) is not int
             or not worker.api.get("username")
-            or not worker.api.get("credential_reference")
         ):
             unavailable[worker.device_id] = "no_assignment"
             return self._log_skip(worker, item, "no_assignment")
@@ -395,12 +447,28 @@ class WithdrawDispatcher:
         self._clear_reservation(worker, token)
         worker.set_state("IDLE")
 
-    def _ambiguous(self, worker, token):
+    def _ambiguous(self, worker, token, item, *, stage, error):
+        reason = _sanitized_lock_reason(error)
+        error_type = type(error).__name__
+        LOG.warning(
+            "Withdraw lock result ambiguous operation=client-lock stage=%s "
+            "device=%s withdraw_id=%s tx_id=%s error=%s: %s",
+            stage,
+            worker.device_id,
+            item.get("id"),
+            item.get("tx_id"),
+            error_type,
+            reason,
+        )
         self._clear_reservation(worker, token)
         worker.stop_renewal()
         worker.attention(
             "External lock result is uncertain. Reconcile this withdrawal "
-            "before retrying."
+            "before retrying.",
+            ambiguity_operation="client-lock",
+            ambiguity_stage=stage,
+            ambiguity_error_type=error_type,
+            ambiguity_reason=reason,
         )
 
     def _try_assignment(self, worker, item):
@@ -434,10 +502,22 @@ class WithdrawDispatcher:
                 self._reject(worker, token, "Withdrawal is no longer payable.")
                 return "stop"
 
-            self._ambiguous(worker, token)
+            self._ambiguous(
+                worker,
+                token,
+                item,
+                stage=getattr(exc, "withdraw_stage", "client-lock-action"),
+                error=exc,
+            )
             return "stop"
-        except Exception:
-            self._ambiguous(worker, token)
+        except Exception as exc:
+            self._ambiguous(
+                worker,
+                token,
+                item,
+                stage=getattr(exc, "withdraw_stage", "client-lock-action"),
+                error=exc,
+            )
             return "stop"
         try:
             LOG.info(
@@ -446,8 +526,14 @@ class WithdrawDispatcher:
                 item["id"],
             )
             worker.accept_locked(raw, token)
-        except Exception:
-            self._ambiguous(worker, token)
+        except Exception as exc:
+            self._ambiguous(
+                worker,
+                token,
+                item,
+                stage="assignment-handoff",
+                error=exc,
+            )
             return "stop"
         return "assigned"
 
@@ -456,14 +542,20 @@ class WithdrawDispatcher:
             final_amount(item)
         except (ValueError, TypeError):
             LOG.info(
-                "[withdraw-dispatch] skip withdrawal=%s reason=invalid_amount",
-                item.get("id"),
+                "[withdraw-dispatch] client-pending skip reason=invalid_amount "
+                "id=%s tx_id=%s final_amount=%s",
+                _sanitized_pending_value(item.get("id")),
+                _sanitized_pending_value(item.get("tx_id")),
+                _sanitized_pending_value(item.get("final_amount")),
             )
             return False
         if self.journal.identity_conflict(item["id"], item["tx_id"]):
             LOG.info(
-                "[withdraw-dispatch] skip withdrawal=%s reason=duplicate_withdrawal",
-                item["id"],
+                "[withdraw-dispatch] client-pending skip "
+                "reason=duplicate_withdrawal id=%s tx_id=%s final_amount=%s",
+                _sanitized_pending_value(item.get("id")),
+                _sanitized_pending_value(item.get("tx_id")),
+                _sanitized_pending_value(item.get("final_amount")),
             )
             return False
         for worker in self._ordered_candidates(item, visible, unavailable):
@@ -495,15 +587,6 @@ class WithdrawDispatcher:
             for entry in self._pending_snapshot(workers):
                 if self.stop.is_set():
                     break
-                item = entry["item"]
-                LOG.info(
-                    "[withdraw-dispatch] pending id=%s tx=%s record=%s amount=%s priority=%s",
-                    item.get("id"),
-                    item.get("tx_id"),
-                    item.get("payment_record"),
-                    item.get("final_amount"),
-                    item.get("priority"),
-                )
                 self._dispatch_item(entry["item"], entry["visible"], unavailable)
             return True
         finally:

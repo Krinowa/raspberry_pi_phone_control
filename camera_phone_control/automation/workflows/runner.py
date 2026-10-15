@@ -9,6 +9,7 @@ from ..input.base import UnsupportedOperation
 from ..screen.state import (
     ScreenStateError,
     UnavailableScreenStateProvider,
+    verify_text_on_screen,
     wait_for_text,
 )
 from ..screen.stability import wait_until_stable
@@ -178,7 +179,11 @@ class WorkflowRunner:
 
     def _prepare_text_wait_baseline(self, step, following):
         """Capture a cheap pre-action frame for a following camera text wait."""
-        if not following or following["type"] not in {"wait_for_text", "if_text"}:
+        if not following or following["type"] not in {
+            "wait_for_text",
+            "if_text",
+            "verify_text",
+        }:
             return
         physical_action = step["type"] in {"tap", "swipe", "key"} or (
             step["type"] == "input" and step.get("source") != "manual"
@@ -249,6 +254,39 @@ class WorkflowRunner:
                 roi=step.get("roi"),
             )
             ctx.logger.info("Text detected: %s", step["text"])
+        elif kind == "verify_text":
+            source = step["source"]
+            reference = step.get("variable") if source == "variable" else "fixed"
+            ctx.logger.info(
+                "Verifying field=%s match_mode=%s",
+                reference,
+                step["match_mode"],
+            )
+            expected = (
+                values[step["variable"]] if source == "variable" else step["text"]
+            )
+            try:
+                verify_text_on_screen(
+                    self.screen_state_provider,
+                    ctx,
+                    expected,
+                    step["timeout_seconds"],
+                    match_mode=step["match_mode"],
+                    last_n=step.get("last_n"),
+                    roi=step.get("roi"),
+                )
+            except (ValueError, ScreenStateError):
+                ctx.logger.info(
+                    "Text verification failed field=%s match_mode=%s",
+                    reference,
+                    step["match_mode"],
+                )
+                raise
+            ctx.logger.info(
+                "Text verification passed field=%s match_mode=%s",
+                reference,
+                step["match_mode"],
+            )
         elif kind == "if_text":
             ctx.logger.info("Evaluating text condition: %s", step["text"])
             matched = wait_for_text(

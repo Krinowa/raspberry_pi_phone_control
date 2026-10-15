@@ -11,6 +11,7 @@ STEP_TYPES = {
     "wait",
     "wait_until_stable",
     "wait_for_text",
+    "verify_text",
     "if_text",
     "capture_screen",
     "ocr_value",

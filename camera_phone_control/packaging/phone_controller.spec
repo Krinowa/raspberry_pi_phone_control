@@ -4,7 +4,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
 APP_ROOT = Path(SPECPATH).parent
@@ -28,6 +28,10 @@ datas = [
 ]
 binaries = []
 hiddenimports = []
+
+# websocket-client is given certifi.where() explicitly for WSS verification.
+# Bundle certifi's cacert.pem so that path also exists in the installed onedir app.
+datas += collect_data_files("certifi")
 
 for model_name in model_names:
     model = model_root / model_name

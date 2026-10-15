@@ -408,9 +408,38 @@ const jobService = {
     api(`/api/jobs/${encodeURIComponent(jobId)}/retry`, { mode }),
 };
 
-function latestRelevantJobForDevice(deviceId) {
+const TERMINAL_WITHDRAW_PHASES = new Set([
+  "CONFIRMED",
+  "RELEASED",
+  "CANCELLED",
+  "LOCK_REJECTED",
+]);
+
+function latestRelevantJobForDevice(deviceId, withdrawStatus = null) {
   const jobs = Array.isArray(jobCatalog) ? jobCatalog : [];
-  return [...jobs].reverse().find((job) => job.device_id === deviceId) || null;
+  const deviceJobs = [...jobs]
+    .reverse()
+    .filter((job) => job.device_id === deviceId);
+  const phase = withdrawStatus?.phase;
+  const currentWithdrawal =
+    typeof phase === "string" && !TERMINAL_WITHDRAW_PHASES.has(phase);
+  if (!currentWithdrawal) return deviceJobs[0] || null;
+
+  const matchesWithdrawal = (job) =>
+    job.action === "withdraw_v2" &&
+    (!withdrawStatus?.tx_id || job.external_ref === withdrawStatus.tx_id);
+
+  if (withdrawStatus?.job_id) {
+    return (
+      deviceJobs.find(
+        (job) => job.job_id === withdrawStatus.job_id && matchesWithdrawal(job),
+      ) || null
+    );
+  }
+  if (withdrawStatus?.tx_id) {
+    return deviceJobs.find(matchesWithdrawal) || null;
+  }
+  return null;
 }
 
 function availableJobActions(job) {
@@ -1111,6 +1140,7 @@ function friendlyWorkflowStepType(type) {
     wait: "Wait",
     wait_until_stable: "Wait Until Stable",
     wait_for_text: "Wait for Text",
+    verify_text: "Verify Text",
     manual_checkpoint: "Manual Checkpoint",
     ocr_value: "Read Value",
     capture_screen: "Capture Screenshot",
@@ -1150,7 +1180,7 @@ function renderDevices() {
       withdraw.status?.phase === "NEEDS_ATTENTION";
     const camera = details.config || {};
     const status = cameraState(details);
-    const latestJob = latestRelevantJobForDevice(device.id);
+    const latestJob = latestRelevantJobForDevice(device.id, withdraw.status);
     const recoveryJob =
       latestJob &&
       ["FAILED", "INTERRUPTED"].includes(latestJob.status) &&
@@ -1574,7 +1604,10 @@ function renderDevices() {
         withdraw.status?.error || "Withdrawal recovery requires attention.",
       );
 
-      jobSummary.append(issueLabel, issueMessage);
+      const jobState = document.createElement("span");
+      jobState.textContent = "Current job: —";
+
+      jobSummary.append(issueLabel, jobState, issueMessage);
     } else if (manualWorkflowNeedsAttention) {
       jobSummary = document.createElement("div");
       jobSummary.className = "device-job-summary device-issue-summary";
@@ -1857,7 +1890,14 @@ function friendlyOperationalError(message) {
   if (/calibrat/.test(value)) return "Calibration required";
   if (/camera/.test(value)) return "Camera unavailable";
   if (/ocr|paddle|text detection/.test(value)) return "OCR unavailable";
-  if (/busy|lock|ownership/.test(value)) return "Device busy";
+  if (
+    /device (?:is )?busy|already has a running job|active reservation|scheduler reservation|device ownership/.test(
+      value,
+    )
+  )
+    return "Device busy";
+  if (/external lock result is uncertain/.test(value))
+    return "Withdrawal lock status is uncertain. Reconcile before retrying.";
   if (/raspberry|pi api|pi unavailable|cannot reach pi/.test(value))
     return "Raspberry Pi unavailable";
   if (/disconnect|bluetooth|phone unavailable/.test(value))
@@ -2438,52 +2478,76 @@ function closeWithdrawSettings() {
 
 function openWithdrawSettings(device, details = {}) {
   const api = details.withdraw_api || {};
+
   withdrawSettingsDeviceId = device.id;
   withdrawSettingsAssigned =
     details.assigned === true ||
     (Number.isInteger(api.operator_id) && !!api.username);
+
   $("withdraw-settings-title").textContent =
     `Withdraw Account · ${device.name || device.id}`;
+
   $("withdraw-settings-status").textContent = withdrawSettingsAssigned
     ? "Account Status: Assigned"
     : "Account Status: Not Assigned";
+
   $("withdraw-settings-identity").textContent = withdrawSettingsAssigned
-    ? `Username: ${api.username} · Account ID: ${api.operator_id} · Payment Records: ${api.payment_records?.length ? api.payment_records.join(", ") : "None"}`
+    ? `Username: ${api.username} · Account ID: ${api.operator_id} · Payment Records: ${
+        api.payment_records?.length ? api.payment_records.join(", ") : "None"
+      }`
     : "Login with the external operator account assigned to this phone.";
+
   $("withdraw-settings-username").value = api.username || "";
+
   $("withdraw-settings-password").value = "";
   $("withdraw-settings-password").placeholder = details.credentials_saved
-    ? "Saved — enter a new password to change account"
+    ? "Enter password to authenticate"
     : "";
+
   $("withdraw-settings-totp").value = "";
-  $("withdraw-settings-totp").placeholder = details.credentials_saved
-    ? "Saved — enter a new secret to change account"
-    : "";
+  $("withdraw-settings-totp").placeholder = "123456";
+
   $("withdraw-settings-submit").textContent = withdrawSettingsAssigned
-    ? "Change Account"
+    ? "Reauthenticate"
     : "Login & Assign";
+
   $("withdraw-settings-dialog").hidden = false;
+
   setWithdrawSettingsError();
+
   $("withdraw-settings-username").focus();
 }
 
 async function saveWithdrawSettings(event) {
   event.preventDefault();
+
   if (!withdrawSettingsDeviceId) return;
+
   const button = $("withdraw-settings-submit");
+  const g2fCode = $("withdraw-settings-totp").value.trim();
+
+  if (!/^\d{6}$/.test(g2fCode)) {
+    setWithdrawSettingsError("Google 2FA code must be exactly 6 digits.");
+    $("withdraw-settings-totp").focus();
+    return;
+  }
+
   button.disabled = true;
   setWithdrawSettingsError();
+
   try {
     const result = await deviceService.loginWithdraw(withdrawSettingsDeviceId, {
       username: $("withdraw-settings-username").value.trim(),
       password: $("withdraw-settings-password").value,
-      totp_secret: $("withdraw-settings-totp").value.trim(),
+      g2f_code: g2fCode,
     });
+
     const deviceId = withdrawSettingsDeviceId;
+
     deviceWithdrawDetails[deviceId] = {
       ...(deviceWithdrawDetails[deviceId] || {}),
       assigned: true,
-      credentials_saved: true,
+      credentials_saved: result.credentials_saved === true,
       withdraw_api: {
         ...(deviceWithdrawDetails[deviceId]?.withdraw_api || {}),
         operator_id: result.operator_id,
@@ -2491,14 +2555,19 @@ async function saveWithdrawSettings(event) {
         payment_records: result.payment_records || [],
       },
     };
+
     closeWithdrawSettings();
+
     deviceRenderSignature = null;
     renderDevices();
-    notice("Withdraw account assigned to this phone.");
+
+    notice("Withdraw account authenticated successfully.");
+
     await loadDevices();
   } catch (error) {
     setWithdrawSettingsError(error.message);
   } finally {
+    $("withdraw-settings-totp").value = "";
     button.disabled = false;
   }
 }

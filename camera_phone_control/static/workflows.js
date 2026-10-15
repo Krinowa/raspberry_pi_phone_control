@@ -88,6 +88,10 @@
     if (step.type === "wait_for_text")
       return `Wait for Text — “${step.text}” · Wait up to ${step.timeout_seconds} sec`;
 
+    if (step.type === "verify_text") {
+      return `Verify Text — ${verifyFieldConfig(step.variable)?.label || "Configured field"}`;
+    }
+
     if (step.type === "if_text") return `Special Case — “${step.text}”`;
     if (step.type === "ocr_value")
       return `Read Balance — ${step.label || step.output}`;
@@ -169,6 +173,7 @@
     variableInputOpen = false,
     readValueOpen = false,
     liveWaitOpen = false,
+    liveVerifyOpen = false,
     addStepType = "wait",
     returnToVariableInput = false,
     alternateSetupOpen = false,
@@ -183,6 +188,7 @@
     variableInputOpen ||
     readValueOpen ||
     liveWaitOpen ||
+    liveVerifyOpen ||
     alternateSetupOpen;
 
   function keyboardOptions(select, captureOption = false) {
@@ -457,6 +463,7 @@
   const addStepSections = {
     wait: "add-step-wait",
     wait_for_text: "add-step-text",
+    verify_text: "add-step-verify",
     capture_screen: "add-step-screenshot",
     ocr_value: "add-step-value",
   };
@@ -488,6 +495,7 @@
       const focusTarget = {
         wait: "record-wait-seconds",
         wait_for_text: "record-text-value",
+        verify_text: "verify-field",
         ocr_value: "record-value-preset",
       }[addStepType];
 
@@ -828,6 +836,16 @@
     waitControls.hidden = live && !liveWaitOpen;
     $("record-wait").textContent = live ? "Add Wait" : "Insert Wait";
 
+    const verifyControls = $("record-verify-controls");
+    const verifySlot = live
+      ? $("record-verify-live-slot")
+      : $("record-verify-review-slot");
+    if (verifyControls.parentElement !== verifySlot)
+      verifySlot.append(verifyControls);
+    $("record-verify-live-slot").hidden = !live || !liveVerifyOpen;
+    verifyControls.hidden = live && !liveVerifyOpen;
+    $("verify-add").textContent = live ? "Add Verification" : "Insert Step";
+
     if (!live) renderAddStepType();
 
     $("review-flow").hidden = !draft || live;
@@ -864,6 +882,7 @@
     $("record-expect-current").disabled = stopping || annotationBusy();
     $("record-read-value").disabled = stopping || annotationBusy();
     $("record-wait-here").disabled = stopping || annotationBusy();
+    $("record-verify-text-here").disabled = stopping || annotationBusy();
     $("record-capture-keyboard").disabled = stopping || annotationBusy();
     $("review-capture-keyboard").disabled = annotationBusy();
     $("record-input-variable").disabled = stopping || annotationBusy();
@@ -999,7 +1018,12 @@
   }
 
   function variableChoiceFields(selectId, customFieldId, customId, name) {
-    const predefined = ["account_number", "amount", "bank_name"];
+    const predefined = [
+      "account_number",
+      "account_name",
+      "amount",
+      "bank_name",
+    ];
     if (name === "__custom__") {
       $(selectId).value = name;
       $(customFieldId).hidden = false;
@@ -1043,6 +1067,7 @@
       "step-text-options",
       ["wait_for_text", "if_text"].includes(step.type),
     );
+    setSectionVisible("step-verify-options", step.type === "verify_text");
 
     $("step-stable-ms").value = step.stable_ms ?? 700;
     $("step-stable-timeout").value = step.timeout_seconds ?? 10;
@@ -1052,6 +1077,13 @@
 
     stepROIPicker.reset(step.roi);
     $("step-text-advanced").open = !!step.roi;
+
+    if (step.type === "verify_text") {
+      $("step-verify-field").value = verifyFieldConfig(step.variable)
+        ? step.variable
+        : "account_name";
+      stepVerifyROIPicker.reset(step.roi);
+    }
 
     // Tap
     if (step.type === "tap") {
@@ -1300,6 +1332,14 @@
         });
       }
 
+      if (old.type === "verify_text") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: verifyTextFields("step-verify", stepVerifyROIPicker, old.roi),
+        });
+      }
+
       if (old.type === "wait") {
         if (!Number.isFinite(seconds) || seconds < 0 || seconds > 3600) {
           throw new Error("Wait duration must be between 0 and 3600 seconds.");
@@ -1505,8 +1545,14 @@
       canvas.addEventListener(name, () => {
         start = null;
       });
-    $(`${prefix}-roi-test`).addEventListener("click", () =>
+    const testButton = $(`${prefix}-roi-test`);
+    if (!parser && !textPrefix) {
+      testButton.hidden = true;
+      testButton.disabled = true;
+    }
+    testButton.addEventListener("click", () =>
       task(async () => {
+        if (!parser && !textPrefix) return;
         if (!token) throw new Error("Select an OCR region snapshot first.");
         const testedGeneration = generation;
         const text = parser ? "" : $(`${textPrefix}-text-value`).value.trim();
@@ -1529,7 +1575,9 @@
   }
 
   const stepROIPicker = createRegionOCRPicker("step", "step");
+  const stepVerifyROIPicker = createRegionOCRPicker("step-verify", null);
   const recordROIPicker = createRegionOCRPicker("record", "record");
+  const verifyROIPicker = createRegionOCRPicker("verify", null);
   const conditionROIPicker = createRegionOCRPicker("condition", "condition");
   const expectedROIPicker = createRegionOCRPicker("expected", "expected");
   const valueROIPicker = createRegionOCRPicker("value", null, "currency");
@@ -1546,7 +1594,39 @@
   liveValueROIPicker.reset(null);
   recordValueROIPicker.reset(null);
   recordROIPicker.reset(null);
+  verifyROIPicker.reset(null);
   conditionROIPicker.reset(null);
+
+  const VERIFY_FIELDS = Object.freeze({
+    account_name: Object.freeze({
+      label: "Account Name",
+      match_mode: "account_name",
+    }),
+    account_number: Object.freeze({
+      label: "Account Number",
+      match_mode: "account_number",
+    }),
+    bank_name: Object.freeze({ label: "Bank Name", match_mode: "contains" }),
+    amount: Object.freeze({ label: "Amount", match_mode: "amount" }),
+  });
+
+  function verifyFieldConfig(variable) {
+    return VERIFY_FIELDS[variable] || null;
+  }
+
+  function verifyTextFields(prefix, picker, existingROI = null) {
+    const variable = $(`${prefix}-field`).value;
+    const config = verifyFieldConfig(variable);
+    if (!config) throw new Error("Choose a field to verify.");
+    const fields = {
+      source: "variable",
+      variable,
+      match_mode: config.match_mode,
+      timeout_seconds: 5,
+    };
+    Object.assign(fields, picker.fields(existingROI));
+    return fields;
+  }
 
   function textWaitFields(prefix) {
     const text = $(`${prefix}-text-value`).value.trim();
@@ -1595,6 +1675,37 @@
       $("record-text-advanced").open = false;
     }),
   );
+
+  $("verify-add").addEventListener("click", () =>
+    task(async () => {
+      const step = {
+        type: "verify_text",
+        ...verifyTextFields("verify", verifyROIPicker),
+      };
+      step.label = `Verify ${verifyFieldConfig(step.variable).label}`;
+      if (recording.active) {
+        await pendingManual;
+        await captureQueue;
+        recording = await api("/api/recorder/step", {
+          capture: false,
+          step,
+        });
+        liveVerifyOpen = false;
+        show("Text verification added. Recording continues.");
+      } else {
+        await review(insertionPayload(step));
+        closeAddStep();
+      }
+      verifyROIPicker.reset(null);
+    }),
+  );
+
+  $("verify-cancel").addEventListener("click", () => {
+    if (recording.active) {
+      liveVerifyOpen = false;
+      renderRecording();
+    } else closeAddStep();
+  });
 
   $("record-wait").addEventListener("click", () =>
     task(async () => {
@@ -2037,6 +2148,18 @@
         $("record-wait-seconds").focus();
         $("record-wait-seconds").select();
       });
+    }),
+  );
+
+  $("record-verify-text-here").addEventListener("click", () =>
+    task(async () => {
+      if (!recording.active || stopping || annotationBusy()) return;
+      await pendingManual;
+      await flushText();
+      await captureQueue;
+      liveVerifyOpen = true;
+      renderRecording();
+      requestAnimationFrame(() => $("verify-field").focus());
     }),
   );
 

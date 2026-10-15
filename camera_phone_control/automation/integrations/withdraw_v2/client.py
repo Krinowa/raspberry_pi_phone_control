@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import pyotp
 import requests
 
 API_PATH = "/api/admin-withdraw/v2"
@@ -58,16 +57,20 @@ def response_data(body, code=200):
     ):
         raise APIError(code, "Withdraw API returned an unsuccessful response.")
     data = body.get("data")
+
     # PHP may serialize an empty response as [] rather than {}.
     if data == []:
         return {}
+
     if not isinstance(data, dict):
         raise APIError(code, "Withdraw API response data must be an object.")
+
     return deepcopy(data)
 
 
 def retry_delay(headers):
     value = headers.get("Retry-After", "60")
+
     try:
         return max(1, int(value))
     except (TypeError, ValueError):
@@ -86,18 +89,19 @@ class WithdrawClient:
     def __init__(self, base_url, *, http=None):
         self.origin = base_origin(base_url)
         self.http = http or requests.Session()
-        self.http.trust_env = (
-            False  # Do not substitute .netrc credentials for this worker.
-        )
+        self.http.trust_env = False
         self.token = None
         self.profile = None
 
     def request(self, method, path, *, raw=False, **kwargs):
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("API paths must stay on the configured API host.")
+
         headers = {"Accept": "application/json"}
+
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
+
         try:
             response = self.http.request(
                 method,
@@ -109,28 +113,47 @@ class WithdrawClient:
             )
         except requests.RequestException:
             raise UncertainResult() from None
+
         if response.status_code != 200:
             raise APIError(
                 response.status_code,
                 f"Withdraw API returned HTTP {response.status_code}.",
                 retry_after=retry_delay(response.headers),
             )
+
         try:
             body = response.json()
         except ValueError:
             raise UncertainResult() from None
+
         if raw:
             if not isinstance(body, dict):
-                raise APIError(0, "Invalid private-channel authorization response.")
+                raise APIError(
+                    0,
+                    "Invalid private-channel authorization response.",
+                )
             return body
+
         return response_data(body)
 
-    def login(self, username, password, totp_secret, operator_id=None):
-        self.token = self.profile = None
-        try:
-            code = pyotp.TOTP(totp_secret).now()
-        except Exception:
-            raise ValueError("External TOTP credential is invalid.") from None
+    def login(self, username, password, g2f_code, operator_id=None):
+        """
+        Authenticate using the current six-digit Google Authenticator code.
+
+        g2f_code is the rotating OTP currently shown by Google Authenticator.
+        It must not be stored or reused after this login attempt.
+        """
+        self.token = None
+        self.profile = None
+
+        if not isinstance(g2f_code, str):
+            raise ValueError("Google 2FA code must be exactly 6 digits.")
+
+        code = g2f_code.strip()
+
+        if len(code) != 6 or not code.isdigit():
+            raise ValueError("Google 2FA code must be exactly 6 digits.")
+
         profile = self.request(
             "POST",
             API_PATH + "/login",
@@ -140,11 +163,13 @@ class WithdrawClient:
                 "g2f_code": code,
             },
         )
+
         valid_operator = (
             profile.get("role") == "operator"
             and type(profile.get("id")) is int
             and profile["id"] > 0
         )
+
         if not valid_operator or (
             operator_id is not None and profile["id"] != operator_id
         ):
@@ -152,11 +177,22 @@ class WithdrawClient:
                 403,
                 "Login account is not an authorized operator or does not match this device.",
             )
+
         if not isinstance(profile.get("token"), str) or not profile["token"]:
-            raise APIError(0, "Login response is missing the session token.")
+            raise APIError(
+                0,
+                "Login response is missing the session token.",
+            )
+
         if not isinstance(profile.get("realtime"), dict):
-            raise APIError(0, "Login response is missing realtime configuration.")
-        self.token, self.profile = profile["token"], profile
+            raise APIError(
+                0,
+                "Login response is missing realtime configuration.",
+            )
+
+        self.token = profile["token"]
+        self.profile = profile
+
         return deepcopy(profile)
 
     def authorize(self, endpoint, socket_id, channel):
@@ -169,53 +205,83 @@ class WithdrawClient:
                 "channel_name": channel,
             },
         )
+
         if not isinstance(body.get("auth"), str) or not body["auth"]:
-            raise APIError(0, "Private-channel authorization was not granted.")
+            raise APIError(
+                0,
+                "Private-channel authorization was not granted.",
+            )
+
         return body
 
     def logout(self):
         try:
-            return self.request("POST", API_PATH + "/logout")
+            return self.request(
+                "POST",
+                API_PATH + "/logout",
+            )
         finally:
-            self.token = self.profile = None
+            self.token = None
+            self.profile = None
 
     def confirm_with_receipt(self, withdraw_id, receipt_path):
         if type(withdraw_id) is not int or withdraw_id <= 0:
             raise ValueError("Invalid withdrawal ID.")
+
         path = Path(receipt_path)
+
         if (
             path.is_symlink()
             or not path.is_file()
             or not 0 < path.stat().st_size <= 10 * 1024 * 1024
         ):
             raise ValueError("Receipt must be a nonempty regular file, at most 10 MB.")
+
         mime = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".png": "image/png",
             ".pdf": "application/pdf",
         }.get(path.suffix.lower())
+
         if mime is None:
             raise ValueError("Unsupported receipt format.")
+
         with path.open("rb") as stream:
             return self.request(
                 "POST",
                 f"{API_PATH}/withdrawals/{withdraw_id}/confirm",
-                files={"proof": (path.name, stream, mime)},
+                files={
+                    "proof": (
+                        path.name,
+                        stream,
+                        mime,
+                    )
+                },
             )
 
     def reconcile_confirmation(self, tx_id, withdraw_id):
-        # The documented tx_id search is PARTIAL. Match both identifiers exactly,
-        # and scan pages; a substring match must never count as confirmation.
+        # The documented tx_id search is PARTIAL.
+        # Match both identifiers exactly, and scan pages.
+        # A substring match must never count as confirmation.
         for page in range(1, 101):
             data = self.request(
                 "GET",
                 API_PATH + "/withdrawals/my-approved",
-                params={"tx_id": tx_id, "page": page},
+                params={
+                    "tx_id": tx_id,
+                    "page": page,
+                },
             )
+
             items = data.get("withdrawals")
+
             if not isinstance(items, list):
-                raise APIError(0, "Invalid my-approved response.")
+                raise APIError(
+                    0,
+                    "Invalid my-approved response.",
+                )
+
             for item in items:
                 if (
                     isinstance(item, dict)
@@ -226,16 +292,29 @@ class WithdrawClient:
                     and item["status"] in (1, 6)
                 ):
                     return True
-            pagination = data.get("pagination", {})
+
+            pagination = data.get(
+                "pagination",
+                {},
+            )
+
             last = pagination.get("last_page")
+
             if type(last) is not int or last < page:
-                raise APIError(0, "Invalid my-approved pagination.")
+                raise APIError(
+                    0,
+                    "Invalid my-approved pagination.",
+                )
+
             if page == last:
                 return False
+
         raise APIError(
-            0, "Confirmation search exceeded the page limit; review is required."
+            0,
+            "Confirmation search exceeded the page limit; review is required.",
         )
 
     def close(self):
         self.http.close()
-        self.token = self.profile = None
+        self.token = None
+        self.profile = None

@@ -340,6 +340,15 @@ def validate_workflow(workflow, *, allow_empty=False):
             "wait": {"seconds"},
             "wait_until_stable": {"stable_ms", "timeout_seconds"},
             "wait_for_text": {"text", "timeout_seconds", "roi"},
+            "verify_text": {
+                "source",
+                "text",
+                "variable",
+                "match_mode",
+                "last_n",
+                "timeout_seconds",
+                "roi",
+            },
             "if_text": {
                 "text",
                 "timeout_seconds",
@@ -457,6 +466,56 @@ def validate_workflow(workflow, *, allow_empty=False):
             step["roi"] = dict(
                 zip(("x", "y", "width", "height"), normalized_roi(step.get("roi")))
             )
+        elif kind == "verify_text":
+            source = step.get("source")
+            if source == "fixed":
+                expected = text(step.get("text"), "Text to verify", 500).strip()
+                if not expected:
+                    raise ValueError("Text to verify must not be empty.")
+                if "variable" in step:
+                    raise ValueError("Conflicting verify_text source fields.")
+                step["text"] = expected
+            elif source == "variable":
+                if (
+                    not isinstance(step.get("variable"), str)
+                    or step["variable"] not in names
+                ):
+                    raise ValueError("verify_text references an undefined variable.")
+                if "text" in step:
+                    raise ValueError("Conflicting verify_text source fields.")
+            else:
+                raise ValueError("verify_text source must be fixed or variable.")
+
+            match_mode = step.get("match_mode")
+            if match_mode not in {
+                "exact",
+                "contains",
+                "last_n_digits",
+                "account_name",
+                "account_number",
+                "amount",
+            }:
+                raise ValueError("Unsupported verify_text match mode.")
+            if match_mode == "last_n_digits":
+                last_n = step.get("last_n")
+                if type(last_n) is not int or not 1 <= last_n <= 64:
+                    raise ValueError("last_n must be an integer between 1 and 64.")
+            elif "last_n" in step:
+                raise ValueError("last_n is only valid with last_n_digits matching.")
+
+            try:
+                number(step.get("timeout_seconds"), 0.5, 300)
+            except ValueError:
+                raise ValueError(
+                    "timeout_seconds must be numeric between 0.5 and 300."
+                ) from None
+            if "roi" in step:
+                values = normalized_roi(step["roi"])
+                step["roi"] = (
+                    dict(zip(("x", "y", "width", "height"), values))
+                    if isinstance(step["roi"], dict)
+                    else values
+                )
         elif kind in {"wait_for_text", "if_text"}:
             expected = text(step.get("text"), "Text to detect", 500).strip()
             if not expected:
