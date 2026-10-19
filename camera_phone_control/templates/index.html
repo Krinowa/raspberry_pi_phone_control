@@ -678,6 +678,41 @@ Select Refresh Logs to load recent activity.</pre
       </div>
 
       <div
+        id="withdraw-cancel-final-dialog"
+        class="modal-backdrop"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="withdraw-cancel-final-title"
+        hidden
+      >
+        <div class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">MANUAL RECOVERY</p>
+
+              <h2 id="withdraw-cancel-final-title">Cancel this withdrawal?</h2>
+            </div>
+          </div>
+
+          <p>
+            This will cancel the withdrawal externally and cannot be undone.
+          </p>
+
+          <div class="flow-buttons">
+            <button id="withdraw-cancel-final-back" type="button">Back</button>
+
+            <button
+              id="withdraw-cancel-final-confirm"
+              class="stop"
+              type="button"
+            >
+              Yes, Cancel Withdrawal
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div
         id="workflow-settings-dialog"
         class="modal-backdrop admin-only"
         role="dialog"

@@ -140,8 +140,9 @@ These are test-only and are not part of API v2:
   `"bank_name":"Mock Bank","account_number":"0000000001",`
   `"account_name":"Mock User"}`; ID, order ID, transaction ID, and timestamp
   are generated automatically
-- `POST /mock/withdrawals/reset` with `{}` — clears every pending, locked, and
-  historical withdrawal while preserving active mock sessions
+- `POST /mock/withdrawals/reset` with `{}` — clears every pending and historical
+  withdrawal while preserving active mock sessions. If any withdrawal is locked,
+  `{"confirm_locked":true}` is required as an additional safety acknowledgement.
 - `POST /mock/emit-queue-changed`
 - `POST /mock/disconnect`
 - `POST /mock/expire-session`

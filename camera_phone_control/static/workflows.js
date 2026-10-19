@@ -30,8 +30,12 @@
   const preview = $("workflow-preview"),
     paint = preview.getContext("2d");
   const piManual = () => state?.manual_backend === "raspberry_pi";
+  const previewCoordinateSpace = () =>
+    window.phonePreviewCoordinateSpace?.() || "camera_normalized";
   const cameraPoint = (point) =>
-    window.phonePreviewToCameraPoint?.(point) ?? point;
+    previewCoordinateSpace() === "screen_normalized"
+      ? point
+      : (window.phonePreviewToCameraPoint?.(point) ?? point);
   let pendingManual = Promise.resolve();
   const terminal = new Set(["passed", "failed", "cancelled"]);
   const show = (message, error = false) => {
@@ -1957,12 +1961,19 @@
     textTimer = setTimeout(flushText, 400);
   }
 
-  function naturalAction(action, point) {
+  function naturalAction(
+    action,
+    point,
+    coordinateSpace = previewCoordinateSpace(),
+  ) {
     if (!recording.active || stopping || annotationBusy()) return;
     flushText();
 
     if (action === "tap")
-      return enqueue({ type: "tap" }, { camera_start: point });
+      return enqueue(
+        { type: "tap" },
+        { camera_start: point, coordinate_space: coordinateSpace },
+      );
 
     const swipes = {
       swipe_up: [0.5, 0.75, 0.5, 0.25],
@@ -2663,8 +2674,9 @@
       const step = swipe ? { type: "swipe", duration_ms } : { type: "tap" };
       const extra = camera
         ? {
-            camera_start: saved.start,
+            camera_start: cameraPoint(swipe ? saved.start : end),
             ...(swipe ? { camera_end: cameraPoint(end) } : {}),
+            coordinate_space: previewCoordinateSpace(),
             frame_id: frameId,
           }
         : {};
@@ -2706,6 +2718,7 @@
           ...(camera
             ? {
                 camera_point: cameraPoint(point),
+                coordinate_space: previewCoordinateSpace(),
                 frame_id: frameId,
               }
             : { point }),

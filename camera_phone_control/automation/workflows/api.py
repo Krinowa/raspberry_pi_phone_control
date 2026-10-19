@@ -16,6 +16,7 @@ from flask import jsonify, request
 from ..backends import backend_names, select_device
 from ..context import AutomationContext
 from ..coordinates import normalized_roi
+from ..coordinates import unit
 from .values import parse_currency
 from .timing import WorkflowTiming
 from ..input.base import UnsupportedOperation
@@ -818,7 +819,13 @@ def register_workflows(
     @admin_required
     def capture_keyboard_key():
         data = payload()
-        if set(data) - {"key", "point", "camera_point", "frame_id"}:
+        if set(data) - {
+            "key",
+            "point",
+            "camera_point",
+            "coordinate_space",
+            "frame_id",
+        }:
             raise ValueError("Unexpected keyboard capture fields.")
         if ("point" in data) == ("camera_point" in data):
             raise ValueError("Provide exactly one keyboard capture coordinate.")
@@ -831,7 +838,16 @@ def register_workflows(
                     raise ValueError(
                         "Calibrate the phone display before capturing keyboard keys."
                     )
-                point = state.calibration.map(data["camera_point"])
+                coordinate_space = data.get("coordinate_space", "camera_normalized")
+                if coordinate_space == "screen_normalized":
+                    source = data["camera_point"]
+                    if not isinstance(source, (list, tuple)) or len(source) != 2:
+                        raise ValueError("A keyboard key coordinate is required.")
+                    point = [unit(source[0]), unit(source[1])]
+                elif coordinate_space == "camera_normalized":
+                    point = state.calibration.map(data["camera_point"])
+                else:
+                    raise ValueError("Unsupported coordinate_space.")
             if not isinstance(point, (list, tuple)) or len(point) != 2:
                 raise ValueError("A keyboard key coordinate is required.")
             return jsonify(
@@ -1033,6 +1049,7 @@ def register_workflows(
             "frame_id",
             "camera_start",
             "camera_end",
+            "coordinate_space",
             "capture",
         }:
             raise ValueError("Unexpected recorded " "step fields.")
@@ -1062,7 +1079,18 @@ def register_workflows(
                         "preview gestures."
                     )
 
-                start = state.calibration.map(data["camera_start"])
+                coordinate_space = data.get("coordinate_space", "camera_normalized")
+
+                def recorded_point(value):
+                    if coordinate_space == "screen_normalized":
+                        if not isinstance(value, (list, tuple)) or len(value) != 2:
+                            raise ValueError("A normalized coordinate is required.")
+                        return [unit(value[0]), unit(value[1])]
+                    if coordinate_space == "camera_normalized":
+                        return state.calibration.map(value)
+                    raise ValueError("Unsupported coordinate_space.")
+
+                start = recorded_point(data["camera_start"])
 
                 if step.get("type") == "tap":
                     step.update(
@@ -1073,7 +1101,7 @@ def register_workflows(
                 elif step.get("type") == "swipe":
                     step.update(
                         start=start,
-                        end=(state.calibration.map(data.get("camera_end"))),
+                        end=recorded_point(data.get("camera_end")),
                     )
 
                 else:

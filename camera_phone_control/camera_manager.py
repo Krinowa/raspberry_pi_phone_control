@@ -448,7 +448,7 @@ class CameraManager:
             if assigned is camera
         ]
 
-    def _close_shared_camera_locked(self, camera):
+    def _close_shared_camera_locked(self, camera, *, preserve_recovery_state=False):
         """Close one physical Camera and remove every logical alias to it.
 
         Closing a shared capture for only one device would leave the other
@@ -465,19 +465,23 @@ class CameraManager:
             if self.cameras.get(device_id) is camera:
                 self.cameras.pop(device_id, None)
             self.last_opened.pop(device_id, None)
-            self.recovery_attempts.pop(device_id, None)
+            if not preserve_recovery_state:
+                self.recovery_attempts.pop(device_id, None)
         return device_ids
 
-    def _find_shared_camera(self, runtime_source, rotation):
+    def _find_shared_camera(self, configured_source, runtime_source, rotation):
+        stable_identity = is_stable_camera_id(configured_source)
         for camera in self.cameras.values():
             if isinstance(camera, UnavailableCamera):
                 continue
             if getattr(camera, "identity_mismatch", False):
                 continue
-            if (
-                getattr(camera, "source", None) == runtime_source
-                and getattr(camera, "rotate", None) == rotation
-            ):
+            source_matches = (
+                getattr(camera, "configured_source", None) == configured_source
+                if stable_identity
+                else getattr(camera, "source", None) == runtime_source
+            )
+            if source_matches and getattr(camera, "rotate", None) == rotation:
                 return camera
         return None
 
@@ -504,7 +508,7 @@ class CameraManager:
                 ),
             )
 
-        shared = self._find_shared_camera(runtime_source, config.rotation)
+        shared = self._find_shared_camera(configured, runtime_source, config.rotation)
 
         if shared is not None:
             LOG.info(
@@ -514,6 +518,28 @@ class CameraManager:
             )
             self.last_opened[device_id] = time.monotonic()
             return shared
+
+        if is_stable_camera_id(configured):
+            # Runtime indexes can be reassigned when USB cameras reconnect.
+            # Never open a second capture on an index still held by a different
+            # stable identity; retire that stale mapping first and let its
+            # logical users reopen lazily against their own stable identity.
+            runtime_conflicts = {
+                id(camera): camera
+                for camera in self.cameras.values()
+                if not isinstance(camera, UnavailableCamera)
+                and getattr(camera, "source", None) == runtime_source
+                and getattr(camera, "configured_source", None) != configured
+            }
+            for conflict in runtime_conflicts.values():
+                LOG.warning(
+                    "Closing stale camera runtime mapping source=%r "
+                    "configured_identity=%r replacement_identity=%r",
+                    runtime_source,
+                    getattr(conflict, "configured_source", None),
+                    configured,
+                )
+                self._close_shared_camera_locked(conflict)
 
         camera = self.camera_factory(
             runtime_source,
@@ -642,7 +668,9 @@ class CameraManager:
                     self.recovery_attempts.get(device_id, 0) + 1
                 )
                 if is_stable_camera_id(config.camera_id or config.camera_source):
-                    self._close_shared_camera_locked(camera)
+                    self._close_shared_camera_locked(
+                        camera, preserve_recovery_state=True
+                    )
                     time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
                     camera = self._new_camera(config, device_id)
                     self.cameras[device_id] = camera
@@ -1011,7 +1039,12 @@ class CameraManager:
                         "error": "The configured camera is disconnected.",
                     }, None
             for device_id, camera in self.cameras.items():
-                if getattr(camera, "source", None) != runtime_source:
+                source_matches = (
+                    getattr(camera, "configured_source", None) == source
+                    if identity is not None
+                    else getattr(camera, "source", None) == runtime_source
+                )
+                if not source_matches:
                     continue
                 current = camera.frame()
                 if current is None:

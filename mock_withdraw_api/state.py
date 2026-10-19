@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import threading
 import time
 from copy import deepcopy
@@ -30,6 +31,8 @@ from config import (
 from scenarios import SCENARIOS
 from seed_data import users as seeded_users
 from seed_data import withdrawals as seeded_withdrawals
+
+LOG = logging.getLogger("mock_withdraw_api")
 
 
 class MockError(Exception):
@@ -86,10 +89,41 @@ class MockState:
             self.scenario = value
         return value
 
-    def clear_withdrawals(self):
+    def clear_withdrawals(
+        self,
+        *,
+        action_name="direct_state_clear",
+        caller="internal",
+        reason="unspecified",
+        confirm_locked=False,
+    ):
         """Clear the test queue/history without invalidating active sessions."""
         with self.lock:
+            locked = [
+                item["id"]
+                for item in self.withdrawals.values()
+                if item["status"] == "LOCKED"
+            ]
+            if locked and not confirm_locked:
+                raise MockError(
+                    409,
+                    "Locked withdrawals exist. Confirm clearing locked withdrawals explicitly.",
+                )
+            before = [
+                {"id": item["id"], "status": item["status"]}
+                for item in self.withdrawals.values()
+            ]
             affected = {item["payment_record"] for item in self.withdrawals.values()}
+            LOG.warning(
+                "mock_withdrawals_cleared timestamp=%s route_action=%s "
+                "caller=%s reason=%s count=%d withdrawals=%s",
+                utc_iso(self.now()),
+                action_name,
+                caller,
+                reason,
+                len(before),
+                before,
+            )
             self.withdrawals = {}
             # Preserve the monotonic test ID sequence until an explicit reset.
             return affected

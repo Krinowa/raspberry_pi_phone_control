@@ -11,7 +11,8 @@ const names = ["top-left", "top-right", "bottom-right", "bottom-left"];
 let state = null,
   frameId = null,
   frameAt = 0,
-  bitmap = null;
+  bitmap = null,
+  bitmapCoordinateSpace = "camera_normalized";
 let calibrating = false,
   corners = [],
   manual = false,
@@ -67,6 +68,7 @@ let workflowSettingsMode = "payment";
 let withdrawSettingsDeviceId = null;
 let withdrawSettingsAssigned = false;
 let withdrawCancelDeviceId = null;
+let withdrawCancelPendingReason = null;
 const withdrawCancelsInFlight = new Set();
 let ocrSettingsDirty = false;
 let ocrStatusTimer = null;
@@ -98,6 +100,7 @@ let ocrOperationalHealthy = null;
 let workflowRuntime = null;
 let diagnosticsLogs = [];
 let previewConsecutiveFailures = 0;
+let previewCalibrationRequired = false;
 
 function setDashboardMode(mode) {
   dashboardMode = mode === "admin" ? "admin" : "operate";
@@ -390,9 +393,9 @@ const deviceService = {
       `/api/devices/${encodeURIComponent(deviceId)}/withdraw/balance/refresh`,
       {},
     ),
-  cancelWithdrawal: (deviceId, reasonCode) =>
+  cancelWithdrawal: (deviceId, reason) =>
     api(`/api/devices/${encodeURIComponent(deviceId)}/withdraw/cancel`, {
-      reason_code: reasonCode,
+      reason,
     }),
 };
 
@@ -882,14 +885,22 @@ function startDevicePreview(deviceId, image, placeholder) {
 
     try {
       const response = await fetch(
-        `/api/devices/${encodeURIComponent(deviceId)}/camera/frame?t=${Date.now()}`,
+        `/api/devices/${encodeURIComponent(deviceId)}/camera/preview?t=${Date.now()}`,
         {
           cache: "no-store",
           signal: AbortSignal.timeout(4000),
         },
       );
 
-      if (!response.ok) throw new Error("Camera unavailable");
+      if (!response.ok) {
+        let message = "Camera unavailable";
+        try {
+          message = (await response.json()).error || message;
+        } catch {
+          /* The generic message is safe for a non-JSON camera failure. */
+        }
+        throw new Error(message);
+      }
 
       const blob = await response.blob();
       nextUrl = URL.createObjectURL(blob);
@@ -911,6 +922,11 @@ function startDevicePreview(deviceId, image, placeholder) {
       image.src = nextUrl;
       image.hidden = false;
       placeholder.hidden = true;
+      applyCameraPreviewGeometry(
+        image.parentElement,
+        preloader.naturalWidth,
+        preloader.naturalHeight,
+      );
 
       // The new resource is already decoded. Revoke the older object URL only
       // after switching the visible image to avoid a blank frame in between.
@@ -920,14 +936,22 @@ function startDevicePreview(deviceId, image, placeholder) {
 
       nextUrl = null;
       schedule(200);
-    } catch (_error) {
+    } catch (error) {
       if (nextUrl) URL.revokeObjectURL(nextUrl);
 
       // If we already have a good frame, keep it visible and retry silently.
-      if (!devicePreviewLastFrames.has(deviceId)) {
+      if (error.message === "Calibration required for this phone.") {
+        const previousUrl = devicePreviewLastFrames.get(deviceId);
+        if (previousUrl) URL.revokeObjectURL(previousUrl);
+        devicePreviewLastFrames.delete(deviceId);
+        image.removeAttribute("src");
         image.hidden = true;
         placeholder.hidden = false;
-        placeholder.textContent = "Camera unavailable";
+        placeholder.textContent = error.message;
+      } else if (!devicePreviewLastFrames.has(deviceId)) {
+        image.hidden = true;
+        placeholder.hidden = false;
+        placeholder.textContent = error.message;
       }
 
       schedule(1000);
@@ -2406,9 +2430,12 @@ function closeWithdrawCancel() {
   )
     return;
   withdrawCancelDeviceId = null;
+  withdrawCancelPendingReason = null;
   $("withdraw-cancel-reason").value = "";
   $("withdraw-cancel-confirm").disabled = true;
   $("withdraw-cancel-dialog").hidden = true;
+  $("withdraw-cancel-final-dialog").hidden = true;
+  $("withdraw-cancel-final-confirm").disabled = false;
   setWithdrawCancelError();
 }
 
@@ -2430,14 +2457,31 @@ function updateWithdrawCancelConfirm() {
     withdrawCancelsInFlight.has(withdrawCancelDeviceId);
 }
 
-async function confirmWithdrawCancel(event) {
-  event.preventDefault();
-  const deviceId = withdrawCancelDeviceId;
-  const reasonCode = $("withdraw-cancel-reason").value;
+function closeWithdrawCancelFinal({ back = false } = {}) {
+  if (
+    withdrawCancelDeviceId &&
+    withdrawCancelsInFlight.has(withdrawCancelDeviceId)
+  )
+    return;
+  withdrawCancelPendingReason = null;
+  $("withdraw-cancel-final-dialog").hidden = true;
+  if (back) $("withdraw-cancel-dialog").hidden = false;
+}
+
+function openWithdrawCancelFinal(reasonCode) {
+  withdrawCancelPendingReason = reasonCode;
+  $("withdraw-cancel-dialog").hidden = true;
+  $("withdraw-cancel-final-dialog").hidden = false;
+  $("withdraw-cancel-final-confirm").disabled = false;
+  $("withdraw-cancel-final-confirm").focus();
+}
+
+async function submitWithdrawCancel(deviceId, reasonCode) {
   if (!deviceId || !reasonCode || withdrawCancelsInFlight.has(deviceId)) return;
 
   withdrawCancelsInFlight.add(deviceId);
   updateWithdrawCancelConfirm();
+  $("withdraw-cancel-final-confirm").disabled = true;
   setWithdrawCancelError();
   deviceRenderSignature = null;
   renderDevices();
@@ -2454,17 +2498,37 @@ async function confirmWithdrawCancel(event) {
     renderDevices();
     notice("Withdrawal cancelled successfully.");
     await loadDevices();
-  } catch (_error) {
+  } catch (error) {
+    $("withdraw-cancel-final-dialog").hidden = true;
+    $("withdraw-cancel-dialog").hidden = false;
     setWithdrawCancelError(
-      "Unable to confirm cancellation. This withdrawal remains under manual attention.",
+      error?.message ||
+        "External cancellation failed. This withdrawal remains under manual attention.",
     );
     await loadDevices().catch(() => {});
   } finally {
     withdrawCancelsInFlight.delete(deviceId);
     updateWithdrawCancelConfirm();
+    $("withdraw-cancel-final-confirm").disabled = false;
     deviceRenderSignature = null;
     renderDevices();
   }
+}
+
+async function confirmWithdrawCancel(event) {
+  event.preventDefault();
+  const deviceId = withdrawCancelDeviceId;
+  const reasonCode = $("withdraw-cancel-reason").value;
+  if (!deviceId || !reasonCode || withdrawCancelsInFlight.has(deviceId)) return;
+
+  openWithdrawCancelFinal(reasonCode);
+}
+
+async function confirmWithdrawCancelFinal() {
+  const deviceId = withdrawCancelDeviceId;
+  const reasonCode = withdrawCancelPendingReason;
+  if (!deviceId || !reasonCode || withdrawCancelsInFlight.has(deviceId)) return;
+  await submitWithdrawCancel(deviceId, reasonCode);
 }
 
 function closeWithdrawSettings() {
@@ -3233,6 +3297,8 @@ async function saveDeviceCamera(event) {
 function clearPreview(message = "Waiting for camera access…") {
   bitmap?.close();
   bitmap = null;
+  bitmapCoordinateSpace = "camera_normalized";
+  previewCalibrationRequired = false;
   frameId = null;
   frameAt = 0;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -3494,6 +3560,8 @@ function render() {
 
 function activePreviewCrop() {
   if (
+    bitmapCoordinateSpace !== "camera_normalized" ||
+    previewCalibrationRequired ||
     calibrating ||
     !bitmap ||
     !state?.calibrated ||
@@ -3535,6 +3603,7 @@ function previewPointToCamera(point) {
 }
 
 window.phonePreviewToCameraPoint = previewPointToCamera;
+window.phonePreviewCoordinateSpace = () => bitmapCoordinateSpace;
 
 function draw() {
   if (!bitmap) return;
@@ -3833,17 +3902,46 @@ async function videoLoop() {
   const cycleStarted = performance.now();
   try {
     const requestedDevice = deviceCatalog?.selected_device || null;
-    const framePath = requestedDevice
-      ? `/api/devices/${encodeURIComponent(requestedDevice)}/camera/frame`
+    let requestedCoordinateSpace =
+      requestedDevice && !calibrating && !previewCalibrationRequired
+        ? "screen_normalized"
+        : "camera_normalized";
+    let framePath = requestedDevice
+      ? `/api/devices/${encodeURIComponent(requestedDevice)}/camera/${
+          requestedCoordinateSpace === "camera_normalized" ? "frame" : "preview"
+        }`
       : "/api/frame";
     const previewStarted = performance.now();
-    const response = await fetch(framePath, {
+    let response = await fetch(framePath, {
       cache: "no-store",
       signal: AbortSignal.timeout(4000),
     });
 
-    if (!response.ok)
-      throw new Error((await response.json()).error || "Camera unavailable");
+    if (!response.ok) {
+      const status = response.status;
+      const error = (await response.json()).error || "Camera unavailable";
+      if (status === 409 && requestedDevice && !calibrating) {
+        // The calibrated endpoint fails closed. Fetch raw explicitly so the
+        // operator can enter calibration mode, while retaining camera-space
+        // interaction semantics for this frame.
+        requestedCoordinateSpace = "camera_normalized";
+        framePath = `/api/devices/${encodeURIComponent(requestedDevice)}/camera/frame`;
+        response = await fetch(framePath, {
+          cache: "no-store",
+          signal: AbortSignal.timeout(4000),
+        });
+        if (!response.ok)
+          throw new Error(
+            (await response.json()).error || "Camera unavailable",
+          );
+        previewCalibrationRequired = true;
+        notice(error, true);
+      } else {
+        throw new Error(error);
+      }
+    } else if (requestedCoordinateSpace === "screen_normalized") {
+      previewCalibrationRequired = false;
+    }
     const responseAt = performance.now();
     const nextId = Number(response.headers.get("X-Frame-Id"));
     const body = await response.blob();
@@ -3855,9 +3953,22 @@ async function videoLoop() {
       succeeded = true;
       return;
     }
+    if (
+      requestedCoordinateSpace !==
+      (previewCalibrationRequired ||
+      !deviceCatalog?.selected_device ||
+      calibrating
+        ? "camera_normalized"
+        : "screen_normalized")
+    ) {
+      next.close();
+      succeeded = true;
+      return;
+    }
 
     if (
       bitmap &&
+      bitmapCoordinateSpace === requestedCoordinateSpace &&
       (next.width !== bitmap.width || next.height !== bitmap.height)
     ) {
       manual = false;
@@ -3874,6 +3985,7 @@ async function videoLoop() {
     const previousBitmap = bitmap;
 
     bitmap = next;
+    bitmapCoordinateSpace = requestedCoordinateSpace;
 
     if (frameId !== nextId) {
       frameAt = performance.now();
@@ -4051,6 +4163,7 @@ $("calibrate").addEventListener("click", () =>
     await disable();
     await api("/api/calibration", {}, "DELETE");
     calibrating = true;
+    previewCalibrationRequired = true;
     corners = [];
     state.calibrated = false;
     state.corners = [];
@@ -4075,6 +4188,7 @@ $("save").addEventListener("click", () =>
     });
 
     calibrating = false;
+    previewCalibrationRequired = false;
     state.calibrated = true;
     state.corners = result.corners;
 
@@ -4105,15 +4219,20 @@ function manualApi(path, data) {
   return operation;
 }
 
-async function sendAction(action, point) {
+async function sendAction(
+  action,
+  point,
+  coordinateSpace = bitmapCoordinateSpace,
+) {
   if (window.phoneRecorder?.capturesPreview()) {
-    return window.phoneRecorder.action(action, point);
+    return window.phoneRecorder.action(action, point, coordinateSpace);
   }
   if (!active() || busy || physicalBusy) return;
 
   await report(async () => {
     const data = { action, frame_id: frameId };
     if (point) [data.x, data.y] = point;
+    if (point) data.coordinate_space = coordinateSpace;
 
     try {
       const result = await manualApi("/api/action", data);
@@ -4134,7 +4253,12 @@ async function sendAction(action, point) {
   });
 }
 
-async function sendPreviewSwipe(start, end, durationMs) {
+async function sendPreviewSwipe(
+  start,
+  end,
+  durationMs,
+  coordinateSpace = bitmapCoordinateSpace,
+) {
   if (!active() || busy || physicalBusy) return;
   await report(async () => {
     try {
@@ -4144,6 +4268,7 @@ async function sendPreviewSwipe(start, end, durationMs) {
         end,
         duration_ms: durationMs,
         frame_id: frameId,
+        coordinate_space: coordinateSpace,
       });
       notice("Sent swipe.");
     } catch (error) {
@@ -4295,13 +4420,25 @@ canvas.addEventListener("pointerup", (event) => {
     performance.now() - saved.at,
   );
   if (gesture.type === "swipe") {
-    sendPreviewSwipe(
-      previewPointToCamera(gesture.start),
-      previewPointToCamera(gesture.end),
-      gesture.duration_ms,
-    );
+    const coordinateSpace = bitmapCoordinateSpace;
+    const start =
+      coordinateSpace === "screen_normalized"
+        ? gesture.start
+        : previewPointToCamera(gesture.start);
+    const end =
+      coordinateSpace === "screen_normalized"
+        ? gesture.end
+        : previewPointToCamera(gesture.end);
+    sendPreviewSwipe(start, end, gesture.duration_ms, coordinateSpace);
   } else {
-    sendAction("tap", previewPointToCamera(gesture.end));
+    const coordinateSpace = bitmapCoordinateSpace;
+    sendAction(
+      "tap",
+      coordinateSpace === "screen_normalized"
+        ? gesture.end
+        : previewPointToCamera(gesture.end),
+      coordinateSpace,
+    );
   }
 });
 
@@ -4331,7 +4468,16 @@ canvas.addEventListener("click", (event) => {
     if (corners.length < 4) corners.push(point);
     render();
     draw();
-  } else sendAction("tap", previewPointToCamera(point));
+  } else {
+    const coordinateSpace = bitmapCoordinateSpace;
+    sendAction(
+      "tap",
+      coordinateSpace === "screen_normalized"
+        ? point
+        : previewPointToCamera(point),
+      coordinateSpace,
+    );
+  }
 });
 
 document.querySelectorAll("[data-action]").forEach((button) => {
@@ -4558,6 +4704,17 @@ $("withdraw-cancel-back").addEventListener("click", closeWithdrawCancel);
 $("withdraw-cancel-close").addEventListener("click", closeWithdrawCancel);
 $("withdraw-cancel-dialog").addEventListener("click", (event) => {
   if (event.target === $("withdraw-cancel-dialog")) closeWithdrawCancel();
+});
+$("withdraw-cancel-final-back").addEventListener("click", () =>
+  closeWithdrawCancelFinal({ back: true }),
+);
+$("withdraw-cancel-final-confirm").addEventListener(
+  "click",
+  confirmWithdrawCancelFinal,
+);
+$("withdraw-cancel-final-dialog").addEventListener("click", (event) => {
+  if (event.target === $("withdraw-cancel-final-dialog"))
+    closeWithdrawCancelFinal({ back: true });
 });
 $("camera-settings-form").addEventListener("submit", saveDeviceCamera);
 $("camera-settings-test").addEventListener("click", testCameraSettings);

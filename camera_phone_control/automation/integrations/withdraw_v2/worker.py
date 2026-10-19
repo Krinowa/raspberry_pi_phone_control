@@ -2,6 +2,8 @@
 
 import logging
 
+import re
+
 import threading
 
 import time
@@ -32,8 +34,30 @@ LOG = logging.getLogger("withdraw_v2")
 WITHDRAW_API_TIMEZONE = timezone(timedelta(hours=8))
 
 
+def _sanitized_cancel_reason(error):
+    """Retain useful external-cancel diagnostics without persisting credentials."""
+    # The HTTP boundary deliberately constructs credential-free APIError
+    # messages. Unknown exception text is not trusted for logs or the journal.
+    if isinstance(error, (APIError, TimeoutError, ConnectionError)):
+        reason = str(error).strip() or type(error).__name__
+    else:
+        reason = type(error).__name__
+    reason = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer <redacted>", reason)
+    reason = re.sub(
+        r"(?i)\b(?:authorization|token|password|otp|secret|auth|cookie|set-cookie)\b"
+        r"\s*[:=]\s*[^\s,;]+",
+        "<redacted>",
+        reason,
+    )
+    return reason.replace("\r", " ").replace("\n", " ")[:500]
+
+
 class AuthenticationFailed(ValueError):
     """Stored credentials or assigned identity require operator intervention."""
+
+
+class ManualCancellationRequested(Exception):
+    """Internal control flow used to hand operation ownership to manual cancel."""
 
 
 def expiry(value):
@@ -192,6 +216,8 @@ class WithdrawWorker:
 
         self.withdrawal_operation = threading.Lock()
 
+        self.manual_cancel_requested = threading.Event()
+
         self.thread = None
 
         self.socket = None
@@ -264,7 +290,7 @@ class WithdrawWorker:
 
         current = self.journal.current(self.device_id)
 
-        cancel_allowed = self.can_cancel_withdrawal(current)
+        cancel_mode = self._cancel_withdrawal_mode(current)
 
         with self.lock:
 
@@ -336,7 +362,7 @@ class WithdrawWorker:
                 ),
                 "balance_observed_at": self.cache.observed_at,
                 "balance_error": self.balance_error,
-                "cancel_allowed": cancel_allowed,
+                "cancel_allowed": cancel_mode is not None,
             }
 
     def balance_context(self):
@@ -851,6 +877,10 @@ class WithdrawWorker:
         """Authorize one validated retry while retaining this worker's lock lease."""
 
         with self.lock:
+
+            if self.manual_cancel_requested.is_set():
+
+                raise RecordConflict("Withdrawal cancellation is already in progress.")
 
             if self.retry_waiting_job_id != original_job_id:
 
@@ -1457,18 +1487,29 @@ class WithdrawWorker:
         finally:
             self.withdrawal_operation.release()
 
-    def can_cancel_withdrawal(self, current=None):
-        """Allow external cancellation only before payment execution has started."""
+    def _cancel_withdrawal_mode(self, current=None):
+        """Return whether this exact unresolved withdrawal may be cancelled."""
 
         current = current or self.journal.current(self.device_id)
 
         if (
             current.get("phase") not in {"LOCKED", "NEEDS_ATTENTION", "QUEUED"}
             or type(current.get("withdraw_id")) is not int
+            or not isinstance(current.get("tx_id"), str)
+            or not current.get("tx_id")
             or current.get("assigned_device_id") != self.device_id
         ):
 
-            return False
+            return None
+
+        if current.get("operator_id") not in (None, self.api.get("operator_id")):
+            return None
+
+        raw = current.get("raw_withdrawal")
+
+        if isinstance(raw, dict) and self._retry_identity_error(current, raw):
+
+            return None
 
         job_id = current.get("job_id")
 
@@ -1476,15 +1517,7 @@ class WithdrawWorker:
 
         if not job_id:
 
-            return True
-
-        # A retry belongs to a withdrawal whose earlier payment execution already
-
-        # failed/interrupted. Do not guess whether money may already have moved.
-
-        if current.get("retry_of_job_id"):
-
-            return False
+            return "allowed"
 
         try:
 
@@ -1492,11 +1525,33 @@ class WithdrawWorker:
 
         except RecordNotFound:
 
-            return False
+            return None
 
-        # The original local payment job has not started physical execution yet.
+        if (
+            getattr(job, "action", None) != "withdraw_v2"
+            or getattr(job, "device_id", None) != self.device_id
+            or getattr(job, "external_ref", None) != current.get("tx_id")
+            or current.get("workflow_id") not in (None, getattr(job, "workflow", None))
+            or current.get("account_id") not in (None, getattr(job, "account_id", None))
+            or current.get("retry_of_job_id")
+            not in (None, getattr(job, "retry_of_job_id", None))
+        ):
 
-        return job.status in {"QUEUED", "WAITING_FOR_DEVICE"}
+            return None
+
+        if job.status in {
+            "QUEUED",
+            "WAITING_FOR_DEVICE",
+            "FAILED",
+            "INTERRUPTED",
+        }:
+
+            return "allowed"
+
+        return None
+
+    def can_cancel_withdrawal(self, current=None):
+        return self._cancel_withdrawal_mode(current) is not None
 
     def _wait_for_retry(self, job):
         """Keep renewing the lock while the operator restores and resumes safely."""
@@ -1534,6 +1589,10 @@ class WithdrawWorker:
 
                 with self.lock:
 
+                    if self.manual_cancel_requested.is_set():
+
+                        raise ManualCancellationRequested()
+
                     retry_job_id = self.retry_job_id
 
                 if retry_job_id is not None:
@@ -1548,9 +1607,14 @@ class WithdrawWorker:
 
             with self.lock:
 
-                self.retry_waiting_job_id = None
+                # Preserve the exact failed job across a manual-cancel
+                # handoff. If client-cancel is uncertain, the worker resumes
+                # waiting on this job instead of entering _pay() again.
+                if not self.manual_cancel_requested.is_set():
 
-                self.retry_job_id = None
+                    self.retry_waiting_job_id = None
+
+                    self.retry_job_id = None
 
     def reconcile(self):
         """Called after every subscription, before any pending/physical work."""
@@ -1742,6 +1806,113 @@ class WithdrawWorker:
 
         self.stop_renewal()
 
+    def _acquire_manual_cancel_operation(self):
+        """Acquire exclusive withdrawal ownership for one manual cancellation.
+
+        A FAILED/INTERRUPTED payment may still be inside _wait_for_retry() while
+        the worker thread owns ``withdrawal_operation``. In that case, signal the
+        wait to unwind first, then acquire the operation lock. Full withdrawal
+        identity/state validation is deliberately performed again by
+        cancel_withdrawal() after ownership has transferred.
+        """
+
+        # Use the event as the single-flight guard for *all* manual cancellation
+        # attempts, including the fast path where the operation lock is idle.
+        with self.lock:
+            if self.manual_cancel_requested.is_set():
+                raise RecordConflict("Withdrawal cancellation is already in progress.")
+
+        if self.withdrawal_operation.acquire(blocking=False):
+            # Close the tiny race where another request observed the lock as busy
+            # before this request installed the single-flight marker.
+            with self.lock:
+                if self.manual_cancel_requested.is_set():
+                    self.withdrawal_operation.release()
+                    raise RecordConflict(
+                        "Withdrawal cancellation is already in progress."
+                    )
+                self.manual_cancel_requested.set()
+            return
+
+        # The worker owns the operation lock. Only a payment that has already
+        # reached FAILED/INTERRUPTED may be asked to hand ownership over. Do not
+        # require _cancel_withdrawal_mode() here: that helper performs identity
+        # checks intended for the final decision. Requiring it before the handoff
+        # can deadlock an otherwise valid failed-job cancellation behind the same
+        # worker lock. cancel_withdrawal() revalidates everything after acquiring
+        # ownership.
+        current = self.journal.current(self.device_id)
+        job_id = current.get("job_id")
+        if not job_id:
+            raise RecordConflict(
+                "Withdrawal cancellation or payment is already in progress."
+            )
+
+        try:
+            job = self.scheduler.get_job(job_id)
+        except RecordNotFound:
+            raise RecordConflict(
+                "The related payment job could not be found for cancellation."
+            ) from None
+
+        if job.status == "RUNNING":
+            raise RecordConflict(
+                "The payment workflow is currently running and cannot be cancelled."
+            )
+
+        if job.status not in {"FAILED", "INTERRUPTED"}:
+            raise RecordConflict(
+                "Withdrawal cancellation is waiting for the payment operation to "
+                f"become idle (job status: {job.status})."
+            )
+
+        # Do not require retry_waiting_job_id == job_id here. There is a real
+        # transition window after the scheduler marks the job FAILED/INTERRUPTED
+        # but before _wait_for_retry() publishes retry_waiting_job_id. The event is
+        # safe to set during that window: _wait_for_retry() will observe it as soon
+        # as it starts and unwind the worker-owned operation lock.
+        with self.lock:
+            if self.manual_cancel_requested.is_set():
+                raise RecordConflict("Withdrawal cancellation is already in progress.")
+            self.manual_cancel_requested.set()
+
+        LOG.info(
+            "Withdraw manual-cancel handoff requested "
+            "device=%s withdraw_id=%s job_id=%s job_status=%s "
+            "retry_waiting_job_id=%s retry_job_id=%s",
+            self.device_id,
+            current.get("withdraw_id"),
+            job_id,
+            job.status,
+            self.retry_waiting_job_id,
+            self.retry_job_id,
+        )
+
+        self.wake.set()
+
+        if not self.withdrawal_operation.acquire(timeout=5):
+            with self.lock:
+                self.manual_cancel_requested.clear()
+            self.wake.set()
+
+            try:
+                latest_status = self.scheduler.get_job(job_id).status
+            except RecordNotFound:
+                latest_status = "missing"
+
+            raise RecordConflict(
+                "Timed out waiting for the failed payment workflow to hand over "
+                f"cancellation ownership (job status: {latest_status})."
+            )
+
+        LOG.info(
+            "Withdraw manual-cancel handoff acquired "
+            "device=%s withdraw_id=%s job_id=%s",
+            self.device_id,
+            current.get("withdraw_id"),
+            job_id,
+        )
+
     def cancel_withdrawal(self, reason):
         # Explicit caller classification only;
         # local failures never invoke this.
@@ -1750,10 +1921,7 @@ class WithdrawWorker:
                 "A genuine withdrawal-problem reason " "(1–200 characters) is required."
             )
 
-        if not self.withdrawal_operation.acquire(blocking=False):
-            raise RecordConflict(
-                "Withdrawal cancellation or payment is already in progress."
-            )
+        self._acquire_manual_cancel_operation()
 
         try:
             current = self.journal.current(self.device_id)
@@ -1777,10 +1945,12 @@ class WithdrawWorker:
                     "Withdrawal cannot be cancelled in its current state."
                 )
 
-            if not self.can_cancel_withdrawal(current):
+            cancel_mode = self._cancel_withdrawal_mode(current)
+
+            if cancel_mode is None:
                 raise RecordConflict(
-                    "Withdrawal cannot be cancelled after physical "
-                    "payment may have started."
+                    "Withdrawal cannot be cancelled because its related "
+                    "payment job or identity is not eligible."
                 )
 
             job_id = current.get("job_id")
@@ -1788,17 +1958,30 @@ class WithdrawWorker:
             if job_id:
                 job = self.scheduler.get_job(job_id)
 
-                if job.status in {
-                    "QUEUED",
-                    "WAITING_FOR_DEVICE",
-                }:
+                # Recheck immediately before the external action. A queued job
+                # must be stopped locally first; a running payment may never be
+                # cancelled underneath its workflow execution.
+                if job.status == "RUNNING":
+                    raise RecordConflict(
+                        "The payment workflow is currently running and cannot "
+                        "be cancelled."
+                    )
+
+                if job.status in {"QUEUED", "WAITING_FOR_DEVICE"}:
+
                     cancelled = self.executor.cancel(job_id)
 
                     if cancelled.status != "CANCELLED":
                         raise RecordConflict(
-                            "The local retry already started and can "
+                            "The local payment job already started and can "
                             "no longer be cancelled safely."
                         )
+
+                elif job.status not in {"FAILED", "INTERRUPTED"}:
+                    raise RecordConflict(
+                        "The payment workflow state changed before the "
+                        "withdrawal could be cancelled."
+                    )
 
             with self.lock:
                 assignment = self.assigned
@@ -1819,18 +2002,26 @@ class WithdrawWorker:
                 )
 
             except Exception as exc:
-                # Do not include str(exc) here because an external API
-                # exception could contain response/session information.
+                safe_reason = _sanitized_cancel_reason(exc)
+                error_code = exc.code if isinstance(exc, APIError) else None
+                safe_description = type(exc).__name__
+                if error_code is not None:
+                    safe_description += f" code={error_code}"
+                safe_description += f": {safe_reason}"
                 LOG.warning(
                     "Withdraw cancellation request uncertain "
-                    "device=%s withdraw_id=%s error_type=%s",
+                    "device=%s withdraw_id=%s tx_id=%s error_type=%s "
+                    "error_code=%s reason=%s",
                     self.device_id,
                     current["withdraw_id"],
+                    current.get("tx_id"),
                     type(exc).__name__,
+                    error_code,
+                    safe_reason,
                 )
 
                 message = (
-                    "Unable to confirm external cancellation. "
+                    f"External cancellation failed ({safe_description}). "
                     "This withdrawal remains under manual attention."
                 )
 
@@ -1839,6 +2030,8 @@ class WithdrawWorker:
                     ambiguity_operation="cancel",
                     ambiguity_stage="external-cancel-request",
                     ambiguity_error_type=type(exc).__name__,
+                    ambiguity_error_code=error_code,
+                    ambiguity_error_reason=safe_reason,
                 )
 
                 raise RecordConflict(message) from None
@@ -1895,6 +2088,10 @@ class WithdrawWorker:
                 if self.assigned == assignment:
                     self.assigned = None
 
+                self.retry_waiting_job_id = None
+
+                self.retry_job_id = None
+
             if assignment is not None:
                 _, reservation = assignment
 
@@ -1908,6 +2105,13 @@ class WithdrawWorker:
                 self.dispatcher.wake()
 
         finally:
+            # _acquire_manual_cancel_operation() marks every manual cancel as
+            # single-flight, including the immediate-lock path. Always clear the
+            # marker when this request gives up ownership so Retry/Cancel cannot
+            # remain blocked by a stale event.
+            with self.lock:
+                self.manual_cancel_requested.clear()
+            self.wake.set()
             self.withdrawal_operation.release()
 
     def _route(self):
@@ -2451,13 +2655,25 @@ class WithdrawWorker:
 
             retry_job_id = self.retry_job_id
 
+            retry_waiting_job_id = self.retry_waiting_job_id
+
         if assignment is None:
 
             return
 
         raw, reservation = assignment
 
+        cancellation_handoff = False
+
         try:
+
+            if retry_job_id is None and retry_waiting_job_id is not None:
+
+                self._finish_payment_job(
+                    raw, self.scheduler.get_job(retry_waiting_job_id)
+                )
+
+                return
 
             if retry_job_id is not None:
 
@@ -2490,36 +2706,38 @@ class WithdrawWorker:
                 dispatch_reservation=reservation,
             )
 
+        except ManualCancellationRequested:
+
+            cancellation_handoff = True
+
         finally:
+            if not cancellation_handoff:
+                self.stop_renewal()
 
-            self.stop_renewal()
+                with self.scheduler.lock:
+                    if (
+                        reservation is not None
+                        and self.scheduler.reservations.get(self.device_id)
+                        == reservation
+                    ):
+                        del self.scheduler.reservations[self.device_id]
 
-            with self.scheduler.lock:
+                with self.lock:
+                    if self.assigned == assignment:
+                        self.assigned = None
 
-                if (
-                    reservation is not None
-                    and self.scheduler.reservations.get(self.device_id) == reservation
-                ):
+                    if self.retry_job_id == retry_job_id:
+                        self.retry_job_id = None
 
-                    del self.scheduler.reservations[self.device_id]
+                if self.journal.current(self.device_id).get("phase") in TERMINAL:
+                    self.set_state("IDLE")
 
-            with self.lock:
+                if self.dispatcher:
+                    self.dispatcher.wake()
 
-                if self.assigned == assignment:
-
-                    self.assigned = None
-
-                if self.retry_job_id == retry_job_id:
-
-                    self.retry_job_id = None
-
-            if self.journal.current(self.device_id).get("phase") in TERMINAL:
-
-                self.set_state("IDLE")
-
-            if self.dispatcher:
-
-                self.dispatcher.wake()
+            # cancellation_handoff=True:
+            # intentionally skip normal cleanup.
+            # cancel_withdrawal() now owns the assignment/lease/reservation.
 
     def ensure_realtime(self):
         """Authenticate this session and reconcile it once per physical generation."""

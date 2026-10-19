@@ -37,7 +37,10 @@ from camera_manager import (
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
 from automation.context import AutomationContext
+from automation.coordinates import normalized_to_device, unit
 from automation.diagnostics import install_recent_log_handler
+from automation.screen.camera import CalibratedPreviewCache
+from automation.screen.stability import ScreenStabilityError
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
 from automation.jobs.storage import DeviceWorkflowAssignmentStore
@@ -45,7 +48,7 @@ from automation.integrations.withdraw_v2.balance import balance_check_workflow
 from automation.integrations.withdraw_v2.manager import register_withdraw
 from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
 from hardware.device_config import DEFAULT_DEVICE_ID
-from hardware.raspberry_pi_input import RaspberryPiInputBridge
+from hardware.raspberry_pi_input import PiControlTarget, RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
@@ -467,6 +470,8 @@ def create_app(
         "route_total": 0.0,
     }
     app.extensions["preview_request_metrics"] = request_metrics
+    calibrated_preview_cache = CalibratedPreviewCache()
+    app.extensions["calibrated_preview_cache"] = calibrated_preview_cache
     token = secrets.token_urlsafe(32)
     if calibration_storage is None and all(
         hasattr(camera, field) for field in ("source", "rotate")
@@ -1224,6 +1229,86 @@ def create_app(
             },
         )
 
+    @app.get("/api/devices/<device_id>/camera/preview")
+    def calibrated_preview(device_id):
+        """Return this logical phone's calibrated view of its shared camera."""
+        with state.lock:
+            with camera_manager.lock:
+                selected = selected_camera_device_id()
+                camera_manager.config(device_id)
+                active_camera = camera_manager.get_camera(device_id)
+                camera_status = active_camera.status()
+                if not camera_status["ready"]:
+                    return jsonify(error=camera_status["error"]), 503
+                latest = active_camera.frame()
+                if latest is None:
+                    return jsonify(error="Camera frame unavailable."), 503
+                preview_frame = (
+                    latest[0],
+                    latest[1],
+                    camera_status["width"],
+                    camera_status["height"],
+                )
+
+                if state.pi_bridge is not None:
+                    serial = "pi-api:" + state.pi_bridge.client.base_url
+                    if device_id != DEFAULT_DEVICE_ID:
+                        serial += "#" + device_id
+                    preview_device = PiControlTarget(serial, device_id=device_id)
+                elif device_id == selected:
+                    if state.device is None:
+                        state.require_ready()
+                    preview_device = state.device
+                else:
+                    return (
+                        jsonify(error="This logical phone is not available."),
+                        404,
+                    )
+
+                if state.calibration_storage is None:
+                    calibration = None
+                else:
+                    calibration = state.calibration_storage.load(
+                        active_camera,
+                        camera_status,
+                        preview_device,
+                    )
+                if calibration is None:
+                    return (
+                        jsonify(error="Calibration required for this phone."),
+                        409,
+                    )
+
+        try:
+            jpeg, number, width, height, cache_hit = calibrated_preview_cache.encode(
+                device_id,
+                active_camera,
+                calibration,
+                preview_device,
+                preview_frame,
+            )
+        except ScreenStabilityError as exc:
+            return jsonify(error=str(exc)), 503
+
+        with camera_manager.lock:
+            if not camera_manager.is_current(device_id, active_camera):
+                return (
+                    jsonify(error="Camera selection changed; request a new preview."),
+                    409,
+                )
+        return Response(
+            jpeg,
+            mimetype="image/jpeg",
+            headers={
+                "X-Frame-Id": str(number),
+                "X-Camera-Device-Id": device_id,
+                "X-Preview-Coordinate-Space": "screen_normalized",
+                "X-Preview-Width": str(width),
+                "X-Preview-Height": str(height),
+                "X-Preview-Cache": "hit" if cache_hit else "miss",
+            },
+        )
+
     @app.post("/api/control")
     def control():
         data, client = payload(), client_id()
@@ -1487,15 +1572,28 @@ def create_app(
 
                 pixel, normalized = None, None
                 swipe_start, swipe_end, swipe_duration = None, None, None
+                coordinate_space = data.get("coordinate_space", "camera_normalized")
+                if coordinate_space not in {
+                    "camera_normalized",
+                    "screen_normalized",
+                }:
+                    raise ValueError("Unsupported coordinate_space.")
+
+                def action_point(value):
+                    if not isinstance(value, (list, tuple)) or len(value) != 2:
+                        raise ValueError("A normalized coordinate is required.")
+                    if coordinate_space == "screen_normalized":
+                        return [unit(value[0]), unit(value[1])]
+                    return state.calibration.map(value)
 
                 if name == "tap":
+                    normalized = action_point([data.get("x"), data.get("y")])
                     if state.pi_bridge is not None:
-                        normalized = state.calibration.map(
-                            [data.get("x"), data.get("y")]
-                        )
+                        pixel = None
                     else:
-                        pixel, normalized = state.calibration.pixel(
-                            [data.get("x"), data.get("y")],
+                        pixel = normalized_to_device(
+                            normalized[0],
+                            normalized[1],
                             state.device.width,
                             state.device.height,
                         )
@@ -1510,15 +1608,11 @@ def create_app(
                             "Swipe duration must be 50–60000 milliseconds."
                         )
                     if state.pi_bridge is not None:
-                        swipe_start = state.calibration.map(start)
-                        swipe_end = state.calibration.map(end)
+                        swipe_start = action_point(start)
+                        swipe_end = action_point(end)
                     else:
-                        _, swipe_start = state.calibration.pixel(
-                            start, state.device.width, state.device.height
-                        )
-                        _, swipe_end = state.calibration.pixel(
-                            end, state.device.width, state.device.height
-                        )
+                        swipe_start = action_point(start)
+                        swipe_end = action_point(end)
 
                 recorded = None
                 try:

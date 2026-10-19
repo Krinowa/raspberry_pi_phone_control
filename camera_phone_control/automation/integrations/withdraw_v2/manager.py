@@ -1597,9 +1597,13 @@ class WithdrawManager:
                 "Reconnect the Withdraw account before " "cancelling this withdrawal."
             )
 
-        worker.cancel_withdrawal(reason)
+        # Retry creation uses the same manager lock. Holding it through the
+        # cancellation handoff makes Retry and Cancel mutually exclusive all
+        # the way through their durable journal transition.
+        with self.lock:
+            worker.cancel_withdrawal(reason)
 
-        return self.status(device_id)
+            return self.status(device_id)
 
     def close(self):
 
@@ -1745,14 +1749,23 @@ def register_withdraw(
 
         data = payload()
 
-        if set(data) != {"reason_code"}:
+        # Accept the former attestation field for rolling-client compatibility,
+        # but it is intentionally ignored and never affects eligibility.
+        if set(data) not in (
+            {"reason"},
+            {"reason", "confirmed_not_submitted"},
+            {"reason_code"},
+            {"reason_code", "confirmed_not_submitted"},
+        ):
 
-            raise ValueError("Cancel Withdrawal expects a reason_code only.")
+            raise ValueError("Cancel Withdrawal expects one reason.")
+
+        reason_code = data.get("reason", data.get("reason_code"))
 
         return jsonify(
             manager.cancel_withdrawal(
                 device_id,
-                data["reason_code"],
+                reason_code,
             )
         )
 
