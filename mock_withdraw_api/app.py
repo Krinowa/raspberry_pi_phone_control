@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from ipaddress import ip_address
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
@@ -29,6 +30,18 @@ def create_app(state=None, realtime=None):
     app.config.update(MAX_CONTENT_LENGTH=12 * 1024 * 1024)
     app.extensions["mock_state"] = state
     app.extensions["mock_realtime"] = realtime
+
+    @app.before_request
+    def local_mock_controls_only():
+        if not request.path.startswith("/mock"):
+            return None
+        try:
+            local = ip_address(request.remote_addr or "").is_loopback
+        except ValueError:
+            local = False
+        if not local:
+            return jsonify(envelope({}, "Mock controls are local-only.", 0)), 403
+        return None
 
     @app.errorhandler(MockError)
     def mock_error(error):
@@ -181,7 +194,9 @@ def create_app(state=None, realtime=None):
     def disconnect():
         hub = app.extensions.get("mock_realtime") or state.publisher
         if hub:
-            hub.disconnect_all()
+            future = hub.disconnect_all()
+            if future:
+                future.result(timeout=5)
         return jsonify({"ok": True})
 
     @app.post("/mock/expire-session")
@@ -208,13 +223,21 @@ def create_app(state=None, realtime=None):
 
     @app.post("/mock/lock-expire")
     def lock_expire():
-        with state.lock:
-            for item in state.withdrawals.values():
-                if item["status"] == "LOCKED":
-                    item["lock_expires_at_timestamp"] = state.now() - 1
-        affected = state.expire_locks()
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or set(data) - {"withdraw_id"}:
+            raise MockError(422, "Expected optional withdraw_id only.")
+        affected = state.expire_lock(data.get("withdraw_id"))
         publish(affected)
         return jsonify({"ok": True, "payment_records": sorted(affected)})
+
+    @app.post("/mock/withdrawals/<int:withdraw_id>/approve")
+    def approve_withdrawal(withdraw_id):
+        data = body()
+        if set(data) != {"operator_id"}:
+            raise MockError(422, "operator_id is required.")
+        value, record = state.approve(withdraw_id, data["operator_id"])
+        publish({record})
+        return jsonify({"ok": True, "withdrawal": value})
 
     @app.get("/mock")
     def mock_ui():
@@ -234,11 +257,13 @@ _ADMIN_HTML = """<!doctype html>
 <p>HTTP 127.0.0.1:9100 · WebSocket 127.0.0.1:9101 · scenario <strong>{{ snapshot.scenario }}</strong></p>
 <form method="post" action="/mock/scenario" onsubmit="return send(this)"><select name="scenario">{% for value in scenarios %}<option>{{ value }}</option>{% endfor %}</select><button>Set scenario</button></form>
 <button onclick="post('/mock/reset',{})">Reset to Seed Data</button><button onclick="post('/mock/withdrawals/reset',{})">Clear Withdrawals</button><button onclick="post('/mock/emit-queue-changed',{payment_record:'5'})">Emit queue.changed</button><button onclick="post('/mock/disconnect',{})">Disconnect WebSocket</button>
+<form onsubmit="return expireLock(this)"><strong>Expire lock:</strong> <label>Withdrawal ID <input name="withdraw_id" type="number" min="1" required></label><button>Expire Exact Lock</button></form>
+<form onsubmit="return approveWithdrawal(this)"><strong>Simulate approval:</strong> <label>Withdrawal ID <input name="withdraw_id" type="number" min="1" required></label> <label>Operator ID <input name="operator_id" type="number" min="1" required></label><button>Approve Exact Withdrawal</button></form>
 <form onsubmit="return addWithdrawal(this)"><strong>Add pending:</strong> <label>Payment Record <select name="payment_record" required><option>5</option><option>2b</option><option>9</option></select></label> <label>Amount <input name="amount" type="number" value="10.00" min="0.01" step="0.01" required></label> <label>Priority <input name="priority" type="number" value="0" min="0" step="1" required></label> <label>Bank Name <input name="bank_name" placeholder="Mock Bank" required></label> <label>Account Number <input name="account_number" placeholder="0000000000" required></label> <label>Account Name <input name="account_name" placeholder="Mock Test User" required></label><button>Add Pending Withdrawal</button></form>
 <h2>Seeded users</h2><table><tr><th>User</th><th>ID</th><th>Payment records</th></tr>{% for name,user in snapshot.operators.items() %}<tr><td>{{ name }}</td><td>{{ user.id }}</td><td>{{ user.payment_records|join(', ') }}</td></tr>{% endfor %}</table>
 <h2>Pending withdrawals</h2><table><tr><th>ID</th><th>TX</th><th>Record</th><th>Amount</th><th>Priority</th><th>Bank Name</th><th>Account Number</th><th>Account Name</th></tr>{% for w in snapshot.pending_withdrawals %}<tr><td>{{ w.id }}</td><td>{{ w.tx_id }}</td><td>{{ w.payment_record }}</td><td>RM {{ w.final_amount }}</td><td>{{ w.priority }}</td><td>{{ w.bank_name }}</td><td>{{ w.account_number }}</td><td>{{ w.account_name }}</td></tr>{% endfor %}</table>
 <h2>History</h2><pre>{{ snapshot.confirmed_withdrawals + snapshot.cancelled_withdrawals }}</pre>
-<script>async function post(url,data){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!response.ok){const result=await response.json();alert(result.message||result.error||'Mock request failed');return}location.reload()} function send(form){post(form.action,{scenario:form.scenario.value});return false} function addWithdrawal(form){post('/mock/withdrawals',{payment_record:form.payment_record.value,final_amount:form.amount.value,priority:Number(form.priority.value),bank_name:form.bank_name.value,account_number:form.account_number.value,account_name:form.account_name.value});return false}</script>"""
+<script>async function post(url,data){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!response.ok){const result=await response.json();alert(result.message||result.error||'Mock request failed');return}location.reload()} function send(form){post(form.action,{scenario:form.scenario.value});return false} function addWithdrawal(form){post('/mock/withdrawals',{payment_record:form.payment_record.value,final_amount:form.amount.value,priority:Number(form.priority.value),bank_name:form.bank_name.value,account_number:form.account_number.value,account_name:form.account_name.value});return false} function expireLock(form){post('/mock/lock-expire',{withdraw_id:Number(form.withdraw_id.value)});return false} function approveWithdrawal(form){post('/mock/withdrawals/'+Number(form.withdraw_id.value)+'/approve',{operator_id:Number(form.operator_id.value)});return false}</script>"""
 
 
 if __name__ == "__main__":

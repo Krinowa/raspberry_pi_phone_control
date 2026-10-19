@@ -14,7 +14,6 @@ from .validation import (
     validate_workflow,
 )
 
-
 VERIFY_VARIABLE_LABELS = {
     "account_name": "Account Name",
     "account_number": "Account Number",

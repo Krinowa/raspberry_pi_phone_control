@@ -49,9 +49,9 @@ def main(argv=None):
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=True,
-        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_detection_model_name="PP-OCRvthe c5_mobile_det",
         text_recognition_model_name="en_PP-OCRv5_mobile_rec",
-        text_line_orientation_model_name="PP-LCNet_x1_0_textline_ori",
+        textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
     )
     model_root = cache_root / "official_models"
     _validate(model_root)

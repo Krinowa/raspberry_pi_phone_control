@@ -993,23 +993,26 @@ def create_app(
         data = payload()
         if set(data) != {"device_id"}:
             raise ValueError("Expected device_id only.")
+
         bridge, _, registered = registered_pi_devices()
+
         if data["device_id"] not in registered:
             raise ValueError("Select a registered phone returned by the Pi.")
+
         workflow_service = app.extensions.get("workflow_service")
         recorder = app.extensions.get("workflow_recorder")
+
         with state.lock:
-            if workflow_service is not None and workflow_service.has_active_run():
-                raise ValueError(
-                    "Wait for the active workflow to finish before switching phones."
-                )
             if recorder is not None and recorder.active:
                 raise ValueError(
                     "Stop or discard the recording before switching phones."
                 )
+
             selected = state.select_pi_device(data["device_id"])
+
             if workflow_service is not None:
                 workflow_service.device_id = selected
+
             return jsonify(ok=True, selected_device=selected)
 
     @app.get("/api/enrollment")
@@ -1137,14 +1140,7 @@ def create_app(
                     )
                 camera_manager.config(requested_device)
                 active_camera = camera_manager.get_camera(requested_device)
-                if (
-                    getattr(active_camera, "device_id", requested_device)
-                    != requested_device
-                ):
-                    return (
-                        jsonify(error="Camera ownership changed; request a new frame."),
-                        409,
-                    )
+
                 if requested_device == selected:
                     state.camera = active_camera
                 camera_status = active_camera.status()

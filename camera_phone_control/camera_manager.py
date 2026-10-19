@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
@@ -270,7 +270,8 @@ class CameraManager:
             self.configs[DEFAULT_DEVICE_ID] = CameraConfig(
                 DEFAULT_DEVICE_ID, default_source, default_rotation, True
             )
-        self.source_owners = self._source_owners_for(self.configs, strict=False)
+        self.source_users = self._source_users_for(self.configs)
+        self._validate_shared_sources(self.configs)
         if default_camera is not None:
             default_config = self.configs[DEFAULT_DEVICE_ID]
             camera_matches_config = (
@@ -296,26 +297,15 @@ class CameraManager:
             return {key: value.public() for key, value in self.configs.items()}
 
     @staticmethod
-    def _source_owners_for(configs, *, strict=True):
-        owners = {}
+    def _source_users_for(configs):
+        """Return configured camera assignments as source -> logical device IDs."""
+        users = {}
         for device_id, config in configs.items():
             assignment = config.camera_id or config.camera_source
             if not config.enabled or assignment is None:
                 continue
-            previous = owners.get(assignment)
-            if previous is not None and previous != device_id:
-                message = (
-                    f"Camera source {assignment!r} is already assigned "
-                    f"to {previous}."
-                )
-                if strict:
-                    raise ValueError(message)
-                LOG.warning(
-                    "Ignoring duplicate persisted camera assignment: %s", message
-                )
-                continue
-            owners[assignment] = device_id
-        return owners
+            users.setdefault(assignment, set()).add(device_id)
+        return users
 
     def _identity_devices(self):
         if self.identity_discovery is None:
@@ -398,7 +388,28 @@ class CameraManager:
         resolved_source, _ = self._resolve_source(stable_id, identities)
         return resolved_source == runtime_source
 
-    def _runtime_owners_for(self, configs, identities=None, *, strict=True):
+    def _validate_shared_sources(self, configs, identities=None):
+        """Allow camera sharing, but require one rotation per physical source.
+
+        A Camera object rotates the captured frame before publishing it. Two
+        logical phones can therefore share one live Camera only when they use
+        the same rotation. Their four-corner calibrations remain independent.
+        """
+        configured_rotations = {}
+        for device_id, config in configs.items():
+            configured = config.camera_id or config.camera_source
+            if not config.enabled or configured is None:
+                continue
+            previous = configured_rotations.get(configured)
+            if previous is not None and previous[1] != config.rotation:
+                previous_device, previous_rotation = previous
+                raise ValueError(
+                    f"Phones sharing camera source {configured!r} must use the "
+                    f"same rotation. {previous_device} uses {previous_rotation}°, "
+                    f"{device_id} uses {config.rotation}°."
+                )
+            configured_rotations.setdefault(configured, (device_id, config.rotation))
+
         requires_identity = any(
             config.enabled
             and is_stable_camera_id(config.camera_id or config.camera_source)
@@ -409,26 +420,66 @@ class CameraManager:
             if identities is None and requires_identity
             else identities or []
         )
-        owners = {}
+
+        runtime_rotations = {}
         for device_id, config in configs.items():
             configured = config.camera_id or config.camera_source
             if not config.enabled or configured is None:
                 continue
-            source, _ = self._resolve_source(configured, identities)
-            if source is None:
+
+            runtime_source, _ = self._resolve_source(configured, identities)
+            if runtime_source is None:
                 continue
-            previous = owners.get(source)
-            if previous is not None and previous != device_id:
-                message = (
-                    f"Camera source {source!r} currently resolves to both "
-                    f"{previous} and {device_id}."
+
+            previous = runtime_rotations.get(runtime_source)
+            if previous is not None and previous[1] != config.rotation:
+                previous_device, previous_rotation = previous
+                raise ValueError(
+                    f"Phones sharing physical camera {runtime_source!r} must use "
+                    f"the same rotation. {previous_device} uses "
+                    f"{previous_rotation}°, {device_id} uses {config.rotation}°."
                 )
-                if strict:
-                    raise ValueError(message)
-                LOG.warning("Ignoring duplicate runtime camera assignment: %s", message)
+            runtime_rotations.setdefault(runtime_source, (device_id, config.rotation))
+
+    def _device_ids_for_camera(self, camera):
+        return [
+            device_id
+            for device_id, assigned in self.cameras.items()
+            if assigned is camera
+        ]
+
+    def _close_shared_camera_locked(self, camera):
+        """Close one physical Camera and remove every logical alias to it.
+
+        Closing a shared capture for only one device would leave the other
+        device mappings pointing at a dead Camera object. Remove all aliases
+        only after close succeeds so a close failure preserves the authoritative
+        mappings. Other logical devices reopen lazily and reuse the replacement.
+        """
+        device_ids = self._device_ids_for_camera(camera)
+        close = getattr(camera, "close", None)
+        if close is not None:
+            close()
+
+        for device_id in device_ids:
+            if self.cameras.get(device_id) is camera:
+                self.cameras.pop(device_id, None)
+            self.last_opened.pop(device_id, None)
+            self.recovery_attempts.pop(device_id, None)
+        return device_ids
+
+    def _find_shared_camera(self, runtime_source, rotation):
+        for camera in self.cameras.values():
+            if isinstance(camera, UnavailableCamera):
                 continue
-            owners[source] = device_id
-        return owners
+            if getattr(camera, "identity_mismatch", False):
+                continue
+            if (
+                getattr(camera, "source", None) == runtime_source
+                and getattr(camera, "rotate", None) == rotation
+            ):
+                return camera
+        return None
 
     def _new_camera(self, config, device_id, *, identities=None):
         if not config.enabled:
@@ -452,21 +503,18 @@ class CameraManager:
                     else f"Configured camera {config.display_name or configured!r} is disconnected."
                 ),
             )
-        owner = self.source_owners.get(configured)
-        if owner is not None and owner != device_id:
-            return UnavailableCamera(
-                config,
-                f"Camera source {configured!r} is already in use by {owner}.",
+
+        shared = self._find_shared_camera(runtime_source, config.rotation)
+
+        if shared is not None:
+            LOG.info(
+                "Reusing camera source=%r for device_id=%s",
+                runtime_source,
+                device_id,
             )
-        runtime_owner = self._runtime_owners_for(
-            self.configs, identities, strict=False
-        ).get(runtime_source)
-        if runtime_owner is not None and runtime_owner != device_id:
-            return UnavailableCamera(
-                config,
-                f"Camera source {runtime_source!r} is already in use by "
-                f"{runtime_owner}.",
-            )
+            self.last_opened[device_id] = time.monotonic()
+            return shared
+
         camera = self.camera_factory(
             runtime_source,
             self.width,
@@ -497,6 +545,7 @@ class CameraManager:
             camera = self.cameras.get(device_id)
             configured = config.camera_id or config.camera_source
             identity_mismatch_transitioned = False
+
             if (
                 is_avfoundation_camera_source(configured)
                 and camera is not None
@@ -515,14 +564,12 @@ class CameraManager:
                     configured,
                     getattr(camera, "source", None),
                 )
-                close = getattr(camera, "close", None)
-                if close is not None:
-                    close()
+                self._close_shared_camera_locked(camera)
                 camera = UnavailableCamera(config, error)
                 self.cameras[device_id] = camera
                 self.last_opened[device_id] = time.monotonic()
-                self.recovery_attempts.pop(device_id, None)
                 identity_mismatch_transitioned = True
+
             if (
                 is_avfoundation_camera_source(configured)
                 and camera is not None
@@ -541,17 +588,15 @@ class CameraManager:
                         current_source,
                         resolved_source,
                     )
-                    close = getattr(camera, "close", None)
-                    if close is not None:
-                        close()
+                    self._close_shared_camera_locked(camera)
                     time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
-                    self.cameras.pop(device_id, None)
                     camera = self._new_camera(
                         config,
                         device_id,
                         identities=identities,
                     )
                     self.cameras[device_id] = camera
+
             thread = getattr(camera, "thread", None)
             camera_status = camera.status() if camera is not None else None
             if (
@@ -561,6 +606,7 @@ class CameraManager:
                 >= self.recovery_reset_seconds
             ):
                 self.recovery_attempts.pop(device_id, None)
+
             if (
                 is_stable_camera_id(config.camera_id or config.camera_source)
                 and isinstance(camera, UnavailableCamera)
@@ -596,21 +642,22 @@ class CameraManager:
                     self.recovery_attempts.get(device_id, 0) + 1
                 )
                 if is_stable_camera_id(config.camera_id or config.camera_source):
-                    close = getattr(camera, "close", None)
-                    if close is not None:
-                        close()
+                    self._close_shared_camera_locked(camera)
                     time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
-                    self.cameras.pop(device_id, None)
                     camera = self._new_camera(config, device_id)
                     self.cameras[device_id] = camera
                 else:
                     camera.start()
-                    self.last_opened[device_id] = time.monotonic()
+                    opened_at = time.monotonic()
+                    for shared_device_id in self._device_ids_for_camera(camera):
+                        self.last_opened[shared_device_id] = opened_at
+
             if camera is None:
                 if not open_camera:
                     return None
                 camera = self._new_camera(config, device_id)
                 self.cameras[device_id] = camera
+
             return camera
 
     def activate(self, device_id):
@@ -641,15 +688,16 @@ class CameraManager:
         display_name=None,
         camera_id=None,
     ):
-        """Apply one assignment, atomically swapping with its current owner.
+        """Apply one logical-device camera assignment atomically.
 
-        A swap is possible when the edited device already owns another source. An
-        unassigned device still cannot take an occupied source because there is no
-        safe destination for the existing owner.
+        Multiple logical phones may reference the same physical camera. The
+        physical capture is reused when the resolved source and rotation match.
+        Each phone keeps its own logical configuration and calibration.
         """
         config = CameraConfig(
             device_id, camera_source, rotation, enabled, display_name, camera_id
         )
+
         with self.lock:
             previous = self.configs.get(
                 device_id, CameraConfig(device_id, None, 0, False)
@@ -658,7 +706,6 @@ class CameraManager:
                 return config, set()
 
             # A metadata-only save does not change the physical assignment.
-            # Keep the live capture and source ownership untouched.
             if (
                 previous.camera_source == config.camera_source
                 and previous.camera_id == config.camera_id
@@ -669,62 +716,35 @@ class CameraManager:
                 updated[device_id] = config
                 self.storage.save(updated)
                 self.configs = updated
+                self.source_users = self._source_users_for(updated)
                 return config, set()
 
             updated = dict(self.configs)
+            updated[device_id] = config
             affected = {device_id}
-            target_owner = (
-                self.source_owners.get(config.camera_id or config.camera_source)
-                if config.enabled
-                and (config.camera_id is not None or config.camera_source is not None)
-                else None
-            )
+
+            # Sharing is valid, but one physical Camera publishes one rotated
+            # frame, so every logical user of that capture must agree on rotation.
+            self._validate_shared_sources(updated)
+            new_users = self._source_users_for(updated)
+
             LOG.info(
                 "Camera reassignment device_id=%s old_source=%r new_source=%r "
-                "target_owner=%s",
+                "shared_users=%s",
                 device_id,
-                previous.camera_source,
-                config.camera_source,
-                target_owner,
+                previous.camera_id or previous.camera_source,
+                config.camera_id or config.camera_source,
+                sorted(new_users.get(config.camera_id or config.camera_source, set())),
             )
-            if target_owner is not None and target_owner != device_id:
-                if (
-                    not previous.enabled
-                    or (previous.camera_id is None and previous.camera_source is None)
-                    or self.source_owners.get(
-                        previous.camera_id or previous.camera_source
-                    )
-                    != device_id
-                ):
-                    raise ValueError(
-                        f"Camera source {config.camera_id or config.camera_source!r} is already assigned "
-                        f"to {target_owner}."
-                    )
-                owner_config = updated[target_owner]
-                updated[target_owner] = replace(
-                    owner_config,
-                    camera_source=previous.camera_source,
-                    camera_id=previous.camera_id,
-                )
-                affected.add(target_owner)
-                LOG.info(
-                    "Camera swap device_id=%s source=%r other_device_id=%s source=%r",
-                    device_id,
-                    config.camera_source,
-                    target_owner,
-                    previous.camera_source,
-                )
-            updated[device_id] = config
-            new_owners = self._source_owners_for(updated)
-            self._runtime_owners_for(updated)
 
             old_configs = self.configs
-            old_owners = self.source_owners
+            old_users = self.source_users
             reopen = {
-                item
-                for item in affected
-                if item in self.cameras or item == self.active_device_id
+                device_id
+                for device_id in affected
+                if device_id in self.cameras or device_id == self.active_device_id
             }
+
             released = False
             released_devices = set()
             try:
@@ -747,13 +767,15 @@ class CameraManager:
                     "Camera could not be stopped safely; previous assignments "
                     "were restored."
                 ) from exc
+
             if released:
-                # AVFoundation can retain an exclusive device handle very briefly
-                # after release. Keep the pause bounded and inside this transaction.
+                # Some camera backends retain an exclusive handle briefly after
+                # the final logical user releases the physical capture.
                 time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
 
             self.configs = updated
-            self.source_owners = new_owners
+            self.source_users = new_users
+
             try:
                 self._open_devices_locked(reopen)
                 self.storage.save(updated)
@@ -765,6 +787,7 @@ class CameraManager:
                     previous.camera_source,
                     config.camera_source,
                 )
+
                 rollback_released = False
                 try:
                     for affected_id in sorted(affected):
@@ -777,10 +800,13 @@ class CameraManager:
                         "Camera change failed, and rollback could not safely stop "
                         "the changed camera. Check the camera connections."
                     ) from rollback_stop_exc
+
                 self.configs = old_configs
-                self.source_owners = old_owners
+                self.source_users = old_users
+
                 if rollback_released:
                     time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
+
                 try:
                     self._open_devices_locked(reopen)
                 except Exception as rollback_exc:
@@ -789,6 +815,7 @@ class CameraManager:
                         "Camera change failed, and the previous camera assignments "
                         "could not be reopened. Check the camera connections."
                     ) from rollback_exc
+
                 if isinstance(exc, (OSError, TypeError, ValueError)):
                     raise CameraManagerError(
                         "Camera settings could not be applied; previous assignments were restored."
@@ -799,12 +826,12 @@ class CameraManager:
 
             LOG.info(
                 "Camera reassignment complete device_id=%s old_source=%r "
-                "new_source=%r affected=%s owners=%s",
+                "new_source=%r affected=%s users=%s",
                 device_id,
                 previous.camera_source,
                 config.camera_source,
                 sorted(affected),
-                self.source_owners,
+                {key: sorted(value) for key, value in self.source_users.items()},
             )
             return self.configs[device_id], affected
 
@@ -984,12 +1011,7 @@ class CameraManager:
                         "error": "The configured camera is disconnected.",
                     }, None
             for device_id, camera in self.cameras.items():
-                matches = (
-                    getattr(camera, "configured_source", None) == source
-                    if identity is not None
-                    else getattr(camera, "source", None) == runtime_source
-                )
-                if not matches:
+                if getattr(camera, "source", None) != runtime_source:
                     continue
                 current = camera.frame()
                 if current is None:

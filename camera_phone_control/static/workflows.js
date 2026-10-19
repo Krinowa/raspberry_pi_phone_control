@@ -30,6 +30,8 @@
   const preview = $("workflow-preview"),
     paint = preview.getContext("2d");
   const piManual = () => state?.manual_backend === "raspberry_pi";
+  const cameraPoint = (point) =>
+    window.phonePreviewToCameraPoint?.(point) ?? point;
   let pendingManual = Promise.resolve();
   const terminal = new Set(["passed", "failed", "cancelled"]);
   const show = (message, error = false) => {
@@ -2662,7 +2664,7 @@
       const extra = camera
         ? {
             camera_start: saved.start,
-            ...(swipe ? { camera_end: end } : {}),
+            ...(swipe ? { camera_end: cameraPoint(end) } : {}),
             frame_id: frameId,
           }
         : {};
@@ -2701,7 +2703,12 @@
       task(async () => {
         recording = await api("/api/recorder/keyboard-capture/key", {
           key,
-          ...(camera ? { camera_point: point, frame_id: frameId } : { point }),
+          ...(camera
+            ? {
+                camera_point: cameraPoint(point),
+                frame_id: frameId,
+              }
+            : { point }),
         });
       });
     });

@@ -3492,11 +3492,94 @@ function render() {
         : "Input disabled. Calibrate, then enable Manual Control.";
 }
 
+function activePreviewCrop() {
+  if (
+    calibrating ||
+    !bitmap ||
+    !state?.calibrated ||
+    !Array.isArray(state?.corners) ||
+    state.corners.length !== 4
+  ) {
+    return null;
+  }
+
+  const xs = state.corners.map((point) => point[0]);
+  const ys = state.corners.map((point) => point[1]);
+
+  const left = Math.max(0, Math.min(...xs));
+  const top = Math.max(0, Math.min(...ys));
+  const right = Math.min(1, Math.max(...xs));
+  const bottom = Math.min(1, Math.max(...ys));
+
+  const width = right - left;
+  const height = bottom - top;
+
+  if (width <= 0 || height <= 0) return null;
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width,
+    height,
+  };
+}
+
+function previewPointToCamera(point) {
+  const crop = activePreviewCrop();
+
+  if (!crop) return point;
+
+  return [crop.left + point[0] * crop.width, crop.top + point[1] * crop.height];
+}
+
+window.phonePreviewToCameraPoint = previewPointToCamera;
+
 function draw() {
   if (!bitmap) return;
+
+  const crop = activePreviewCrop();
+
+  // Normal mode: show only the selected calibrated phone.
+  if (crop) {
+    const sx = Math.max(0, Math.floor(crop.left * bitmap.width));
+    const sy = Math.max(0, Math.floor(crop.top * bitmap.height));
+    const ex = Math.min(bitmap.width, Math.ceil(crop.right * bitmap.width));
+    const ey = Math.min(bitmap.height, Math.ceil(crop.bottom * bitmap.height));
+
+    const sourceWidth = Math.max(1, ex - sx);
+    const sourceHeight = Math.max(1, ey - sy);
+
+    if (canvas.width !== sourceWidth || canvas.height !== sourceHeight) {
+      canvas.width = sourceWidth;
+      canvas.height = sourceHeight;
+    }
+
+    ctx.drawImage(
+      bitmap,
+      sx,
+      sy,
+      sourceWidth,
+      sourceHeight,
+      0,
+      0,
+      canvas.width,
+      canvas.height,
+    );
+
+    return;
+  }
+
+  // Calibration / uncalibrated mode: show the whole physical camera.
+  if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+  }
+
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  const points = calibrating ? corners : state?.corners || [];
-  if (!points.length) return;
+
+  if (!calibrating || !corners.length) return;
 
   ctx.save();
   ctx.lineWidth = Math.max(2, canvas.width / 500);
@@ -3504,30 +3587,37 @@ function draw() {
   ctx.fillStyle = "rgba(61, 208, 128, .10)";
   ctx.beginPath();
 
-  points.forEach(([x, y], i) => {
-    if (i === 0) ctx.moveTo(x * canvas.width, y * canvas.height);
-    else ctx.lineTo(x * canvas.width, y * canvas.height);
+  corners.forEach(([x, y], i) => {
+    if (i === 0) {
+      ctx.moveTo(x * canvas.width, y * canvas.height);
+    } else {
+      ctx.lineTo(x * canvas.width, y * canvas.height);
+    }
   });
 
-  if (points.length === 4) {
+  if (corners.length === 4) {
     ctx.closePath();
     ctx.fill();
   }
 
   ctx.stroke();
-  points.forEach(([x, y], i) => {
+
+  corners.forEach(([x, y], i) => {
     const radius = Math.max(12, canvas.width / 65);
+
     ctx.fillStyle = "#164d34";
     ctx.beginPath();
     ctx.arc(x * canvas.width, y * canvas.height, radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
+
     ctx.fillStyle = "white";
     ctx.font = `600 ${radius}px sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(String(i + 1), x * canvas.width, y * canvas.height);
   });
+
   ctx.restore();
 }
 
@@ -3768,7 +3858,7 @@ async function videoLoop() {
 
     if (
       bitmap &&
-      (next.width !== canvas.width || next.height !== canvas.height)
+      (next.width !== bitmap.width || next.height !== bitmap.height)
     ) {
       manual = false;
       calibrating = false;
@@ -3782,13 +3872,6 @@ async function videoLoop() {
     }
 
     const previousBitmap = bitmap;
-
-    // Only resize when resolution actually changed.
-    // Setting canvas.width / canvas.height clears the canvas.
-    if (canvas.width !== next.width || canvas.height !== next.height) {
-      canvas.width = next.width;
-      canvas.height = next.height;
-    }
 
     bitmap = next;
 
@@ -4211,9 +4294,15 @@ canvas.addEventListener("pointerup", (event) => {
     canvas,
     performance.now() - saved.at,
   );
-  if (gesture.type === "swipe")
-    sendPreviewSwipe(gesture.start, gesture.end, gesture.duration_ms);
-  else sendAction("tap", gesture.end);
+  if (gesture.type === "swipe") {
+    sendPreviewSwipe(
+      previewPointToCamera(gesture.start),
+      previewPointToCamera(gesture.end),
+      gesture.duration_ms,
+    );
+  } else {
+    sendAction("tap", previewPointToCamera(gesture.end));
+  }
 });
 
 for (const name of ["pointercancel", "lostpointercapture"])
@@ -4242,7 +4331,7 @@ canvas.addEventListener("click", (event) => {
     if (corners.length < 4) corners.push(point);
     render();
     draw();
-  } else sendAction("tap", point);
+  } else sendAction("tap", previewPointToCamera(point));
 });
 
 document.querySelectorAll("[data-action]").forEach((button) => {

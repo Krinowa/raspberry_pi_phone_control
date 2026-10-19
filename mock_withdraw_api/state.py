@@ -60,7 +60,7 @@ class MockState:
             self.tokens = {}
             self.login_serial = 0
 
-            self.next_withdrawal_id = int(time.time() * 1000)
+            self.next_withdrawal_id = 936000
 
             self.scenario = "normal"
             self.time_offset = 0
@@ -91,7 +91,7 @@ class MockState:
         with self.lock:
             affected = {item["payment_record"] for item in self.withdrawals.values()}
             self.withdrawals = {}
-            # self.next_withdrawal_id = 936000
+            # Preserve the monotonic test ID sequence until an explicit reset.
             return affected
 
     def login(self, username, password, g2f_code):
@@ -258,6 +258,12 @@ class MockState:
             )
         if not token:
             raise MockError(403, "Session channel is not subscribed.")
+        session = self.session(token, touch=False)
+        expected = self.profile(session)["realtime"]["channels"]["session"]
+        if channel != expected:
+            raise MockError(
+                403, "Client actions require the authorized session channel."
+            )
         return token
 
     def _expire_locks_locked(self):
@@ -268,7 +274,8 @@ class MockState:
                 affected.add(item["payment_record"])
                 item.update(
                     status="PENDING",
-                    locked_by=None,
+                    locked_by_operator_id=None,
+                    locked_by_session_id=None,
                     lock_expires_at=None,
                     lock_expires_at_timestamp=None,
                 )
@@ -283,12 +290,17 @@ class MockState:
 
     @staticmethod
     def _public(item, session=None):
-        hidden = {"lock_expires_at_timestamp", "proof_files"}
+        hidden = {
+            "lock_expires_at_timestamp",
+            "locked_by_operator_id",
+            "locked_by_session_id",
+            "proof_files",
+        }
         result = {
             key: deepcopy(value) for key, value in item.items() if key not in hidden
         }
         result["locked_by_me"] = bool(
-            session and item.get("locked_by") == session["token"]
+            session and item.get("locked_by_operator_id") == session["operator_id"]
         )
         return result
 
@@ -309,7 +321,10 @@ class MockState:
         with self.lock:
             self._expire_locks_locked()
             for item in self.withdrawals.values():
-                if item["status"] == "LOCKED" and item["locked_by"] == session["token"]:
+                if (
+                    item["status"] == "LOCKED"
+                    and item["locked_by_operator_id"] == session["operator_id"]
+                ):
                     return self._public(item, session)
             return None
 
@@ -317,10 +332,11 @@ class MockState:
         with self.lock:
             self._expire_locks_locked()
             if any(
-                item["status"] == "LOCKED" and item["locked_by"] == session["token"]
+                item["status"] == "LOCKED"
+                and item["locked_by_operator_id"] == session["operator_id"]
                 for item in self.withdrawals.values()
             ):
-                raise MockError(409, "This session already owns a withdrawal lock.")
+                raise MockError(409, "This operator already owns a withdrawal lock.")
             item = self.withdrawals.get(withdraw_id)
 
             if item is None:
@@ -341,7 +357,8 @@ class MockState:
             expiry = self.now() + ttl
             item.update(
                 status="LOCKED",
-                locked_by=session["token"],
+                locked_by_operator_id=session["operator_id"],
+                locked_by_session_id=session["session_id"],
                 lock_expires_at=utc_iso(expiry),
                 lock_expires_at_timestamp=expiry,
             )
@@ -352,8 +369,15 @@ class MockState:
         item = self.withdrawals.get(withdraw_id)
         if item is None:
             raise MockError(404, "Withdrawal was not found.")
-        if item["status"] != "LOCKED" or item["locked_by"] != session["token"]:
+        if (
+            item["status"] != "LOCKED"
+            or item["locked_by_operator_id"] != session["operator_id"]
+        ):
             raise MockError(409, "Withdrawal lock is not owned by this session.")
+        # A fresh authenticated session for the same stable operator may adopt
+        # the existing lock. This mirrors the production reconnect contract
+        # without allowing another operator to act as its owner.
+        item["locked_by_session_id"] = session["session_id"]
         return item
 
     def renew(self, session, withdraw_id):
@@ -374,7 +398,8 @@ class MockState:
             item = self._owned(session, withdraw_id)
             item.update(
                 status="PENDING",
-                locked_by=None,
+                locked_by_operator_id=None,
+                locked_by_session_id=None,
                 lock_expires_at=None,
                 lock_expires_at_timestamp=None,
             )
@@ -393,7 +418,8 @@ class MockState:
             item.update(
                 status="CANCELLED",
                 cancel_reason=reason,
-                locked_by=None,
+                locked_by_operator_id=None,
+                locked_by_session_id=None,
                 lock_expires_at=None,
                 lock_expires_at_timestamp=None,
             )
@@ -406,7 +432,8 @@ class MockState:
                 status="PROOF_PENDING",
                 confirmed_by_operator=session["operator_id"],
                 completed_at=utc_iso(self.now()),
-                locked_by=None,
+                locked_by_operator_id=None,
+                locked_by_session_id=None,
                 lock_expires_at=None,
                 lock_expires_at_timestamp=None,
                 proof_files=[str(path) for path in proof_paths],
@@ -449,11 +476,15 @@ class MockState:
         affected = set()
         with self.lock:
             for item in self.withdrawals.values():
-                if item["status"] == "LOCKED" and item["locked_by"] == token:
+                if (
+                    item["status"] == "LOCKED"
+                    and item["locked_by_session_id"] == session["session_id"]
+                ):
                     affected.add(item["payment_record"])
                     item.update(
                         status="PENDING",
-                        locked_by=None,
+                        locked_by_operator_id=None,
+                        locked_by_session_id=None,
                         lock_expires_at=None,
                         lock_expires_at_timestamp=None,
                     )
@@ -528,7 +559,8 @@ class MockState:
                 "mobile_no": str(data.get("mobile_no", "0199999999")),
                 "created_at": str(data.get("created_at", stamp)),
                 "status": "PENDING",
-                "locked_by": None,
+                "locked_by_operator_id": None,
+                "locked_by_session_id": None,
                 "lock_expires_at": None,
                 "lock_expires_at_timestamp": None,
                 "cancel_reason": None,
@@ -546,6 +578,61 @@ class MockState:
             self.time_offset += seconds
             return self._expire_locks_locked()
 
+    def expire_lock(self, withdraw_id=None):
+        """Expire one exact lock, or all locks when no ID is supplied."""
+        with self.lock:
+            if withdraw_id is not None and (
+                type(withdraw_id) is not int or withdraw_id <= 0
+            ):
+                raise MockError(422, "withdraw_id must be a positive integer.")
+            if withdraw_id is not None and withdraw_id not in self.withdrawals:
+                raise MockError(404, "Withdrawal was not found.")
+            for item in self.withdrawals.values():
+                if item["status"] == "LOCKED" and (
+                    withdraw_id is None or item["id"] == withdraw_id
+                ):
+                    item["lock_expires_at_timestamp"] = self.now() - 1
+            return self._expire_locks_locked()
+
+    def approve(self, withdraw_id, operator_id):
+        """Deterministically simulate exact external approval for recovery tests."""
+        with self.lock:
+            if type(operator_id) is not int or operator_id <= 0:
+                raise MockError(422, "operator_id must be a positive integer.")
+            if not any(user["id"] == operator_id for user in self.users.values()):
+                raise MockError(404, "Operator was not found.")
+            item = self.withdrawals.get(withdraw_id)
+            if item is None:
+                raise MockError(404, "Withdrawal was not found.")
+            if item["status"] in {"CANCELLED", "PROOF_PENDING"}:
+                raise MockError(
+                    409, "Withdrawal cannot be approved in its current state."
+                )
+            if item["payment_record"] not in next(
+                user["payment_records"]
+                for user in self.users.values()
+                if user["id"] == operator_id
+            ):
+                raise MockError(
+                    409, "Payment record is not accessible to this operator."
+                )
+            if (
+                item["status"] == "LOCKED"
+                and item["locked_by_operator_id"] != operator_id
+            ):
+                raise MockError(409, "Withdrawal is locked by another operator.")
+            item.update(
+                status="PROOF_PENDING",
+                confirmed_by_operator=operator_id,
+                completed_at=utc_iso(self.now()),
+                locked_by_operator_id=None,
+                locked_by_session_id=None,
+                lock_expires_at=None,
+                lock_expires_at_timestamp=None,
+                proof_rejected=False,
+            )
+            return self._public(item), item["payment_record"]
+
     def snapshot(self):
         with self.lock:
             pending = [
@@ -554,7 +641,11 @@ class MockState:
                 if x["status"] == "PENDING"
             ]
             locked = [
-                self._public(x)
+                {
+                    **self._public(x),
+                    "lock_owner_operator_id": x.get("locked_by_operator_id"),
+                    "lock_owner_session_id": x.get("locked_by_session_id"),
+                }
                 for x in self.withdrawals.values()
                 if x["status"] == "LOCKED"
             ]

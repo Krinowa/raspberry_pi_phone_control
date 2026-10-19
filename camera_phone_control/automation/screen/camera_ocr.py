@@ -101,7 +101,7 @@ def _build_paddle_engine(
             text_recognition_model_dir=str(recognition),
         )
         if textline_orientation:
-            options["text_line_orientation_model_dir"] = str(orientation)
+            options["textline_orientation_model_dir"] = str(orientation)
     return PaddleOCR(**options)
 
 
