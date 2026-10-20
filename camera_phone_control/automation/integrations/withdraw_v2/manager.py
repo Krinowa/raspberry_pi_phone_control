@@ -1403,6 +1403,62 @@ class WithdrawManager:
 
         return self.status(device_id)
 
+    def job_withdrawal_state(self, job):
+        """Return UI-safe business state for the exact withdrawal job chain."""
+
+        if job.action != "withdraw_v2":
+            return {}
+
+        related_job_ids = {job.job_id}
+        jobs = self.scheduler.list_jobs()
+        changed = True
+        while changed:
+            changed = False
+            for candidate in jobs:
+                if (
+                    candidate.action == "withdraw_v2"
+                    and candidate.device_id == job.device_id
+                    and (
+                        candidate.job_id in related_job_ids
+                        or candidate.retry_of_job_id in related_job_ids
+                    )
+                ):
+                    before = len(related_job_ids)
+                    related_job_ids.add(candidate.job_id)
+                    if candidate.retry_of_job_id:
+                        related_job_ids.add(candidate.retry_of_job_id)
+                    changed = changed or len(related_job_ids) != before
+
+        metadata = (
+            job.protected_metadata if isinstance(job.protected_metadata, dict) else {}
+        )
+        withdraw_id = metadata.get("withdraw_id")
+        if type(withdraw_id) is not int or withdraw_id <= 0:
+            try:
+                withdraw_id = int(job.payload.get("withdraw_id"))
+            except (TypeError, ValueError):
+                withdraw_id = None
+        operator_id = metadata.get("operator_id")
+        if type(operator_id) is not int:
+            operator_id = None
+
+        record = self.journal.find_job_record(
+            job.device_id,
+            job_ids=related_job_ids,
+            withdraw_id=withdraw_id,
+            tx_id=job.external_ref,
+            operator_id=operator_id,
+            account_id=job.account_id,
+            workflow_id=job.workflow,
+        )
+        phase = record.get("phase") if record else None
+        terminal = phase in TERMINAL
+        return {
+            "withdrawal_phase": phase,
+            "withdrawal_terminal": terminal,
+            "withdrawal_retryable": None if record is None else not terminal,
+        }
+
     def retry_job(
         self,
         job_id,
@@ -1427,6 +1483,12 @@ class WithdrawManager:
             }:
 
                 raise RecordConflict("Only failed or interrupted jobs can be retried.")
+
+            withdrawal_state = self.job_withdrawal_state(original)
+            if withdrawal_state.get("withdrawal_terminal"):
+                raise RecordConflict(
+                    "This withdrawal is already terminal and cannot be retried."
+                )
 
             if mode == "restart" and original.recovery_status != "READY":
 

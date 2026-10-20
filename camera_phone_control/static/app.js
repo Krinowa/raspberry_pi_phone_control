@@ -47,7 +47,7 @@ let devicePollingStopped = false;
 const deviceDeletesInFlight = new Set();
 const devicePreviewTimers = new Map();
 const devicePreviewLastFrames = new Map();
-let devicePreviewGeneration = 0;
+const devicePreviewGenerations = new Map();
 let cameraSettingsDeviceId = null;
 let deviceRefreshLastSuccessAt = null;
 let deviceRefreshError = "";
@@ -448,6 +448,10 @@ function latestRelevantJobForDevice(deviceId, withdrawStatus = null) {
 function availableJobActions(job) {
   if (!job) return [];
 
+  const withdrawalRetryBlocked =
+    job.action === "withdraw_v2" &&
+    (job.withdrawal_terminal === true || job.withdrawal_retryable === false);
+
   if (["QUEUED", "WAITING_FOR_DEVICE", "RUNNING"].includes(job.status))
     return job.action === "withdraw_v2" ? [] : ["cancel"];
 
@@ -457,13 +461,18 @@ function availableJobActions(job) {
     return [
       "manual_assistance",
       ...(job.action === "withdraw_v2" &&
+      !withdrawalRetryBlocked &&
       Number.isInteger(job.failed_step_index)
         ? ["retry_failed_step"]
         : []),
-      ...(job.action === "withdraw_v2" ? ["restart"] : []),
+      ...(job.action === "withdraw_v2" && !withdrawalRetryBlocked
+        ? ["restart"]
+        : []),
     ];
 
   if (job.recovery_status !== "READY") return [];
+
+  if (withdrawalRetryBlocked) return [];
 
   return [
     ...(Number.isInteger(job.failed_step_index) ? ["retry_failed_step"] : []),
@@ -846,9 +855,19 @@ function applyCameraPreviewGeometry(preview, width, height) {
 }
 
 function stopDevicePreviews() {
-  devicePreviewGeneration++;
-  for (const timer of devicePreviewTimers.values()) clearTimeout(timer);
+  for (const deviceId of devicePreviewTimers.keys())
+    stopDevicePreview(deviceId);
   devicePreviewTimers.clear();
+}
+
+function stopDevicePreview(deviceId) {
+  const timer = devicePreviewTimers.get(deviceId);
+  if (timer) clearTimeout(timer);
+  devicePreviewTimers.delete(deviceId);
+  devicePreviewGenerations.set(
+    deviceId,
+    (devicePreviewGenerations.get(deviceId) || 0) + 1,
+  );
 }
 
 function startDevicePreview(deviceId, image, placeholder) {
@@ -860,7 +879,7 @@ function startDevicePreview(deviceId, image, placeholder) {
   )
     return;
 
-  const generation = devicePreviewGeneration;
+  const generation = devicePreviewGenerations.get(deviceId) || 0;
   const cachedFrame = devicePreviewLastFrames.get(deviceId);
 
   if (cachedFrame) {
@@ -870,7 +889,11 @@ function startDevicePreview(deviceId, image, placeholder) {
   }
 
   const schedule = (delay) => {
-    if (generation !== devicePreviewGeneration || devicePollingStopped) return;
+    if (
+      generation !== (devicePreviewGenerations.get(deviceId) || 0) ||
+      devicePollingStopped
+    )
+      return;
     const timer = setTimeout(() => {
       if (document.hidden) return schedule(PREVIEW_BACKGROUND_MS);
       void loadNextFrame();
@@ -879,7 +902,11 @@ function startDevicePreview(deviceId, image, placeholder) {
   };
 
   const loadNextFrame = async () => {
-    if (generation !== devicePreviewGeneration || devicePollingStopped) return;
+    if (
+      generation !== (devicePreviewGenerations.get(deviceId) || 0) ||
+      devicePollingStopped
+    )
+      return;
 
     let nextUrl = null;
 
@@ -911,7 +938,10 @@ function startDevicePreview(deviceId, image, placeholder) {
       preloader.src = nextUrl;
       await preloader.decode();
 
-      if (generation !== devicePreviewGeneration || devicePollingStopped) {
+      if (
+        generation !== (devicePreviewGenerations.get(deviceId) || 0) ||
+        devicePollingStopped
+      ) {
         URL.revokeObjectURL(nextUrl);
         return;
       }
@@ -1174,15 +1204,131 @@ function friendlyWorkflowStepType(type) {
   return labels[type] || null;
 }
 
+function deviceJobRenderSnapshot(job) {
+  if (!job) return null;
+  return {
+    job_id: job.job_id,
+    device_id: job.device_id,
+    external_ref: job.external_ref,
+    action: job.action,
+    status: job.status,
+    error: job.error,
+    result: job.result,
+    recovery_status: job.recovery_status,
+    recovery_error: job.recovery_error,
+    failed_step_index: job.failed_step_index,
+    failed_step_type: job.failed_step_type,
+    retry_of_job_id: job.retry_of_job_id,
+    withdrawal_terminal: job.withdrawal_terminal,
+    withdrawal_retryable: job.withdrawal_retryable,
+  };
+}
+
+function deviceCardRenderSignature(device, details, withdraw, latestJob) {
+  const status = withdraw?.status || {};
+  return JSON.stringify({
+    device: {
+      id: device.id,
+      name: device.name,
+      connected: device.connected,
+      default: device.default,
+      bluetooth_address: device.bluetooth_address,
+      ready_for_work: device.ready_for_work,
+      workflow_assignment: device.workflow_assignment,
+    },
+    default_device: deviceCatalog?.default_device,
+    selected: device.id === deviceCatalog?.selected_device,
+    stale: deviceStatusStale,
+    returned: device.id === returnedDeviceId,
+    management_blocked: deviceManagementBlocked(),
+    camera: {
+      config: details?.config,
+      ready: details?.status?.ready,
+      poll_failed: details?.status?.poll_failed,
+      width: details?.status?.width,
+      height: details?.status?.height,
+    },
+    withdraw: {
+      assigned: withdraw?.assigned,
+      balance_workflow_id: withdraw?.balance_workflow_id,
+      withdraw_api: withdraw?.withdraw_api,
+      state: status.state,
+      phase: status.phase,
+      error: status.error,
+      session_state: status.session_state,
+      physical_socket_connected: status.physical_socket_connected,
+      payment_ready: status.payment_ready,
+      payment_readiness_error: status.payment_readiness_error,
+      balance_state: status.balance_state,
+      balance_valid: status.balance_valid,
+      last_balance: status.last_balance,
+      balance_observed_at: status.balance_observed_at,
+      balance_error: status.balance_error,
+      balance_workflow_ready: status.balance_workflow_ready,
+      balance_workflow_error: status.balance_workflow_error,
+      cancel_allowed: status.cancel_allowed,
+      withdraw_id: status.withdraw_id,
+      tx_id: status.tx_id,
+      job_id: status.job_id,
+    },
+    job: deviceJobRenderSnapshot(latestJob),
+    workflow_runtime:
+      workflowRuntime?.device_id === device.id
+        ? {
+            status: workflowRuntime.status,
+            message: workflowRuntime.message,
+          }
+        : null,
+    requests: {
+      deleting: deviceDeletesInFlight.has(device.id),
+      cancelling_job: latestJob
+        ? jobCancelsInFlight.has(latestJob.job_id)
+        : false,
+      retrying_job: latestJob
+        ? jobRetriesInFlight.has(latestJob.job_id)
+        : false,
+      reconnecting: withdrawReconnectsInFlight.has(device.id),
+      refreshing_balance: balanceRefreshesInFlight.has(device.id),
+      changing_readiness: workReadinessRequestsInFlight.has(device.id),
+      cancelling_withdrawal: withdrawCancelsInFlight.has(device.id),
+    },
+  });
+}
+
+function devicePreviewRenderSignature(device, details) {
+  const config = details?.config || {};
+  return JSON.stringify({
+    device_id: device.id,
+    name: device.name,
+    enabled: config.enabled,
+    camera_source: config.camera_source,
+    camera_id: config.camera_id,
+    rotation: config.rotation,
+    width: details?.status?.width,
+    height: details?.status?.height,
+  });
+}
+
 function renderDevices() {
-  stopDevicePreviews();
   const devices = Array.isArray(deviceCatalog?.devices)
     ? deviceCatalog.devices
     : [];
 
+  const deviceList = $("device-list");
+  const existingCards = new Map(
+    Array.from(deviceList.children || []).map((card) => [
+      card.dataset?.deviceId,
+      card,
+    ]),
+  );
+
   const currentDeviceIds = new Set(devices.map((device) => device.id));
+  for (const deviceId of existingCards.keys()) {
+    if (!currentDeviceIds.has(deviceId)) stopDevicePreview(deviceId);
+  }
   for (const [deviceId, frameUrl] of devicePreviewLastFrames) {
     if (currentDeviceIds.has(deviceId)) continue;
+    stopDevicePreview(deviceId);
     URL.revokeObjectURL(frameUrl);
     devicePreviewLastFrames.delete(deviceId);
   }
@@ -1220,6 +1366,16 @@ function renderDevices() {
       workflowRuntime?.status === "failed" &&
       workflowRuntime?.device_id === device.id;
 
+    const cardSignature = deviceCardRenderSignature(
+      device,
+      details,
+      withdraw,
+      latestJob,
+    );
+    const existingCard = existingCards.get(device.id);
+    if (existingCard?.dataset?.renderSignature === cardSignature)
+      return existingCard;
+
     const operationalState = recoveryJob
       ? recoveryJob.recovery_status === "RECOVERING"
         ? "recovering"
@@ -1242,6 +1398,7 @@ function renderDevices() {
       (device.id === selected ? " selected" : "");
     card.dataset.state = operationalState;
     card.dataset.deviceId = device.id;
+    card.dataset.renderSignature = cardSignature;
     if (device.id === returnedDeviceId)
       card.className += " device-card--returned";
 
@@ -1305,39 +1462,61 @@ function renderDevices() {
     mac.className = "device-mac admin-only";
     mac.textContent = device.bluetooth_address || "Bluetooth MAC not paired";
 
-    const preview = document.createElement("button");
-    preview.type = "button";
-    preview.className = "device-preview";
-    applyCameraPreviewGeometry(
-      preview,
-      details.status?.width,
-      details.status?.height,
+    const previewSignature = devicePreviewRenderSignature(device, details);
+    const existingPreview = Array.from(existingCard?.children || []).find(
+      (child) => child.className === "device-preview",
     );
+    let preview;
+    if (existingPreview?.dataset?.renderSignature === previewSignature) {
+      preview = existingPreview;
+      preview.disabled = device.id === selected || deviceManagementBlocked();
+      preview.setAttribute?.(
+        "aria-label",
+        `Select ${device.name || device.id} for control`,
+      );
+      applyCameraPreviewGeometry(
+        preview,
+        details.status?.width,
+        details.status?.height,
+      );
+    } else {
+      stopDevicePreview(device.id);
+      preview = document.createElement("button");
+      preview.type = "button";
+      preview.className = "device-preview";
+      preview.dataset.renderSignature = previewSignature;
+      applyCameraPreviewGeometry(
+        preview,
+        details.status?.width,
+        details.status?.height,
+      );
 
-    preview.disabled = device.id === selected || deviceManagementBlocked();
-    preview.setAttribute?.(
-      "aria-label",
-      `Select ${device.name || device.id} for control`,
-    );
+      preview.disabled = device.id === selected || deviceManagementBlocked();
+      preview.setAttribute?.(
+        "aria-label",
+        `Select ${device.name || device.id} for control`,
+      );
 
-    const previewImage = document.createElement("img");
-    previewImage.alt = `${device.name || device.id} live camera preview`;
-    previewImage.hidden = true;
+      const previewImage = document.createElement("img");
+      previewImage.alt = `${device.name || device.id} live camera preview`;
+      previewImage.hidden = true;
 
-    const previewPlaceholder = document.createElement("span");
-    previewPlaceholder.textContent =
-      status.label === "Available"
-        ? "Loading camera…"
-        : `Camera ${status.label.toLowerCase()}`;
-    preview.append(previewImage, previewPlaceholder);
-    preview.addEventListener("click", () => selectDashboardDevice(device.id));
+      const previewPlaceholder = document.createElement("span");
+      previewPlaceholder.textContent =
+        status.label === "Available"
+          ? "Loading camera…"
+          : `Camera ${status.label.toLowerCase()}`;
+      preview.append(previewImage, previewPlaceholder);
+      preview.addEventListener("click", () => selectDashboardDevice(device.id));
 
-    if (
-      camera.enabled &&
-      ((camera.camera_source !== null && camera.camera_source !== undefined) ||
-        camera.camera_id)
-    )
-      startDevicePreview(device.id, previewImage, previewPlaceholder);
+      if (
+        camera.enabled &&
+        ((camera.camera_source !== null &&
+          camera.camera_source !== undefined) ||
+          camera.camera_id)
+      )
+        startDevicePreview(device.id, previewImage, previewPlaceholder);
+    }
 
     const summary = document.createElement("p");
     summary.className = "camera-summary admin-only";
@@ -1717,7 +1896,12 @@ function renderDevices() {
     return card;
   });
 
-  $("device-list").replaceChildren(...cards);
+  const currentCards = Array.from(deviceList.children || []);
+  if (
+    currentCards.length !== cards.length ||
+    cards.some((card, index) => currentCards[index] !== card)
+  )
+    deviceList.replaceChildren(...cards);
   $("device-enrollment-active").hidden = !enrollment.active;
   $("device-enrollment-form").hidden =
     !addPhonePanelOpen || !!enrollment.active;
@@ -2928,13 +3112,16 @@ function deviceRenderSnapshot(catalog, cameras, withdrawDetails, jobs) {
         deviceId,
         {
           assigned: details?.assigned,
-          credentials_saved: details?.credentials_saved,
-          withdraw_api: details?.withdraw_api,
+          withdraw_api: {
+            operator_id: details?.withdraw_api?.operator_id,
+            username: details?.withdraw_api?.username,
+            payment_records: details?.withdraw_api?.payment_records,
+          },
           status: {
             state: details?.status?.state,
             phase: details?.status?.phase,
+            error: details?.status?.error,
             session_state: details?.status?.session_state,
-            reconciliation_complete: details?.status?.reconciliation_complete,
             physical_socket_connected:
               details?.status?.physical_socket_connected,
 
@@ -2951,13 +3138,17 @@ function deviceRenderSnapshot(catalog, cameras, withdrawDetails, jobs) {
 
             cancel_allowed: details?.status?.cancel_allowed,
             withdraw_id: details?.status?.withdraw_id,
+            tx_id: details?.status?.tx_id,
             job_id: details?.status?.job_id,
           },
         },
       ]),
     ),
 
-    jobs: jobs,
+    // Device cards only consume operational/recovery fields. Excluding payloads,
+    // timestamps, screenshots and queue-only metadata prevents unrelated job
+    // polling changes from rebuilding every phone card.
+    jobs: (jobs || []).map(deviceJobRenderSnapshot),
 
     status_unavailable: false,
   };
@@ -3037,13 +3228,12 @@ async function loadDevices() {
       };
     }
     if (!addPhonePanelOpen) setDeviceError();
-    if (
-      nextSignature !== deviceRenderSignature ||
-      wasStale ||
-      previousPiState !== JSON.stringify(state?.pi || null)
-    ) {
+    const cardsChanged = nextSignature !== deviceRenderSignature || wasStale;
+    if (cardsChanged) {
       deviceRenderSignature = nextSignature;
       renderDevices();
+    }
+    if (cardsChanged || previousPiState !== JSON.stringify(state?.pi || null)) {
       render();
       window.phoneRecorder?.deviceStateChanged?.();
     }
