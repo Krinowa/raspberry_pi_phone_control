@@ -457,6 +457,18 @@ class WithdrawManager:
 
             status = worker.status()
 
+            authentication_available = getattr(
+                worker,
+                "authentication_available",
+                None,
+            )
+
+            status["authentication_available"] = bool(
+                authentication_available()
+                if callable(authentication_available)
+                else False
+            )
+
             if not balance_ready:
 
                 invalidate = getattr(
@@ -498,6 +510,7 @@ class WithdrawManager:
             "state": "NEEDS_ATTENTION" if blocked else "DISABLED",
             "session_state": "NEEDS_ATTENTION" if blocked else "DISABLED",
             "reconciliation_complete": False,
+            "authentication_available": False,
             "error": record.get("error") if blocked else None,
             "physical_socket_connected": self.realtime_transport.physical_connected,
             "phase": record.get("phase"),
@@ -1045,15 +1058,27 @@ class WithdrawManager:
         credentials,
     ):
 
-        if not isinstance(credentials, dict) or set(credentials) != {
+        required = {
             "username",
             "password",
             "g2f_code",
-        }:
+        }
+
+        if (
+            not isinstance(credentials, dict)
+            or not required.issubset(credentials)
+            or set(credentials) - (required | {"reauthenticate"})
+        ):
 
             raise ValueError(
                 "Username, password and current Google 2FA code are required."
             )
+
+        reauthenticate = credentials.get("reauthenticate", False)
+
+        if type(reauthenticate) is not bool:
+
+            raise ValueError("reauthenticate must be boolean.")
 
         username = credentials.get("username")
 
@@ -1078,6 +1103,16 @@ class WithdrawManager:
 
         api = current["withdraw_api"]
 
+        assigned_operator_id = api.get("operator_id")
+
+        if reauthenticate and (
+            type(assigned_operator_id) is not int or not api.get("username")
+        ):
+
+            raise RecordConflict(
+                "This phone has no assigned Withdraw account to authenticate again."
+            )
+
         base_url = os.environ.get("WITHDRAW_API_BASE_URL") or api.get("base_url")
 
         if not base_url:
@@ -1096,10 +1131,16 @@ class WithdrawManager:
                     username.strip(),
                     password,
                     g2f_code,
-                    None,
+                    assigned_operator_id if reauthenticate else None,
                 )
 
             except (APIError, ValueError) as error:
+
+                if reauthenticate and isinstance(error, APIError) and error.code == 403:
+
+                    raise RecordConflict(
+                        "Authenticated Withdraw account does not match the account assigned to this phone."
+                    ) from None
 
                 raise self._login_error(error) from None
 
@@ -1167,6 +1208,12 @@ class WithdrawManager:
                 client.origin,
                 operator_id,
             )
+
+            if reauthenticate and not same_identity:
+
+                raise RecordConflict(
+                    "Authenticated Withdraw account does not match the account assigned to this phone."
+                )
 
             if not same_identity:
 
@@ -1348,14 +1395,14 @@ class WithdrawManager:
             if worker is None or worker.thread is None or not worker.thread.is_alive():
 
                 raise RecordConflict(
-                    "Withdraw authentication is not active. Enter your password and a fresh "
-                    "6-digit Google 2FA code to reconnect."
+                    "Withdraw authentication is not active. Use Login Again and enter "
+                    "your password and a fresh 6-digit Google 2FA code."
                 )
 
             if not worker.authentication_available():
                 raise RecordConflict(
-                    "Withdraw authentication expired. Enter your password and a fresh "
-                    "6-digit Google 2FA code to reconnect."
+                    "Withdraw authentication expired. Use Login Again and enter your "
+                    "password and a fresh 6-digit Google 2FA code."
                 )
 
             worker.request_reconnect(force_reauthentication=False)

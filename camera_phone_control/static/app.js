@@ -67,6 +67,7 @@ let workflowSettingsData = null;
 let workflowSettingsMode = "payment";
 let withdrawSettingsDeviceId = null;
 let withdrawSettingsAssigned = false;
+let withdrawSettingsReauthentication = false;
 let withdrawCancelDeviceId = null;
 let withdrawCancelPendingReason = null;
 const withdrawCancelsInFlight = new Set();
@@ -1085,7 +1086,9 @@ function canManuallyCancelWithdrawal(details) {
 
 function withdrawRuntimeView(details) {
   const status = details?.status || {};
+  const authenticationAvailable = status.authentication_available === true;
   const connected =
+    authenticationAvailable &&
     status.session_state === "READY" &&
     status.physical_socket_connected === true;
 
@@ -1094,23 +1097,38 @@ function withdrawRuntimeView(details) {
       session: "Authentication required",
       realtime: "Disconnected",
       ready: false,
+      action: "login",
+    };
+  if (!authenticationAvailable)
+    return {
+      session: "Authentication required",
+      realtime: "Disconnected",
+      ready: false,
+      action: "login",
     };
   if (status.state === "CONFIGURATION_ERROR")
     return {
       session: "Configuration required",
       realtime: "Disconnected",
       ready: false,
+      action: "reconnect",
     };
   // NEEDS_ATTENTION describes local withdrawal/payment recovery, not the
   // external authentication or realtime transport. During a failed workflow
   // the worker intentionally keeps this READY session alive to renew its lock.
   if (connected)
-    return { session: "Connected", realtime: "Connected", ready: true };
+    return {
+      session: "Connected",
+      realtime: "Connected",
+      ready: true,
+      action: null,
+    };
   if (status.state === "NEEDS_ATTENTION")
     return {
-      session: "Needs attention",
+      session: "Authenticated",
       realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
       ready: false,
+      action: "reconnect",
     };
   if (["CONNECTING", "WAITING_FOR_CONNECTION"].includes(status.state))
     return {
@@ -1118,11 +1136,13 @@ function withdrawRuntimeView(details) {
         status.state === "CONNECTING" ? "Authenticating" : "Reconnecting",
       realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
       ready: false,
+      action: "reconnect",
     };
   return {
-    session: "Disconnected",
+    session: "Authenticated",
     realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
     ready: false,
+    action: "reconnect",
   };
 }
 
@@ -1719,7 +1739,7 @@ function renderDevices() {
         }
       }
 
-      if (!runtime.ready) {
+      if (runtime.action === "reconnect") {
         const reconnect = document.createElement("button");
         reconnect.type = "button";
         reconnect.textContent = withdrawReconnectsInFlight.has(device.id)
@@ -1730,6 +1750,15 @@ function renderDevices() {
           withdrawReconnectsInFlight.has(device.id);
         reconnect.addEventListener("click", () => reconnectWithdraw(device.id));
         withdrawSummary.append(reconnect);
+      } else if (runtime.action === "login") {
+        const loginAgain = document.createElement("button");
+        loginAgain.type = "button";
+        loginAgain.textContent = "Login Again";
+        loginAgain.disabled = deviceManagementBlocked();
+        loginAgain.addEventListener("click", () =>
+          openWithdrawSettings(device, withdraw, { reauthenticate: true }),
+        );
+        withdrawSummary.append(loginAgain);
       }
     }
     const withdrawButton = document.createElement("button");
@@ -2718,19 +2747,26 @@ async function confirmWithdrawCancelFinal() {
 function closeWithdrawSettings() {
   withdrawSettingsDeviceId = null;
   withdrawSettingsAssigned = false;
+  withdrawSettingsReauthentication = false;
   $("withdraw-settings-password").value = "";
   $("withdraw-settings-totp").value = "";
   $("withdraw-settings-dialog").hidden = true;
   setWithdrawSettingsError();
 }
 
-function openWithdrawSettings(device, details = {}) {
+function openWithdrawSettings(
+  device,
+  details = {},
+  { reauthenticate = false } = {},
+) {
   const api = details.withdraw_api || {};
 
   withdrawSettingsDeviceId = device.id;
   withdrawSettingsAssigned =
     details.assigned === true ||
     (Number.isInteger(api.operator_id) && !!api.username);
+  withdrawSettingsReauthentication =
+    reauthenticate === true && withdrawSettingsAssigned;
 
   $("withdraw-settings-title").textContent =
     `Withdraw Account · ${device.name || device.id}`;
@@ -2746,6 +2782,7 @@ function openWithdrawSettings(device, details = {}) {
     : "Login with the external operator account assigned to this phone.";
 
   $("withdraw-settings-username").value = api.username || "";
+  $("withdraw-settings-username").readOnly = withdrawSettingsReauthentication;
 
   $("withdraw-settings-password").value = "";
   $("withdraw-settings-password").placeholder = details.credentials_saved
@@ -2755,9 +2792,11 @@ function openWithdrawSettings(device, details = {}) {
   $("withdraw-settings-totp").value = "";
   $("withdraw-settings-totp").placeholder = "123456";
 
-  $("withdraw-settings-submit").textContent = withdrawSettingsAssigned
-    ? "Reauthenticate"
-    : "Login & Assign";
+  $("withdraw-settings-submit").textContent = withdrawSettingsReauthentication
+    ? "Login Again"
+    : withdrawSettingsAssigned
+      ? "Reauthenticate"
+      : "Login & Assign";
 
   $("withdraw-settings-dialog").hidden = false;
 
@@ -2784,11 +2823,17 @@ async function saveWithdrawSettings(event) {
   setWithdrawSettingsError();
 
   try {
-    const result = await deviceService.loginWithdraw(withdrawSettingsDeviceId, {
+    const login = {
       username: $("withdraw-settings-username").value.trim(),
       password: $("withdraw-settings-password").value,
       g2f_code: g2fCode,
-    });
+    };
+    if (withdrawSettingsReauthentication) login.reauthenticate = true;
+
+    const result = await deviceService.loginWithdraw(
+      withdrawSettingsDeviceId,
+      login,
+    );
 
     const deviceId = withdrawSettingsDeviceId;
 

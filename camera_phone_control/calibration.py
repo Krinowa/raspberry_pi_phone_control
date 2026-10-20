@@ -123,6 +123,11 @@ class CalibrationStorage:
     def __init__(self, path=None):
         self.path = Path(path or DEFAULT_CALIBRATION_PATH)
         self.lock = threading.RLock()
+        # One validated calibration per logical-device path.  Preview requests
+        # are intentionally frequent, so compatibility is checked from this
+        # in-memory context rather than reopening the same JSON for every frame.
+        # save() and clear() update this cache while holding the same lock.
+        self._cache = {}
 
     @staticmethod
     def _camera_details(camera, camera_info):
@@ -149,10 +154,30 @@ class CalibrationStorage:
         validate_device_id(device_id)
         return self.path.with_name(f"{self.path.stem}.{device_id}{self.path.suffix}")
 
+    def _cache_key(self, path, camera, camera_info, device):
+        """Identify one exact logical calibration compatibility context."""
+        return (
+            str(path),
+            json.dumps(
+                {
+                    "camera": self._camera_details(camera, camera_info),
+                    "device": self._device_details(device),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
+
     def load(self, camera, camera_info, device):
         """Return a compatible Calibration, or None for missing/unsafe data."""
         path = self.path_for(device)
         with self.lock:
+            cache_key = self._cache_key(path, camera, camera_info, device)
+            cached = self._cache.get(path)
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
+
             if not path.exists():
                 return None
             if path.is_symlink():
@@ -206,6 +231,7 @@ class CalibrationStorage:
                 return None
 
             LOG.info("Loaded saved camera calibration.")
+            self._cache[path] = (cache_key, calibration)
             return calibration
 
     def save(self, calibration, camera, camera_info, device):
@@ -218,6 +244,9 @@ class CalibrationStorage:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         with self.lock:
+            # If persistence fails, a prior in-memory value must not mask that
+            # failure on a later load.
+            self._cache.pop(path, None)
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.is_symlink():
                 raise OSError("Calibration path cannot be a symlink.")
@@ -236,11 +265,16 @@ class CalibrationStorage:
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
+            self._cache[path] = (
+                self._cache_key(path, camera, camera_info, device),
+                calibration,
+            )
         LOG.info("Saved camera calibration.")
 
     def clear(self, device=None):
         path = self.path_for(device)
         with self.lock:
+            self._cache.pop(path, None)
             try:
                 if path.is_symlink():
                     raise OSError("Calibration path cannot be a symlink.")
