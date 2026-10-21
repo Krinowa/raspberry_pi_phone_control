@@ -1,6 +1,6 @@
 # Windows client package
 
-The supported release target is **Windows 11 x64 with CPython 3.11 x64 on the
+The supported release target is **Windows 11 x64 with CPython 3.13.13 x64 on the
 build machine**. PyInstaller bundles are platform-specific: build and test the
 Windows application on Windows, not macOS and not through cross-compilation.
 
@@ -39,7 +39,7 @@ OCR and frozen smoke tests; do not copy a macOS environment into it.
 
 ## Clean build
 
-Build on a clean 64-bit Windows machine with Python 3.11 available to the
+Build on a clean 64-bit Windows machine with Python 3.13.13 x64 available to the
 developer (Python is not required on client machines):
 
 ```bat
@@ -53,7 +53,7 @@ The command creates the PyInstaller `onedir` application at:
 dist\PhoneController\PhoneController.exe
 ```
 
-The build command creates a Python 3.11 virtual environment, installs the pinned
+The build command creates a Python 3.13.13 virtual environment, installs the pinned
 build inputs, validates curated workflow seeds, downloads all three OCR models
 into the dedicated build cache, validates their model/configuration files, and
 then creates a PyInstaller `onedir` application. It embeds PaddleOCR,

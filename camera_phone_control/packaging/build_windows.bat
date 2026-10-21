@@ -2,15 +2,18 @@
 setlocal
 cd /d "%~dp0\.."
 
-if not exist ".venv-packaging\Scripts\python.exe" (
-  py -3.11 -m venv .venv-packaging
+py -3.13 -c "import struct,sys; assert sys.version_info[:3] == (3, 13, 13) and struct.calcsize('P') == 8, 'CPython 3.13.13 x64 is required'"
+if errorlevel 1 exit /b 1
+
+if not exist ".venv-packaging-3.13.13\Scripts\python.exe" (
+  py -3.13 -m venv .venv-packaging-3.13.13
   if errorlevel 1 exit /b 1
 )
 
-call ".venv-packaging\Scripts\activate.bat"
+call ".venv-packaging-3.13.13\Scripts\activate.bat"
 if errorlevel 1 exit /b 1
 
-python -c "import struct,sys; assert sys.version_info[:2] == (3, 11) and struct.calcsize('P') == 8, 'CPython 3.11 x64 is required'"
+python -c "import struct,sys; assert sys.version_info[:3] == (3, 13, 13) and struct.calcsize('P') == 8, 'CPython 3.13.13 x64 is required'"
 if errorlevel 1 exit /b 1
 
 python -m pip install --upgrade "pip==25.3" "wheel==0.45.1"
