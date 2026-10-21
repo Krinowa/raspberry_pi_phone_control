@@ -1,13 +1,23 @@
-#define MyAppName "Phone Controller"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "Phone Controller"
+#ifndef MyAppName
+  #define MyAppName "Phone Controller"
+#endif
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
+#ifndef MyAppPublisher
+  #define MyAppPublisher "Phone Controller"
+#endif
 #define MyAppExeName "PhoneController.exe"
+#ifndef MyAppIcon
+  #define MyAppIcon "assets\PhoneController.ico"
+#endif
 
 [Setup]
 AppId={{79250189-8252-4772-BDA7-A82411E181F2}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+VersionInfoVersion={#MyAppVersion}
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -22,12 +32,16 @@ ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=no
 RestartApplications=no
 UninstallDisplayIcon={app}\{#MyAppExeName}
+#if FileExists(MyAppIcon)
+SetupIconFile={#MyAppIcon}
+#endif
 
 [Files]
 Source: "..\dist\PhoneController\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
+Name: "{autoprograms}\Stop {#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--shutdown"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 
 [Run]

@@ -12,18 +12,35 @@ MODEL_NAMES = (
     "PP-LCNet_x1_0_textline_ori",
 )
 
+REQUIRED_MODEL_FILES = (
+    "config.json",
+    "inference.json",
+    "inference.pdiparams",
+    "inference.yml",
+)
+
 
 def _validate(root):
-    missing = []
+    root = Path(root)
+    incomplete = []
     for name in MODEL_NAMES:
         directory = root / name
-        if not directory.is_dir() or not all(
-            (directory / filename).is_file()
-            for filename in ("inference.json", "inference.pdiparams")
-        ):
-            missing.append(name)
-    if missing:
-        raise RuntimeError("OCR model preparation failed: " + ", ".join(missing))
+        missing = [
+            filename
+            for filename in REQUIRED_MODEL_FILES
+            if not (directory / filename).is_file()
+            or (directory / filename).stat().st_size == 0
+        ]
+        if not directory.is_dir():
+            missing = ["model directory"]
+        if missing:
+            incomplete.append(f"{name} ({', '.join(missing)})")
+    if incomplete:
+        raise RuntimeError(
+            "OCR model preparation failed; required offline model assets are "
+            "missing or empty: " + "; ".join(incomplete)
+        )
+    return tuple(root / name for name in MODEL_NAMES)
 
 
 def main(argv=None):
@@ -31,28 +48,37 @@ def main(argv=None):
     parser.add_argument(
         "--cache-root",
         type=Path,
-        default=Path.home() / ".paddlex",
-        help="PaddleX cache containing the official_models directory.",
+        required=True,
+        help=(
+            "Dedicated build cache to populate. Do not point this at a developer "
+            "profile cache when preparing a release."
+        ),
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate existing assets without importing PaddleOCR or downloading.",
     )
     args = parser.parse_args(argv)
     cache_root = args.cache_root.expanduser().resolve()
     os.environ["PADDLE_PDX_CACHE_HOME"] = os.fspath(cache_root)
 
-    # Enabling text-line orientation for this build-time warmup downloads the
-    # optional model too. Runtime behavior still follows the existing setting.
-    from paddleocr import PaddleOCR
+    if not args.validate_only:
+        # Enabling text-line orientation for this build-time warmup downloads the
+        # optional model too. Runtime behavior still follows the existing setting.
+        from paddleocr import PaddleOCR
 
-    PaddleOCR(
-        lang="en",
-        ocr_version="PP-OCRv5",
-        device="cpu",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=True,
-        text_detection_model_name="PP-OCRvthe c5_mobile_det",
-        text_recognition_model_name="en_PP-OCRv5_mobile_rec",
-        textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
-    )
+        PaddleOCR(
+            lang="en",
+            ocr_version="PP-OCRv5",
+            device="cpu",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=True,
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+            textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
+        )
     model_root = cache_root / "official_models"
     _validate(model_root)
     print(f"OCR models ready: {model_root}")

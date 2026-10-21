@@ -5,7 +5,9 @@ from __future__ import annotations
 import ctypes
 import glob
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -167,12 +169,31 @@ def _windows_pnp_devices():
     return raw if isinstance(raw, list) else [raw]
 
 
+def resolve_ffmpeg_executable(*, environment=None, frozen_root=None, which=None):
+    """Prefer the vetted frozen FFmpeg tool, preserving PATH fallback for source use."""
+    environment = os.environ if environment is None else environment
+    configured_tools = environment.get("PHONE_CONTROLLER_TOOLS_DIR")
+    roots = []
+    if configured_tools:
+        roots.append(Path(configured_tools))
+    bundle_root = frozen_root
+    if bundle_root is None:
+        bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        roots.append(Path(bundle_root) / "tools")
+    for root in roots:
+        candidate = root / "ffmpeg.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return (which or shutil.which)("ffmpeg") or "ffmpeg"
+
+
 def _windows_directshow_names():
     """Use ffmpeg's DirectShow enumeration when available for runtime order."""
     try:
         completed = subprocess.run(
             [
-                "ffmpeg",
+                resolve_ffmpeg_executable(),
                 "-hide_banner",
                 "-list_devices",
                 "true",

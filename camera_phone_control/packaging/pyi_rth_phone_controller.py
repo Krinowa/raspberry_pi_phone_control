@@ -10,4 +10,5 @@ os.environ.setdefault(
 )
 tools = root / "tools"
 if tools.is_dir():
+    os.environ.setdefault("PHONE_CONTROLLER_TOOLS_DIR", os.fspath(tools))
     os.environ["PATH"] = os.fspath(tools) + os.pathsep + os.environ.get("PATH", "")

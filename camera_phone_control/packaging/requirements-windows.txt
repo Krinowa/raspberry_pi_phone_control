@@ -1,0 +1,26 @@
+# Release build input for CPython 3.11 x64 on Windows 11.
+#
+# These are the direct runtime/build versions selected for the first frozen
+# validation build. After the clean Windows acceptance run succeeds, archive
+# `python -m pip freeze --all` and the wheel hashes with that signed release.
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+Flask==3.1.2
+Werkzeug==3.1.3
+certifi==2025.11.12
+numpy==2.1.3
+# PaddleX 3.3.x requires this exact contrib build. Installing opencv-python as
+# well would place two distributions behind the same cv2 import.
+opencv-contrib-python==4.10.0.84
+paddleocr==3.3.2
+paddlepaddle==3.3.0
+paddlex[ocr-core]==3.3.11
+psutil==7.0.0
+PyYAML==6.0.2
+pyotp==2.9.0
+python-dotenv==1.2.1
+requests==2.32.5
+websocket-client==1.8.0
+
+PyInstaller==6.16.0
+pyinstaller-hooks-contrib==2026.2

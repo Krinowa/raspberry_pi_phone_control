@@ -57,6 +57,12 @@ class RuntimePaths:
     def create(cls, data_root=None):
         resources = resource_root()
         data = Path(data_root or default_data_root()).resolve()
+        resolved_resources = resources.resolve()
+        if data == resolved_resources or resolved_resources in data.parents:
+            raise RuntimeError(
+                "Writable application data cannot be stored inside the bundled "
+                "application resources."
+            )
         result = cls(
             resources=resources,
             data=data,

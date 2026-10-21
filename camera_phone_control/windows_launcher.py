@@ -155,6 +155,7 @@ def _prepare_environment(paths):
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", os.fspath(paths.cache / "paddlex"))
     tools = paths.resources / "tools"
     if tools.is_dir():
+        os.environ.setdefault("PHONE_CONTROLLER_TOOLS_DIR", os.fspath(tools))
         os.environ["PATH"] = os.fspath(tools) + os.pathsep + os.environ.get("PATH", "")
 
     from automation.auth import load_or_create_secret_key
