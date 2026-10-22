@@ -2482,3 +2482,29 @@ summary {
   font-size: 11px;
   white-space: nowrap;
 }
+header .header-controls {
+  align-items: flex-end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}
+
+.header-controls label,
+.language-control label {
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.header-controls select,
+.language-control select {
+  min-width: 10.5rem;
+}
+
+.auth-language-control {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-bottom: 1rem;
+}

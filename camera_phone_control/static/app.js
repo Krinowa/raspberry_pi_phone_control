@@ -1,6 +1,34 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+const ui = (key, fallback, params) =>
+  window.PhoneI18n?.t(key, params) ?? fallback;
+const uiText = (element, key, fallback, params) => {
+  if (window.PhoneI18n?.bindText)
+    return window.PhoneI18n.bindText(element, key, params);
+  element.textContent = fallback;
+  return element;
+};
+var uiLiteral = (text) => window.PhoneI18n?.translateEnglish?.(text) ?? text;
+var uiLiteralText = (element, text) => {
+  if (window.PhoneI18n?.bindComputedText)
+    return window.PhoneI18n.bindComputedText(element, () =>
+      window.PhoneI18n.translateEnglish(text),
+    );
+  element.textContent = text;
+  return element;
+};
+var uiError = (message) =>
+  window.PhoneI18n?.translateError?.(message) ?? message;
+var uiErrorText = (element, message) => {
+  if (window.PhoneI18n?.bindComputedText)
+    return window.PhoneI18n.bindComputedText(
+      element,
+      () => window.PhoneI18n.translateError?.(message) ?? message,
+    );
+  element.textContent = message;
+  return element;
+};
 const canvas = $("video");
 const ctx = canvas.getContext("2d");
 const clientId = crypto.randomUUID();
@@ -112,6 +140,10 @@ function setDashboardMode(mode) {
     dashboardMode === "operate"
       ? "Start Manual Control"
       : "Enable Manual Control";
+  window.PhoneI18n?.bindText?.(
+    $("enable"),
+    dashboardMode === "operate" ? "device.startManual" : "device.enableManual",
+  );
   window.phoneRecorder?.dashboardModeChanged?.(dashboardMode);
   return dashboardMode;
 }
@@ -139,7 +171,7 @@ async function loadDiagnostics() {
   const status = $("diagnostics-state");
   const refresh = $("diagnostics-refresh");
   refresh.disabled = true;
-  status.textContent = "Loading recent logs…";
+  uiLiteralText(status, "Loading recent logs…");
 
   try {
     const filter = $("diagnostics-filter").value.trim();
@@ -154,12 +186,27 @@ async function loadDiagnostics() {
     diagnosticsLogs = Array.isArray(result.logs) ? result.logs : [];
     output.textContent = diagnosticsLogs.length
       ? diagnosticsLogs.map(formatDiagnosticLog).join("\n")
-      : "No matching application logs.";
+      : uiLiteral("No matching application logs.");
 
-    status.textContent = `${diagnosticsLogs.length} recent log entr${diagnosticsLogs.length === 1 ? "y" : "ies"}.`;
+    deviceUiText(
+      status,
+      "diagnostics.logCount",
+      `${diagnosticsLogs.length} recent log ${diagnosticsLogs.length === 1 ? "entry" : "entries"}.`,
+      {
+        count: diagnosticsLogs.length,
+        entry: deviceUi(
+          diagnosticsLogs.length === 1
+            ? "diagnostics.entry.one"
+            : "diagnostics.entry.many",
+          diagnosticsLogs.length === 1 ? "entry" : "entries",
+        ),
+      },
+    );
     output.scrollTop = output.scrollHeight;
   } catch (error) {
-    output.textContent = "Logs are available only in developer mode.";
+    output.textContent = uiLiteral(
+      "Logs are available only in developer mode.",
+    );
     status.textContent = error.message;
   } finally {
     refresh.disabled = false;
@@ -169,12 +216,12 @@ async function loadDiagnostics() {
 async function copyDiagnostics() {
   const value = $("diagnostics-output").textContent;
   if (!navigator.clipboard?.writeText) {
-    notice("Copy is not available in this browser.", true);
+    notice(uiLiteral("Copy is not available in this browser."), true);
     return;
   }
 
   await navigator.clipboard.writeText(value);
-  $("diagnostics-state").textContent = "Logs copied.";
+  uiLiteralText($("diagnostics-state"), "Logs copied.");
 }
 
 function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
@@ -223,8 +270,14 @@ function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
 }
 
 function notice(text, error = false) {
-  $("notice").textContent = text;
-  $("notice").classList.toggle("error", error);
+  const node = $("notice");
+  if (window.PhoneI18n?.bindComputedText)
+    window.PhoneI18n.bindComputedText(
+      node,
+      () => window.PhoneI18n.translateError?.(text) ?? text,
+    );
+  else node.textContent = text;
+  node.classList.toggle("error", error);
 }
 
 function renderControllerTag() {
@@ -232,18 +285,18 @@ function renderControllerTag() {
   if (!tag) return;
 
   if (connectionState !== "connected") {
-    tag.textContent = "● Controller Reconnecting";
+    uiText(tag, "controller.reconnecting", "● Controller Reconnecting");
     tag.classList.add("error");
     return;
   }
 
   if (!state) {
-    tag.textContent = "● Checking controller…";
+    uiText(tag, "controller.checking", "● Checking controller…");
     tag.classList.remove("error");
     return;
   }
 
-  tag.textContent = "● Controller Online";
+  uiText(tag, "controller.online", "● Controller Online");
   tag.classList.remove("error");
 }
 
@@ -273,7 +326,13 @@ function scheduleRecovery() {
 function beginReconnect(error) {
   recoveryHadManualControl ||= manual;
   connectionState = "reconnecting";
-  notice("Connection interrupted. Retrying automatically...", true);
+  notice(
+    ui(
+      "controller.interrupted",
+      "Connection interrupted. Retrying automatically...",
+    ),
+    true,
+  );
   render();
   scheduleRecovery();
 }
@@ -304,7 +363,10 @@ async function api(path, data, method = "POST", options = {}) {
       if (response.status === 403 && body.error === "Admin login required.")
         lockAdminState();
       const error = new Error(
-        body.error || `Request failed (${response.status})`,
+        body.error ||
+          ui("error.requestFailed", `Request failed (${response.status})`, {
+            status: response.status,
+          }),
       );
       error.status = response.status;
       error.transient = transientFailure(error, response.status);
@@ -412,6 +474,46 @@ const jobService = {
     api(`/api/jobs/${encodeURIComponent(jobId)}/retry`, { mode }),
 };
 
+// Kept inside the device-service slice used by the focused UI tests.
+const deviceUi = (key, fallback, params) =>
+  window.PhoneI18n?.t(key, params) ?? fallback;
+const deviceUiText = (element, key, fallback, params) => {
+  if (window.PhoneI18n?.bindText)
+    return window.PhoneI18n.bindText(element, key, params);
+  element.textContent = fallback;
+  return element;
+};
+// Re-declared with var so focused device harnesses that evaluate this slice
+// retain the same translation fallback as the complete browser bundle.
+var uiLiteral =
+  uiLiteral || ((text) => window.PhoneI18n?.translateEnglish?.(text) ?? text);
+var uiLiteralText =
+  uiLiteralText ||
+  ((element, text) => {
+    if (window.PhoneI18n?.bindComputedText)
+      return window.PhoneI18n.bindComputedText(element, () =>
+        window.PhoneI18n.translateEnglish(text),
+      );
+    element.textContent = text;
+    return element;
+  });
+var uiError =
+  uiError ||
+  ((message) => window.PhoneI18n?.translateError?.(message) ?? message);
+var uiErrorText =
+  uiErrorText ||
+  ((element, message) => {
+    if (window.PhoneI18n?.bindComputedText)
+      return window.PhoneI18n.bindComputedText(
+        element,
+        () => window.PhoneI18n.translateError?.(message) ?? message,
+      );
+    element.textContent = message;
+    return element;
+  });
+const deviceStatusLabel = (status) =>
+  deviceUi(`status.${status}`, status || "—");
+
 const TERMINAL_WITHDRAW_PHASES = new Set([
   "CONFIRMED",
   "RELEASED",
@@ -515,7 +617,12 @@ async function cancelExternalJob(job) {
         workflowRuntime = null;
     }
   } catch (error) {
-    notice(`Could not cancel job: ${error.message}`, true);
+    notice(
+      deviceUi("error.cancelJob", `Could not cancel job: ${error.message}`, {
+        message: uiError(error.message),
+      }),
+      true,
+    );
   } finally {
     jobCancelsInFlight.delete(job.job_id);
     renderDevices();
@@ -537,7 +644,12 @@ async function retryExternalJob(job, mode) {
         : "Workflow restart queued from step 0.",
     );
   } catch (error) {
-    notice(`Could not create retry: ${error.message}`, true);
+    notice(
+      deviceUi("error.retryJob", `Could not create retry: ${error.message}`, {
+        message: uiError(error.message),
+      }),
+      true,
+    );
   } finally {
     jobRetriesInFlight.delete(job.job_id);
     renderJobs();
@@ -556,12 +668,25 @@ const ocrService = {
 
 function setOperationalHealth(id, label, healthy) {
   const element = $(id);
-  element.textContent = label;
+  const key = {
+    "Checking…": "common.checking",
+    Ready: "common.ready",
+    Healthy: "common.healthy",
+    Problem: "common.problem",
+    Connected: "common.connected",
+    Disconnected: "common.disconnected",
+    "Camera unavailable": "camera.unavailable",
+    "Calibration required": "camera.calibrationRequired",
+    "Raspberry Pi unavailable": "error.piUnavailable",
+    "OCR unavailable": "error.ocrUnavailable",
+  }[label];
+  if (key) deviceUiText(element, key, label);
+  else element.textContent = label;
   element.className = healthy ? "health-ok" : "health-problem";
 }
 
 function setOCRSettingsError(message = "") {
-  $("ocr-settings-error").textContent = message;
+  uiErrorText($("ocr-settings-error"), message);
   $("ocr-settings-error").hidden = !message;
 }
 
@@ -589,7 +714,9 @@ function renderOCRStatus(status) {
     status.physical_cpu_cores == null
       ? "—"
       : `${status.physical_cpu_cores}${
-          status.physical_cpu_fallback ? " (logical fallback)" : ""
+          status.physical_cpu_fallback
+            ? ` (${uiLiteral("logical fallback")})`
+            : ""
         }`;
   $("ocr-logical-threads").textContent = status.logical_cpu_threads ?? "—";
   $("ocr-cpu-budget").textContent = Number.isFinite(status.cpu_capacity_percent)
@@ -607,14 +734,26 @@ function renderOCRStatus(status) {
   setOperationalHealth(
     "operate-ocr-state",
     ocrHealthy
-      ? `Healthy · ${status.pool_size} worker${status.pool_size === 1 ? "" : "s"} · Queue ${status.queued_requests ?? 0}`
+      ? deviceUi(
+          "ocr.health",
+          `Healthy · ${status.pool_size} worker${status.pool_size === 1 ? "" : "s"} · Queue ${status.queued_requests ?? 0}`,
+          {
+            count: status.pool_size,
+            worker: deviceUi(
+              status.pool_size === 1 ? "ocr.worker.one" : "ocr.worker.many",
+              status.pool_size === 1 ? "worker" : "workers",
+            ),
+            queue: status.queued_requests ?? 0,
+          },
+        )
       : "Problem",
     ocrHealthy,
   );
   renderOperationalRecovery();
-  $("ocr-restart-required").textContent = status.restart_required
-    ? "Yes"
-    : "No";
+  uiLiteralText(
+    $("ocr-restart-required"),
+    status.restart_required ? "Yes" : "No",
+  );
   $("ocr-cpu-usage").textContent = Number.isFinite(status.current_cpu_percent)
     ? `${status.current_cpu_percent.toFixed(1)}%`
     : "—";
@@ -634,7 +773,7 @@ function renderOCRStatus(status) {
   );
   $("ocr-recommendation-reason").textContent =
     status.recommendation_reason ||
-    "Collecting recent OCR performance samples.";
+    uiLiteral("Collecting recent OCR performance samples.");
   const warning = $("ocr-settings-warning");
   warning.textContent = status.warning || "";
   warning.hidden = !status.warning;
@@ -665,7 +804,11 @@ async function refreshOCRStatus() {
   try {
     renderOCRStatus(await ocrService.status());
   } catch (error) {
-    setOCRSettingsError(`OCR status unavailable: ${error.message}`);
+    setOCRSettingsError(
+      deviceUi("error.ocrStatus", `OCR status unavailable: ${error.message}`, {
+        message: uiError(error.message),
+      }),
+    );
     ocrOperationalHealthy = false;
     setOperationalHealth("operate-ocr-state", "Problem", false);
     renderOperationalRecovery();
@@ -689,7 +832,13 @@ async function loadOCRSettings() {
     renderOCRStatus(status);
     setOCRSettingsError();
   } catch (error) {
-    setOCRSettingsError(`OCR settings unavailable: ${error.message}`);
+    setOCRSettingsError(
+      deviceUi(
+        "error.ocrSettings",
+        `OCR settings unavailable: ${error.message}`,
+        { message: uiError(error.message) },
+      ),
+    );
     ocrOperationalHealthy = false;
     setOperationalHealth("operate-ocr-state", "Problem", false);
     renderOperationalRecovery();
@@ -754,7 +903,7 @@ async function applyOCRRecommendation() {
 
 function setDeviceError(message = "") {
   const node = $("device-error");
-  node.textContent = message;
+  uiErrorText(node, message);
   node.hidden = !message;
 }
 
@@ -824,13 +973,26 @@ function cameraState(details) {
     ((config.camera_source === null || config.camera_source === undefined) &&
       !config.camera_id)
   )
-    return { label: "Unassigned", className: "" };
-  if (!config.enabled) return { label: "Disabled", className: "" };
+    return {
+      label: deviceUi("common.unassigned", "Unassigned"),
+      className: "",
+    };
+  if (!config.enabled)
+    return {
+      label: deviceUi("common.disabled", "Disabled"),
+      className: "",
+    };
   if (details?.status?.poll_failed)
-    return { label: "Status unavailable", className: "" };
+    return {
+      label: deviceUi("device.statusUnavailable", "Status unavailable"),
+      className: "",
+    };
   return details?.status?.ready
-    ? { label: "Available", className: "connected" }
-    : { label: "Unavailable", className: "" };
+    ? {
+        label: deviceUi("common.available", "Available"),
+        className: "connected",
+      }
+    : { label: deviceUi("common.unavailable", "Unavailable"), className: "" };
 }
 
 function applyCameraPreviewGeometry(preview, width, height) {
@@ -978,11 +1140,11 @@ function startDevicePreview(deviceId, image, placeholder) {
         image.removeAttribute("src");
         image.hidden = true;
         placeholder.hidden = false;
-        placeholder.textContent = error.message;
+        placeholder.textContent = uiError(error.message);
       } else if (!devicePreviewLastFrames.has(deviceId)) {
         image.hidden = true;
         placeholder.hidden = false;
-        placeholder.textContent = error.message;
+        placeholder.textContent = uiError(error.message);
       }
 
       schedule(1000);
@@ -1002,28 +1164,37 @@ function createDeviceJobActions(job, deviceId) {
 
     if (action === "manual_assistance") {
       button.className = "primary danger-action";
-      button.textContent = "Manual Assistance";
+      deviceUiText(button, "device.manualAssistance", "Manual Assistance");
       button.disabled = deviceManagementBlocked();
       button.addEventListener("click", () =>
         resolveDeviceIssue(deviceId, job.job_id),
       );
     } else if (action === "retry_failed_step") {
-      button.textContent = "Retry from Failed Step";
+      deviceUiText(button, "workflow.retryFailed", "Retry from Failed Step");
       button.disabled = jobRetriesInFlight.has(job.job_id);
       button.addEventListener("click", () =>
         retryExternalJob(job, "failed_step"),
       );
     } else if (action === "restart") {
-      button.textContent = "Restart Workflow";
+      deviceUiText(button, "workflow.restart", "Restart Workflow");
       button.disabled = jobRetriesInFlight.has(job.job_id);
       button.addEventListener("click", () => retryExternalJob(job, "restart"));
     } else if (action === "cancel") {
       button.className = "stop";
-      button.textContent = job.cancel_requested
-        ? "Cancellation requested"
+      const cancelKey = job.cancel_requested
+        ? "workflow.cancellationRequested"
         : jobCancelsInFlight.has(job.job_id)
-          ? "Cancelling…"
-          : "Cancel";
+          ? "workflow.cancelling"
+          : "common.cancel";
+      deviceUiText(
+        button,
+        cancelKey,
+        job.cancel_requested
+          ? "Cancellation requested"
+          : jobCancelsInFlight.has(job.job_id)
+            ? "Cancelling…"
+            : "Cancel",
+      );
       button.disabled =
         !!job.cancel_requested || jobCancelsInFlight.has(job.job_id);
       button.addEventListener("click", () => cancelExternalJob(job));
@@ -1050,34 +1221,44 @@ function payerBalanceView(details) {
 
   if (status.balance_state === "VALID" && status.balance_valid === true) {
     const amount = formatPayerBalance(status.last_balance);
-    return { value: amount || "Unavailable", checkedAt, stateLabel: null };
+    return {
+      value: amount || deviceUi("common.unavailable", "Unavailable"),
+      checkedAt,
+      stateLabel: null,
+    };
   }
 
   if (status.balance_state === "REFRESHING") {
     const amount = formatPayerBalance(status.last_balance);
     return {
-      value: amount || "Checking…",
+      value: amount || deviceUi("balance.checking", "Checking…"),
       checkedAt: amount ? checkedAt : null,
-      stateLabel: amount ? "Refreshing…" : null,
+      stateLabel: amount ? deviceUi("balance.refreshing", "Refreshing…") : null,
     };
   }
 
   if (status.balance_state === "STALE" && status.last_balance != null) {
     const amount = formatPayerBalance(status.last_balance);
     return {
-      value: amount || "Unavailable",
+      value: amount || deviceUi("common.unavailable", "Unavailable"),
       checkedAt,
-      stateLabel: amount ? "Stale" : null,
+      stateLabel: amount ? deviceUi("balance.stale", "Stale") : null,
     };
   }
   if (status.balance_state === "ERROR") {
     return {
-      value: "Unavailable",
+      value: deviceUi("common.unavailable", "Unavailable"),
       checkedAt: null,
-      stateLabel: status.balance_error || "Balance check failed",
+      stateLabel:
+        status.balance_error ||
+        deviceUi("balance.failed", "Balance check failed"),
     };
   }
-  return { value: "Unavailable", checkedAt: null, stateLabel: null };
+  return {
+    value: deviceUi("common.unavailable", "Unavailable"),
+    checkedAt: null,
+    stateLabel: null,
+  };
 }
 
 function canManuallyCancelWithdrawal(details) {
@@ -1221,7 +1402,7 @@ function friendlyWorkflowStepType(type) {
     if_text: "If Text",
   };
 
-  return labels[type] || null;
+  return labels[type] ? uiLiteral(labels[type]) : null;
 }
 
 function deviceJobRenderSnapshot(job) {
@@ -1247,6 +1428,7 @@ function deviceJobRenderSnapshot(job) {
 function deviceCardRenderSignature(device, details, withdraw, latestJob) {
   const status = withdraw?.status || {};
   return JSON.stringify({
+    locale: window.PhoneI18n?.getLocale?.() || "en",
     device: {
       id: device.id,
       name: device.name,
@@ -1357,10 +1539,20 @@ function renderDevices() {
   const selected = deviceCatalog?.selected_device;
 
   $("device-state").textContent = deviceStatusStale
-    ? "Device status unavailable. Retrying automatically."
+    ? deviceUi(
+        "device.statusRetrying",
+        "Device status unavailable. Retrying automatically.",
+      )
     : devices.length
-      ? `${devices.length} registered phone${devices.length === 1 ? "" : "s"}. All cameras remain visible; one phone receives control.`
-      : "No phones are registered with this Pi yet.";
+      ? deviceUi(
+          "device.count",
+          `${devices.length} registered phone${devices.length === 1 ? "" : "s"}. All cameras remain visible; one phone receives control.`,
+          { count: devices.length, suffix: devices.length === 1 ? "" : "s" },
+        )
+      : deviceUi(
+          "device.noneOnPi",
+          "No phones are registered with this Pi yet.",
+        );
 
   const cards = devices.map((device) => {
     const details = deviceCameraDetails?.[device.id] || {};
@@ -1435,28 +1627,26 @@ function renderDevices() {
     if (device.default || device.id === deviceCatalog.default_device) {
       const badge = document.createElement("span");
       badge.className = "badge";
-      badge.textContent = "Default";
+      deviceUiText(badge, "device.default", "Default");
       badges.append(badge);
     }
 
     if (device.id === selected) {
       const badge = document.createElement("span");
       badge.className = "badge control-target";
-      badge.textContent = "Control target";
+      deviceUiText(badge, "device.controlTarget", "Control target");
       badges.append(badge);
     }
     const operationalBadge = document.createElement("span");
     operationalBadge.className = `badge device-state-badge device-state-badge--${operationalState}`;
-    operationalBadge.textContent =
-      operationalState === "needs-attention"
-        ? "⚠ Needs Attention"
-        : operationalState === "recovering"
-          ? "Recovering"
-          : operationalState === "running"
-            ? "Running"
-            : operationalState === "offline"
-              ? "Offline"
-              : "Ready";
+    const operationalLabel = {
+      "needs-attention": ["health.needsAttentionWarning", "⚠ Needs Attention"],
+      recovering: ["common.reconnecting", "Recovering"],
+      running: ["device.running", "Running"],
+      offline: ["device.offline", "Offline"],
+      ready: ["common.ready", "Ready"],
+    }[operationalState];
+    deviceUiText(operationalBadge, ...operationalLabel);
     badges.append(operationalBadge);
     heading.append(name, logicalId, badges);
 
@@ -1467,20 +1657,50 @@ function renderDevices() {
       "device-status" +
       (!deviceStatusStale && device.connected ? " connected" : "");
 
-    bluetooth.textContent = deviceStatusStale
-      ? "Bluetooth: ? Status unavailable"
-      : `Bluetooth: ● ${device.connected ? "Connected" : "Disconnected"}`;
+    if (deviceStatusStale) {
+      deviceUiText(
+        bluetooth,
+        "device.bluetoothUnavailable",
+        "Bluetooth: ? Status unavailable",
+      );
+    } else {
+      const bluetoothState = device.connected
+        ? deviceUi("common.connected", "Connected")
+        : deviceUi("common.disconnected", "Disconnected");
+      deviceUiText(
+        bluetooth,
+        "device.bluetoothStatus",
+        `Bluetooth: ● ${bluetoothState}`,
+        () => ({
+          status: device.connected
+            ? deviceUi("common.connected", "Connected")
+            : deviceUi("common.disconnected", "Disconnected"),
+        }),
+      );
+    }
 
     const cameraStatus = document.createElement("span");
     cameraStatus.className = "device-status " + status.className;
-    cameraStatus.textContent = deviceStatusStale
-      ? "Camera: ? Status unavailable"
-      : `Camera: ● ${status.label}`;
+    if (deviceStatusStale) {
+      deviceUiText(
+        cameraStatus,
+        "device.cameraUnavailableStatus",
+        "Camera: ? Status unavailable",
+      );
+    } else {
+      deviceUiText(
+        cameraStatus,
+        "device.cameraStatus",
+        `Camera: ● ${status.label}`,
+        () => ({ status: cameraState(details).label }),
+      );
+    }
     states.append(bluetooth, cameraStatus);
 
     const mac = document.createElement("p");
     mac.className = "device-mac admin-only";
-    mac.textContent = device.bluetooth_address || "Bluetooth MAC not paired";
+    mac.textContent =
+      device.bluetooth_address || uiLiteral("Bluetooth MAC not paired");
 
     const previewSignature = devicePreviewRenderSignature(device, details);
     const existingPreview = Array.from(existingCard?.children || []).find(
@@ -1492,7 +1712,13 @@ function renderDevices() {
       preview.disabled = device.id === selected || deviceManagementBlocked();
       preview.setAttribute?.(
         "aria-label",
-        `Select ${device.name || device.id} for control`,
+        deviceUi(
+          "device.selectForControl",
+          `Select ${device.name || device.id} for control`,
+          {
+            name: device.name || device.id,
+          },
+        ),
       );
       applyCameraPreviewGeometry(
         preview,
@@ -1514,18 +1740,27 @@ function renderDevices() {
       preview.disabled = device.id === selected || deviceManagementBlocked();
       preview.setAttribute?.(
         "aria-label",
-        `Select ${device.name || device.id} for control`,
+        deviceUi(
+          "device.selectForControl",
+          `Select ${device.name || device.id} for control`,
+          {
+            name: device.name || device.id,
+          },
+        ),
       );
 
       const previewImage = document.createElement("img");
-      previewImage.alt = `${device.name || device.id} live camera preview`;
+      previewImage.alt = deviceUi(
+        "device.livePreview",
+        `${device.name || device.id} live camera preview`,
+        { name: device.name || device.id },
+      );
       previewImage.hidden = true;
 
       const previewPlaceholder = document.createElement("span");
-      previewPlaceholder.textContent =
-        status.label === "Available"
-          ? "Loading camera…"
-          : `Camera ${status.label.toLowerCase()}`;
+      previewPlaceholder.textContent = details?.status?.ready
+        ? deviceUi("camera.loading", "Loading camera…")
+        : `${deviceUi("health.camera", "Camera")} ${status.label.toLowerCase()}`;
       preview.append(previewImage, previewPlaceholder);
       preview.addEventListener("click", () => selectDashboardDevice(device.id));
 
@@ -1543,8 +1778,23 @@ function renderDevices() {
     summary.textContent =
       (camera.camera_source === null || camera.camera_source === undefined) &&
       !camera.camera_id
-        ? "No camera assigned"
-        : `${camera.display_name || `Camera ${camera.camera_id || camera.camera_source}`} · ${camera.rotation ?? 0}°`;
+        ? deviceUi("camera.noneAssigned", "No camera assigned")
+        : deviceUi(
+            "camera.rotation",
+            `${camera.display_name || `Camera ${camera.camera_id || camera.camera_source}`} · ${camera.rotation ?? 0}°`,
+            {
+              name:
+                camera.display_name ||
+                deviceUi(
+                  "camera.named",
+                  `Camera ${camera.camera_id || camera.camera_source}`,
+                  {
+                    id: camera.camera_id || camera.camera_source,
+                  },
+                ),
+              rotation: camera.rotation ?? 0,
+            },
+          );
 
     const workflowAssignment = device.workflow_assignment || {
       unrestricted: true,
@@ -1559,22 +1809,33 @@ function renderDevices() {
 
     const workReadinessLabel = document.createElement("span");
     workReadinessLabel.className = "device-work-readiness-label";
-    workReadinessLabel.textContent = "Work status";
+    deviceUiText(workReadinessLabel, "device.workStatus", "Work status");
 
     const workReadinessState = document.createElement("span");
     workReadinessState.className = `device-work-readiness-state ${readyForWork ? "ready" : "not-ready"}`;
-    workReadinessState.textContent = readyForWork ? "● Ready" : "● Not Ready";
+    deviceUiText(
+      workReadinessState,
+      readyForWork ? "device.readyMark" : "device.notReadyMark",
+      readyForWork ? "● Ready" : "● Not Ready",
+    );
 
     const workReadinessAction = document.createElement("button");
     workReadinessAction.type = "button";
     workReadinessAction.className = "device-work-readiness-action";
-    workReadinessAction.textContent = workReadinessRequestsInFlight.has(
-      device.id,
-    )
-      ? "Updating…"
+    const readinessKey = workReadinessRequestsInFlight.has(device.id)
+      ? "device.updating"
       : readyForWork
-        ? "Set Not Ready"
-        : "Mark Ready";
+        ? "device.setNotReady"
+        : "device.markReady";
+    deviceUiText(
+      workReadinessAction,
+      readinessKey,
+      workReadinessRequestsInFlight.has(device.id)
+        ? "Updating…"
+        : readyForWork
+          ? "Set Not Ready"
+          : "Mark Ready",
+    );
 
     workReadinessAction.disabled = workReadinessRequestsInFlight.has(device.id);
 
@@ -1591,50 +1852,60 @@ function renderDevices() {
     const workflowSummary = document.createElement("div");
     workflowSummary.className = "account-summary admin-only";
     const workflowHeading = document.createElement("strong");
-    workflowHeading.textContent = "Payment Workflow";
+    deviceUiText(workflowHeading, "workflow.payment", "Payment Workflow");
     const workflowNames = document.createElement("span");
     const assignedWorkflow = workflowAssignment.assigned_workflows?.[0];
 
     workflowNames.textContent = workflowAssignment.unrestricted
-      ? "Not configured"
+      ? deviceUi("common.notConfigured", "Not configured")
       : assignedWorkflow
         ? assignedWorkflow.missing
-          ? `${assignedWorkflow.id} · Missing`
+          ? `${assignedWorkflow.id} · ${deviceUi("workflow.missing", "Missing")}`
           : assignedWorkflow.name || assignedWorkflow.id
-        : "No workflow assigned";
+        : deviceUi("workflow.noAssigned", "No workflow assigned");
 
     const workflowCount = document.createElement("span");
 
     workflowCount.textContent = workflowAssignment.unrestricted
-      ? "Choose one workflow"
+      ? deviceUi("workflow.chooseOne", "Choose one workflow")
       : assignedWorkflow
         ? assignedWorkflow.id
-        : "Execution disabled";
+        : deviceUi("workflow.executionDisabled", "Execution disabled");
 
     const paymentWorkflowAction = document.createElement("button");
     paymentWorkflowAction.type = "button";
-    paymentWorkflowAction.textContent = assignedWorkflow ? "Change" : "Assign";
+    deviceUiText(
+      paymentWorkflowAction,
+      assignedWorkflow ? "common.change" : "workflow.assign",
+      assignedWorkflow ? "Change" : "Assign",
+    );
     paymentWorkflowAction.disabled = deviceManagementBlocked();
     paymentWorkflowAction.addEventListener("click", () =>
       openWorkflowSettings(device, "payment"),
     );
 
     const balanceWorkflowHeading = document.createElement("strong");
-    balanceWorkflowHeading.textContent = "Balance Check Workflow";
+    deviceUiText(
+      balanceWorkflowHeading,
+      "workflow.balance",
+      "Balance Check Workflow",
+    );
 
     const balanceWorkflow = document.createElement("span");
     balanceWorkflow.textContent = workflowAssignment.balance_workflow
       ? workflowAssignment.balance_workflow.missing
-        ? `${workflowAssignment.balance_workflow.id} · Missing`
+        ? `${workflowAssignment.balance_workflow.id} · ${deviceUi("workflow.missing", "Missing")}`
         : workflowAssignment.balance_workflow.name ||
           workflowAssignment.balance_workflow.id
-      : "Not assigned";
+      : deviceUi("workflow.notAssigned", "Not assigned");
 
     const balanceWorkflowAction = document.createElement("button");
     balanceWorkflowAction.type = "button";
-    balanceWorkflowAction.textContent = workflowAssignment.balance_workflow
-      ? "Change"
-      : "Assign";
+    deviceUiText(
+      balanceWorkflowAction,
+      workflowAssignment.balance_workflow ? "common.change" : "workflow.assign",
+      workflowAssignment.balance_workflow ? "Change" : "Assign",
+    );
 
     balanceWorkflowAction.disabled = deviceManagementBlocked();
     balanceWorkflowAction.addEventListener("click", () =>
@@ -1659,7 +1930,7 @@ function renderDevices() {
     const balanceSummary = document.createElement("div");
     balanceSummary.className = "account-summary device-balance-summary";
     const balanceHeading = document.createElement("strong");
-    balanceHeading.textContent = "Balance";
+    deviceUiText(balanceHeading, "balance.title", "Balance");
     const balanceValue = document.createElement("span");
     balanceValue.className = "device-balance-value";
     balanceValue.textContent = balance.value;
@@ -1675,15 +1946,26 @@ function renderDevices() {
     if (balance.checkedAt) {
       const checked = document.createElement("span");
       checked.className = "device-balance-time";
-      checked.textContent = `Last checked: ${balance.checkedAt}`;
+      deviceUiText(
+        checked,
+        "balance.lastChecked",
+        `Last checked: ${balance.checkedAt}`,
+        { time: balance.checkedAt },
+      );
       balanceSummary.append(checked);
     }
     if (withdrawAssigned) {
       const refreshBalance = document.createElement("button");
       refreshBalance.type = "button";
-      refreshBalance.textContent = balanceRefreshesInFlight.has(device.id)
-        ? "Requesting…"
-        : "Refresh Balance";
+      deviceUiText(
+        refreshBalance,
+        balanceRefreshesInFlight.has(device.id)
+          ? "balance.requesting"
+          : "balance.refresh",
+        balanceRefreshesInFlight.has(device.id)
+          ? "Requesting…"
+          : "Refresh Balance",
+      );
       refreshBalance.disabled =
         withdraw.status?.balance_workflow_ready !== true ||
         balanceRefreshesInFlight.has(device.id);
@@ -1695,9 +1977,17 @@ function renderDevices() {
       if (withdraw.status?.balance_workflow_ready !== true) {
         const balanceHelp = document.createElement("span");
         balanceHelp.className = "device-balance-help";
-        balanceHelp.textContent =
-          withdraw.status?.balance_workflow_error ||
-          "Assign a Balance Check Workflow first.";
+        if (withdraw.status?.balance_workflow_error) {
+          balanceHelp.textContent = uiError(
+            withdraw.status.balance_workflow_error,
+          );
+        } else {
+          deviceUiText(
+            balanceHelp,
+            "balance.assignWorkflow",
+            "Assign a Balance Check Workflow first.",
+          );
+        }
         balanceSummary.append(balanceHelp);
       }
     }
@@ -1705,18 +1995,48 @@ function renderDevices() {
     withdrawSummary.className =
       "account-summary withdraw-account-summary admin-only";
     const withdrawHeading = document.createElement("strong");
-    withdrawHeading.textContent = "Withdraw Account";
+    deviceUiText(withdrawHeading, "withdraw.title", "Withdraw Account");
     const withdrawStatus = document.createElement("span");
-    withdrawStatus.textContent = `Account Status: ${withdrawAssigned ? "Assigned" : "Not Assigned"}`;
+    const assignedLabel = withdrawAssigned
+      ? deviceUi("withdraw.assigned", "Assigned")
+      : deviceUi("withdraw.notAssigned", "Not Assigned");
+    deviceUiText(
+      withdrawStatus,
+      "withdraw.accountStatus",
+      `Account Status: ${assignedLabel}`,
+      () => ({
+        status: withdrawAssigned
+          ? deviceUi("withdraw.assigned", "Assigned")
+          : deviceUi("withdraw.notAssigned", "Not Assigned"),
+      }),
+    );
     withdrawSummary.append(withdrawHeading, withdrawStatus);
     if (withdrawAssigned) {
       const runtime = withdrawRuntimeView(withdraw);
       const identity = document.createElement("span");
-      identity.textContent = `Username: ${withdrawApi.username} · Account ID: ${withdrawApi.operator_id}`;
+      deviceUiText(
+        identity,
+        "device.usernameAccount",
+        `Username: ${withdrawApi.username} · Account ID: ${withdrawApi.operator_id}`,
+        { username: withdrawApi.username, accountId: withdrawApi.operator_id },
+      );
       const records = document.createElement("span");
-      records.textContent = `Payment Records: ${withdrawApi.payment_records?.length ? withdrawApi.payment_records.join(", ") : "None"}`;
+      const paymentRecords = withdrawApi.payment_records?.length
+        ? withdrawApi.payment_records.join(", ")
+        : deviceUi("common.none", "None");
+      deviceUiText(
+        records,
+        "device.paymentRecords",
+        `Payment Records: ${paymentRecords}`,
+        { records: paymentRecords },
+      );
       const session = document.createElement("span");
-      session.textContent = `Session: ${runtime.session} · Realtime: ${runtime.realtime}`;
+      deviceUiText(
+        session,
+        "withdraw.sessionStatus",
+        `Session: ${runtime.session} · Realtime: ${runtime.realtime}`,
+        { session: runtime.session, realtime: runtime.realtime },
+      );
       withdrawSummary.append(identity, records, session);
 
       if (typeof withdraw.status?.payment_ready === "boolean") {
@@ -1724,9 +2044,15 @@ function renderDevices() {
         readiness.className = withdraw.status.payment_ready
           ? "withdraw-payment-ready"
           : "withdraw-payment-warning";
-        readiness.textContent = withdraw.status.payment_ready
-          ? "Payment readiness: Ready"
-          : "Payment readiness: Not ready";
+        deviceUiText(
+          readiness,
+          withdraw.status.payment_ready
+            ? "withdraw.paymentReady"
+            : "withdraw.paymentNotReady",
+          withdraw.status.payment_ready
+            ? "Payment readiness: Ready"
+            : "Payment readiness: Not ready",
+        );
         withdrawSummary.append(readiness);
         if (
           !withdraw.status.payment_ready &&
@@ -1734,7 +2060,9 @@ function renderDevices() {
         ) {
           const readinessDetail = document.createElement("span");
           readinessDetail.className = "withdraw-payment-warning-detail";
-          readinessDetail.textContent = withdraw.status.payment_readiness_error;
+          readinessDetail.textContent = uiError(
+            withdraw.status.payment_readiness_error,
+          );
           withdrawSummary.append(readinessDetail);
         }
       }
@@ -1742,9 +2070,15 @@ function renderDevices() {
       if (runtime.action === "reconnect") {
         const reconnect = document.createElement("button");
         reconnect.type = "button";
-        reconnect.textContent = withdrawReconnectsInFlight.has(device.id)
-          ? "Reconnecting…"
-          : "Reconnect";
+        deviceUiText(
+          reconnect,
+          withdrawReconnectsInFlight.has(device.id)
+            ? "withdraw.reconnecting"
+            : "withdraw.reconnect",
+          withdrawReconnectsInFlight.has(device.id)
+            ? "Reconnecting…"
+            : "Reconnect",
+        );
         reconnect.disabled =
           deviceManagementBlocked() ||
           withdrawReconnectsInFlight.has(device.id);
@@ -1753,7 +2087,7 @@ function renderDevices() {
       } else if (runtime.action === "login") {
         const loginAgain = document.createElement("button");
         loginAgain.type = "button";
-        loginAgain.textContent = "Login Again";
+        deviceUiText(loginAgain, "withdraw.loginAgain", "Login Again");
         loginAgain.disabled = deviceManagementBlocked();
         loginAgain.addEventListener("click", () =>
           openWithdrawSettings(device, withdraw, { reauthenticate: true }),
@@ -1763,9 +2097,11 @@ function renderDevices() {
     }
     const withdrawButton = document.createElement("button");
     withdrawButton.type = "button";
-    withdrawButton.textContent = withdrawAssigned
-      ? "Change Account"
-      : "Login & Assign";
+    deviceUiText(
+      withdrawButton,
+      withdrawAssigned ? "withdraw.changeAccount" : "withdraw.loginAssign",
+      withdrawAssigned ? "Change Account" : "Login & Assign",
+    );
     withdrawButton.disabled = deviceManagementBlocked();
     withdrawButton.addEventListener("click", () =>
       openWithdrawSettings(device, withdraw),
@@ -1778,16 +2114,31 @@ function renderDevices() {
       jobSummary.className = "device-job-summary";
 
       const phoneState = document.createElement("strong");
-      phoneState.textContent =
+      const phoneStateKey =
         withdrawNeedsAttention ||
         latestJob.recovery_status === "NEEDS_ATTENTION"
-          ? "Phone state: Needs Attention"
+          ? "device.phoneState.attention"
           : latestJob.recovery_status === "RECOVERING"
+            ? "device.phoneState.recovering"
+            : "device.phoneState.ready";
+      deviceUiText(
+        phoneState,
+        phoneStateKey,
+        phoneStateKey === "device.phoneState.attention"
+          ? "Phone state: Needs Attention"
+          : phoneStateKey === "device.phoneState.recovering"
             ? "Phone state: Recovering"
-            : "Phone state: Ready";
+            : "Phone state: Ready",
+      );
 
       const jobState = document.createElement("span");
-      jobState.textContent = `${activeJob ? "Current" : "Last"} job: ${latestJob.status}`;
+      const displayedJobStatus = deviceStatusLabel(latestJob.status);
+      deviceUiText(
+        jobState,
+        activeJob ? "device.currentJob" : "device.lastJob",
+        `${activeJob ? "Current" : "Last"} job: ${displayedJobStatus}`,
+        { status: displayedJobStatus },
+      );
       jobSummary.append(phoneState, jobState);
 
       if (Number.isInteger(latestJob.failed_step_index)) {
@@ -1797,9 +2148,14 @@ function renderDevices() {
         const stepNumber = latestJob.failed_step_index + 1;
         const stepType = friendlyWorkflowStepType(latestJob.failed_step_type);
 
-        failedStep.textContent = stepType
-          ? `Failed step: Step ${stepNumber} · ${stepType}`
-          : `Failed step: Step ${stepNumber}`;
+        deviceUiText(
+          failedStep,
+          "device.failedStep",
+          stepType
+            ? `Failed step: Step ${stepNumber} · ${stepType}`
+            : `Failed step: Step ${stepNumber}`,
+          { number: stepNumber, type: stepType ? ` · ${stepType}` : "" },
+        );
 
         jobSummary.append(failedStep);
       }
@@ -1815,13 +2171,18 @@ function renderDevices() {
       if (error) {
         const message = document.createElement("span");
         message.className = "job-error";
-        message.textContent = `Error: ${friendlyOperationalError(String(error))}`;
+        const friendlyError = friendlyOperationalError(String(error));
+        deviceUiText(message, "device.error", `Error: ${friendlyError}`, {
+          message: friendlyError,
+        });
 
         jobSummary.append(message);
       } else if (latestJob.result) {
         const message = document.createElement("span");
         message.className = "job-result";
-        message.textContent = `Result: ${latestJob.result}`;
+        deviceUiText(message, "device.result", `Result: ${latestJob.result}`, {
+          result: latestJob.result,
+        });
         jobSummary.append(message);
       }
     } else if (withdrawNeedsAttention) {
@@ -1829,25 +2190,34 @@ function renderDevices() {
       jobSummary.className = "device-job-summary device-issue-summary";
 
       const issueLabel = document.createElement("strong");
-      issueLabel.textContent = "Phone state: Needs Attention";
+      deviceUiText(
+        issueLabel,
+        "device.phoneState.attention",
+        "Phone state: Needs Attention",
+      );
 
       const issueMessage = document.createElement("span");
       issueMessage.textContent = friendlyOperationalError(
-        withdraw.status?.error || "Withdrawal recovery requires attention.",
+        withdraw.status?.error ||
+          uiLiteral("Withdrawal recovery requires attention."),
       );
 
       const jobState = document.createElement("span");
-      jobState.textContent = "Current job: —";
+      deviceUiText(jobState, "device.currentJob.none", "Current job: —");
 
       jobSummary.append(issueLabel, jobState, issueMessage);
     } else if (manualWorkflowNeedsAttention) {
       jobSummary = document.createElement("div");
       jobSummary.className = "device-job-summary device-issue-summary";
       const issueLabel = document.createElement("strong");
-      issueLabel.textContent = "Phone state: Needs Attention";
+      deviceUiText(
+        issueLabel,
+        "device.phoneState.attention",
+        "Phone state: Needs Attention",
+      );
       const issueMessage = document.createElement("span");
       issueMessage.textContent = friendlyOperationalError(
-        workflowRuntime?.message || "This phone needs attention.",
+        workflowRuntime?.message || uiLiteral("This phone needs attention."),
       );
       jobSummary.append(issueLabel, issueMessage);
     }
@@ -1857,7 +2227,11 @@ function renderDevices() {
 
     const select = document.createElement("button");
     select.type = "button";
-    select.textContent = device.id === selected ? "Controlling" : "Select";
+    deviceUiText(
+      select,
+      device.id === selected ? "common.controlling" : "common.select",
+      device.id === selected ? "Controlling" : "Select",
+    );
     select.disabled = device.id === selected || deviceManagementBlocked();
     select.addEventListener("click", () => selectDashboardDevice(device.id));
 
@@ -1866,9 +2240,15 @@ function renderDevices() {
       const cancelWithdrawal = document.createElement("button");
       cancelWithdrawal.type = "button";
       cancelWithdrawal.className = "stop danger-action";
-      cancelWithdrawal.textContent = withdrawCancelsInFlight.has(device.id)
-        ? "Cancelling Withdrawal…"
-        : "Cancel Withdrawal";
+      deviceUiText(
+        cancelWithdrawal,
+        withdrawCancelsInFlight.has(device.id)
+          ? "withdraw.cancelling"
+          : "withdraw.cancel",
+        withdrawCancelsInFlight.has(device.id)
+          ? "Cancelling Withdrawal…"
+          : "Cancel Withdrawal",
+      );
       cancelWithdrawal.disabled = withdrawCancelsInFlight.has(device.id);
       cancelWithdrawal.addEventListener("click", () =>
         openWithdrawCancel(device),
@@ -1879,7 +2259,7 @@ function renderDevices() {
       const assist = document.createElement("button");
       assist.type = "button";
       assist.className = "primary danger-action";
-      assist.textContent = "Manual Assistance";
+      deviceUiText(assist, "device.manualAssistance", "Manual Assistance");
       assist.disabled = deviceManagementBlocked();
       assist.addEventListener("click", () =>
         resolveDeviceIssue(device.id, null),
@@ -1890,16 +2270,20 @@ function renderDevices() {
     const settings = document.createElement("button");
     settings.className = "admin-only";
     settings.type = "button";
-    settings.textContent = "Camera Settings";
+    deviceUiText(settings, "device.cameraSettings", "Camera Settings");
     settings.disabled = deviceManagementBlocked();
     settings.addEventListener("click", () => openCameraSettings(device));
 
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "stop admin-only";
-    remove.textContent = deviceDeletesInFlight.has(device.id)
-      ? "Deleting…"
-      : "Delete";
+    deviceUiText(
+      remove,
+      deviceDeletesInFlight.has(device.id)
+        ? "common.deleting"
+        : "common.delete",
+      deviceDeletesInFlight.has(device.id) ? "Deleting…" : "Delete",
+    );
     remove.disabled =
       deviceDeletesInFlight.has(device.id) || deviceManagementBlocked();
     remove.addEventListener("click", () => deleteDevice(device, remove));
@@ -1937,14 +2321,33 @@ function renderDevices() {
   $("device-add").disabled = !!enrollment.active || deviceManagementBlocked();
 
   if (enrollment.active) {
-    $("device-enrollment-target").textContent = enrollment.target_device_id
-      ? `Registering ${enrollment.target_device_id}`
-      : "Pair the phone from its Bluetooth settings";
-    $("device-enrollment-time").textContent = Number.isFinite(
-      enrollment.remaining_seconds,
-    )
-      ? `${Math.max(0, Math.ceil(enrollment.remaining_seconds))} seconds remaining`
-      : "Enrollment window active";
+    if (enrollment.target_device_id)
+      deviceUiText(
+        $("device-enrollment-target"),
+        "device.enrolling",
+        `Registering ${enrollment.target_device_id}`,
+        { deviceId: enrollment.target_device_id },
+      );
+    else
+      deviceUiText(
+        $("device-enrollment-target"),
+        "device.pairBluetooth",
+        "Pair the phone from its Bluetooth settings",
+      );
+    if (Number.isFinite(enrollment.remaining_seconds)) {
+      const seconds = Math.max(0, Math.ceil(enrollment.remaining_seconds));
+      deviceUiText(
+        $("device-enrollment-time"),
+        "device.enrollmentRemaining",
+        `${seconds} seconds remaining`,
+        { seconds },
+      );
+    } else
+      deviceUiText(
+        $("device-enrollment-time"),
+        "device.enrollmentActive",
+        "Enrollment window active",
+      );
   }
   renderJobs();
 }
@@ -2036,9 +2439,19 @@ function renderJobs() {
   const jobs = Array.isArray(jobCatalog) ? jobCatalog : [];
   const groups = groupJobAttempts(jobs);
 
-  $("jobs-state").textContent = groups.length
-    ? `Showing latest ${Math.min(groups.length, 10)} of ${groups.length} jobs.`
-    : "No external jobs have been submitted.";
+  if (groups.length)
+    deviceUiText(
+      $("jobs-state"),
+      "jobs.summary",
+      `Showing latest ${Math.min(groups.length, 10)} of ${groups.length} jobs.`,
+      { shown: Math.min(groups.length, 10), count: groups.length },
+    );
+  else
+    deviceUiText(
+      $("jobs-state"),
+      "status.noJobs",
+      "No external jobs have been submitted.",
+    );
 
   const cards = [...groups]
     .reverse()
@@ -2051,34 +2464,70 @@ function renderJobs() {
       const id = document.createElement("strong");
       id.textContent = rootJob.job_id;
       const account = document.createElement("span");
-      account.textContent = job.bank
-        ? `Account: ${job.account_id} · ${job.bank}`
-        : `Account: ${job.account_id}`;
+      deviceUiText(
+        account,
+        "jobs.account",
+        job.bank
+          ? `Account: ${job.account_id} · ${job.bank}`
+          : `Account: ${job.account_id}`,
+        { account: job.account_id, bank: job.bank ? ` · ${job.bank}` : "" },
+      );
       const device = document.createElement("span");
-      device.textContent = `Device: ${job.device_id}`;
+      deviceUiText(device, "jobs.device", `Device: ${job.device_id}`, {
+        deviceId: job.device_id,
+      });
       const workflow = document.createElement("span");
-      workflow.textContent = job.action
-        ? `Workflow: ${job.workflow} · ${job.action}`
-        : `Workflow: ${job.workflow}`;
+      deviceUiText(
+        workflow,
+        "jobs.workflow",
+        job.action
+          ? `Workflow: ${job.workflow} · ${job.action}`
+          : `Workflow: ${job.workflow}`,
+        {
+          workflow: job.workflow,
+          action: job.action ? ` · ${job.action}` : "",
+        },
+      );
       const status = document.createElement("span");
       status.textContent = job.queue_position
-        ? `${job.status} · queue ${job.queue_position}`
-        : job.status;
+        ? deviceUi(
+            "jobs.queuePosition",
+            `${deviceStatusLabel(job.status)} · queue ${job.queue_position}`,
+            {
+              status: deviceStatusLabel(job.status),
+              position: job.queue_position,
+            },
+          )
+        : deviceStatusLabel(job.status);
 
       const created = document.createElement("span");
-      created.textContent = `Queued: ${job.created_at || "—"}`;
+      deviceUiText(created, "jobs.queued", `Queued: ${job.created_at || "—"}`, {
+        time: job.created_at || "—",
+      });
       const activity = document.createElement("span");
-      activity.textContent = job.finished_at
-        ? `Finished: ${job.finished_at}`
-        : job.started_at
-          ? `Started: ${job.started_at}`
-          : "Not started";
+      if (job.finished_at)
+        deviceUiText(
+          activity,
+          "jobs.finished",
+          `Finished: ${job.finished_at}`,
+          { time: job.finished_at },
+        );
+      else if (job.started_at)
+        deviceUiText(activity, "jobs.started", `Started: ${job.started_at}`, {
+          time: job.started_at,
+        });
+      else deviceUiText(activity, "workflow.notStarted", "Not started");
 
       item.append(id, account, device, workflow, status, created, activity);
 
       if (attempts.length > 1) {
         const attemptInfo = document.createElement("span");
-        attemptInfo.textContent = `Attempts: ${attempts.length}`;
+        deviceUiText(
+          attemptInfo,
+          "jobs.attempts",
+          `Attempts: ${attempts.length}`,
+          { count: attempts.length },
+        );
         item.append(attemptInfo);
       }
 
@@ -2092,7 +2541,11 @@ function renderJobs() {
           const details = document.createElement("details");
           details.className = "job-error-details";
           const summary = document.createElement("summary");
-          summary.textContent = "Technical details";
+          deviceUiText(
+            summary,
+            "workflow.technicalDetails",
+            "Technical details",
+          );
           const message = document.createElement("code");
           message.textContent = technical;
           details.append(summary, message);
@@ -2108,12 +2561,14 @@ function renderJobs() {
       if (job.recovery_status) {
         const recovery = document.createElement("span");
         recovery.className = `job-recovery-state job-recovery-${job.recovery_status.toLowerCase()}`;
-        recovery.textContent =
+        uiLiteralText(
+          recovery,
           job.recovery_status === "READY"
             ? "Phone state: Ready"
             : job.recovery_status === "RECOVERING"
               ? "Phone state: Recovering"
-              : "Phone state: Needs Attention";
+              : "Phone state: Needs Attention",
+        );
         item.append(recovery);
       }
       return item;
@@ -2124,22 +2579,28 @@ function renderJobs() {
 
 function friendlyOperationalError(message) {
   const value = message.toLowerCase();
-  if (/calibrat/.test(value)) return "Calibration required";
-  if (/camera/.test(value)) return "Camera unavailable";
-  if (/ocr|paddle|text detection/.test(value)) return "OCR unavailable";
+  if (/calibrat/.test(value))
+    return deviceUi("camera.calibrationRequired", "Calibration required");
+  if (/camera/.test(value))
+    return deviceUi("camera.unavailable", "Camera unavailable");
+  if (/ocr|paddle|text detection/.test(value))
+    return deviceUi("error.ocrUnavailable", "OCR unavailable");
   if (
     /device (?:is )?busy|already has a running job|active reservation|scheduler reservation|device ownership/.test(
       value,
     )
   )
-    return "Device busy";
+    return deviceUi("device.busy", "Device busy");
   if (/external lock result is uncertain/.test(value))
-    return "Withdrawal lock status is uncertain. Reconcile before retrying.";
+    return uiLiteral(
+      "Withdrawal lock status is uncertain. Reconcile before retrying.",
+    );
   if (/raspberry|pi api|pi unavailable|cannot reach pi/.test(value))
-    return "Raspberry Pi unavailable";
+    return deviceUi("error.piUnavailable", "Raspberry Pi unavailable");
   if (/disconnect|bluetooth|phone unavailable/.test(value))
-    return "Phone disconnected";
-  if (/interrupt|restart/.test(value)) return "Job interrupted";
+    return deviceUi("device.phoneDisconnected", "Phone disconnected");
+  if (/interrupt|restart/.test(value))
+    return deviceUi("error.jobInterrupted", "Job interrupted");
   return message;
 }
 
@@ -2339,22 +2800,31 @@ function renderOperationalRecovery() {
         .map((job) => job.device_id),
     );
 
-    $("operate-attention-message").textContent =
-      affectedDevices.size > 1
-        ? `${affectedDevices.size} devices need attention`
-        : issue.label;
+    if (affectedDevices.size > 1)
+      deviceUiText(
+        $("operate-attention-message"),
+        "device.multipleAttention",
+        `${affectedDevices.size} devices need attention`,
+        { count: affectedDevices.size },
+      );
+    else uiErrorText($("operate-attention-message"), issue.label);
   }
 
   $("operate-recovery").hidden = !recoveryPanelOpen || (!issue && !recovered);
   if (issue) {
-    $("operate-recovery-issue").textContent = issue.label;
-    $("operate-recovery-recommendation").textContent = issue.recommendation;
-    $("operate-recovery-state").textContent = issue.state || "Needs Attention";
+    uiErrorText($("operate-recovery-issue"), issue.label);
+    uiLiteralText($("operate-recovery-recommendation"), issue.recommendation);
+    uiLiteralText(
+      $("operate-recovery-state"),
+      issue.state || "Needs Attention",
+    );
   } else if (recovered) {
-    $("operate-recovery-issue").textContent = "Phone recovered successfully.";
-    $("operate-recovery-recommendation").textContent =
-      "The configured ready-screen condition was detected. Review the failed job before starting new business work.";
-    $("operate-recovery-state").textContent = "Ready";
+    uiLiteralText($("operate-recovery-issue"), "Phone recovered successfully.");
+    uiLiteralText(
+      $("operate-recovery-recommendation"),
+      "The configured ready-screen condition was detected. Review the failed job before starting new business work.",
+    );
+    uiLiteralText($("operate-recovery-state"), "Ready");
   }
   $("operate-recover-phone").hidden = !issue?.recoverAvailable;
   $("operate-recover-phone").disabled = recoveryRequestInFlight;
@@ -2365,21 +2835,29 @@ function renderOperationalRecovery() {
     readyVerificationRestoreInFlight ||
     readyVerificationFinishInFlight;
   if (recoveryJob?.recovery_status === "RECOVERING")
-    $("operate-recovery-result").textContent =
-      "Recovery workflow is running. The failed workflow will not be retried.";
+    uiLiteralText(
+      $("operate-recovery-result"),
+      "Recovery workflow is running. The failed workflow will not be retried.",
+    );
   else if (recoveryJob?.job_id === readyVerificationFailedJobId)
-    $("operate-recovery-result").textContent =
-      "Expected starting screen was not detected.";
+    uiLiteralText(
+      $("operate-recovery-result"),
+      "Expected starting screen was not detected.",
+    );
   else if (
     recoveryJob?.recovery_status === "NEEDS_ATTENTION" &&
     recoveryAttempted
   )
-    $("operate-recovery-result").textContent =
+    uiErrorText(
+      $("operate-recovery-result"),
       recoveryJob.recovery_error ||
-      "Automatic recovery failed. Resolve the phone issue manually.";
+        "Automatic recovery failed. Resolve the phone issue manually.",
+    );
   else if (recovered)
-    $("operate-recovery-result").textContent =
-      "Phone recovered successfully. Status: Ready.";
+    uiLiteralText(
+      $("operate-recovery-result"),
+      "Phone recovered successfully. Status: Ready.",
+    );
   if (manualAssistanceOpen && readyVerificationMessage)
     $("operate-recovery-result").textContent = readyVerificationMessage;
   document.body.dataset.manualAssistance = manualAssistanceOpen
@@ -2402,7 +2880,7 @@ async function startPhoneRecovery(jobId) {
   readyVerificationMessage = "";
   readyVerificationRestoreManual = false;
   recoveryPanelOpen = true;
-  $("operate-recovery-result").textContent = "Starting recovery workflow…";
+  uiLiteralText($("operate-recovery-result"), "Starting recovery workflow…");
   renderOperationalRecovery();
   try {
     const updated = await jobService.recover(jobId);
@@ -2410,8 +2888,12 @@ async function startPhoneRecovery(jobId) {
       job.job_id === updated.job_id ? updated : job,
     );
   } catch (error) {
-    $("operate-recovery-result").textContent =
-      `Recovery could not start: ${friendlyOperationalError(error.message)}`;
+    deviceUiText(
+      $("operate-recovery-result"),
+      "error.recoveryStart",
+      `Recovery could not start: ${friendlyOperationalError(error.message)}`,
+      { message: friendlyOperationalError(error.message) },
+    );
   } finally {
     recoveryRequestInFlight = false;
     renderJobs();
@@ -2443,7 +2925,11 @@ async function openManualAssistance(jobId = null) {
       await enableManualControl();
     } catch (error) {
       notice(
-        `Manual control could not be enabled: ${friendlyOperationalError(error.message)}`,
+        deviceUi(
+          "error.manualEnable",
+          `Manual control could not be enabled: ${friendlyOperationalError(error.message)}`,
+          { message: friendlyOperationalError(error.message) },
+        ),
         true,
       );
     }
@@ -2520,7 +3006,11 @@ async function verifyPhoneReady() {
         returnToDeviceCard(updated.device_id);
         renderOperationalRecovery();
       } catch (error) {
-        readyVerificationMessage = `Phone could not be marked ready: ${friendlyOperationalError(error.message)}`;
+        readyVerificationMessage = deviceUi(
+          "error.markReady",
+          `Phone could not be marked ready: ${friendlyOperationalError(error.message)}`,
+          { message: friendlyOperationalError(error.message) },
+        );
 
         if (restoreManualOnFailure)
           await restoreManualControlAfterVerificationFailure();
@@ -2546,7 +3036,11 @@ async function verifyPhoneReady() {
     readyVerificationJobId = job.job_id;
     readyVerificationFailedJobId = null;
   } catch (error) {
-    readyVerificationMessage = `Ready state could not be verified: ${friendlyOperationalError(error.message)}`;
+    readyVerificationMessage = deviceUi(
+      "error.verifyReady",
+      `Ready state could not be verified: ${friendlyOperationalError(error.message)}`,
+      { message: friendlyOperationalError(error.message) },
+    );
     if (readyVerificationRestoreManual)
       await restoreManualControlAfterVerificationFailure();
   } finally {
@@ -2610,7 +3104,7 @@ function viewOperationalDetails() {
 }
 
 function setWorkflowSettingsError(message = "") {
-  $("workflow-settings-error").textContent = message;
+  uiErrorText($("workflow-settings-error"), message);
   $("workflow-settings-error").hidden = !message;
 }
 
@@ -2627,12 +3121,12 @@ function closeWorkflowSettings() {
 }
 
 function setWithdrawSettingsError(message = "") {
-  $("withdraw-settings-error").textContent = message;
+  uiErrorText($("withdraw-settings-error"), message);
   $("withdraw-settings-error").hidden = !message;
 }
 
 function setWithdrawCancelError(message = "") {
-  $("withdraw-cancel-error").textContent = message;
+  uiErrorText($("withdraw-cancel-error"), message);
   $("withdraw-cancel-error").hidden = !message;
 }
 
@@ -2654,8 +3148,12 @@ function closeWithdrawCancel() {
 
 function openWithdrawCancel(device) {
   withdrawCancelDeviceId = device.id;
-  $("withdraw-cancel-title").textContent =
-    `Cancel Withdrawal · ${device.name || device.id}`;
+  deviceUiText(
+    $("withdraw-cancel-title"),
+    "withdraw.cancelNamed",
+    `Cancel Withdrawal · ${device.name || device.id}`,
+    { name: device.name || device.id },
+  );
   $("withdraw-cancel-reason").value = "";
   $("withdraw-cancel-confirm").disabled = true;
   $("withdraw-cancel-dialog").hidden = false;
@@ -2768,35 +3266,55 @@ function openWithdrawSettings(
   withdrawSettingsReauthentication =
     reauthenticate === true && withdrawSettingsAssigned;
 
-  $("withdraw-settings-title").textContent =
-    `Withdraw Account · ${device.name || device.id}`;
+  deviceUiText(
+    $("withdraw-settings-title"),
+    "withdraw.titleNamed",
+    `Withdraw Account · ${device.name || device.id}`,
+    { name: device.name || device.id },
+  );
 
-  $("withdraw-settings-status").textContent = withdrawSettingsAssigned
-    ? "Account Status: Assigned"
-    : "Account Status: Not Assigned";
+  uiLiteralText(
+    $("withdraw-settings-status"),
+    withdrawSettingsAssigned
+      ? "Account Status: Assigned"
+      : "Account Status: Not Assigned",
+  );
 
-  $("withdraw-settings-identity").textContent = withdrawSettingsAssigned
-    ? `Username: ${api.username} · Account ID: ${api.operator_id} · Payment Records: ${
-        api.payment_records?.length ? api.payment_records.join(", ") : "None"
-      }`
-    : "Login with the external operator account assigned to this phone.";
+  if (withdrawSettingsAssigned) {
+    const records = api.payment_records?.length
+      ? api.payment_records.join(", ")
+      : deviceUi("common.none", "None");
+    deviceUiText(
+      $("withdraw-settings-identity"),
+      "withdraw.usernameIdentity",
+      `Username: ${api.username} · Account ID: ${api.operator_id} · Payment Records: ${records}`,
+      { username: api.username, accountId: api.operator_id, records },
+    );
+  } else
+    uiLiteralText(
+      $("withdraw-settings-identity"),
+      "Login with the external operator account assigned to this phone.",
+    );
 
   $("withdraw-settings-username").value = api.username || "";
   $("withdraw-settings-username").readOnly = withdrawSettingsReauthentication;
 
   $("withdraw-settings-password").value = "";
   $("withdraw-settings-password").placeholder = details.credentials_saved
-    ? "Enter password to authenticate"
+    ? uiLiteral("Enter password to authenticate")
     : "";
 
   $("withdraw-settings-totp").value = "";
   $("withdraw-settings-totp").placeholder = "123456";
 
-  $("withdraw-settings-submit").textContent = withdrawSettingsReauthentication
-    ? "Login Again"
-    : withdrawSettingsAssigned
-      ? "Reauthenticate"
-      : "Login & Assign";
+  uiLiteralText(
+    $("withdraw-settings-submit"),
+    withdrawSettingsReauthentication
+      ? "Login Again"
+      : withdrawSettingsAssigned
+        ? "Reauthenticate"
+        : "Login & Assign",
+  );
 
   $("withdraw-settings-dialog").hidden = false;
 
@@ -2901,7 +3419,7 @@ function renderWorkflowSettingsOptions() {
       const text = document.createElement("span");
       const name = document.createElement("strong");
       name.textContent = workflow.missing
-        ? `${workflow.name} · Remove this assignment`
+        ? `${workflow.name} · ${uiLiteral("Remove this assignment")}`
         : workflow.name;
       const id = document.createElement("small");
       id.textContent = workflow.id;
@@ -2941,9 +3459,9 @@ function renderBalanceWorkflowOptions() {
   noneInput.checked = !assignedId;
   const noneText = document.createElement("span");
   const noneName = document.createElement("strong");
-  noneName.textContent = "No Balance Check Workflow assigned";
+  uiLiteralText(noneName, "No Balance Check Workflow assigned");
   const noneHint = document.createElement("small");
-  noneHint.textContent = "Disable automatic balance checks for this phone";
+  uiLiteralText(noneHint, "Disable automatic balance checks for this phone");
   noneText.append(noneName, noneHint);
   noneLabel.append(noneInput, noneText);
   options.push(noneLabel);
@@ -2984,9 +3502,12 @@ function renderBalanceWorkflowOptions() {
     input.disabled = true;
     const text = document.createElement("span");
     const name = document.createElement("strong");
-    name.textContent = assigned.missing
-      ? "Missing Balance Check Workflow"
-      : "Invalid Balance Check Workflow";
+    uiLiteralText(
+      name,
+      assigned.missing
+        ? "Missing Balance Check Workflow"
+        : "Invalid Balance Check Workflow",
+    );
     const id = document.createElement("small");
     id.textContent = assigned.name
       ? `${assigned.name} · ${assigned.id}`
@@ -3005,23 +3526,34 @@ async function openWorkflowSettings(device, mode = "payment") {
   workflowSettingsMode = mode === "balance" ? "balance" : "payment";
 
   const balanceMode = workflowSettingsMode === "balance";
-  $("workflow-settings-title").textContent =
-    `${balanceMode ? "Balance Check Workflow" : "Payment Workflow"} · ${device.name || device.id}`;
-  $("workflow-settings-help").textContent = "Loading workflows…";
+  const workflowType = balanceMode
+    ? deviceUi("workflow.balance", "Balance Check Workflow")
+    : deviceUi("workflow.payment", "Payment Workflow");
+  deviceUiText(
+    $("workflow-settings-title"),
+    "workflow.settingsNamed",
+    `${workflowType} · ${device.name || device.id}`,
+    { type: workflowType, name: device.name || device.id },
+  );
+  uiLiteralText($("workflow-settings-help"), "Loading workflows…");
   $("workflow-settings-payment-section").hidden = balanceMode;
   $("workflow-settings-balance-section").hidden = !balanceMode;
-  $("workflow-settings-save").textContent = balanceMode
-    ? "Save Balance Check Workflow"
-    : "Save Payment Workflow";
+  uiLiteralText(
+    $("workflow-settings-save"),
+    balanceMode ? "Save Balance Check Workflow" : "Save Payment Workflow",
+  );
   $("workflow-settings-list").replaceChildren();
   $("workflow-settings-dialog").hidden = false;
   setWorkflowSettingsError();
 
   try {
     workflowSettingsData = await deviceService.workflows(device.id);
-    $("workflow-settings-help").textContent = balanceMode
-      ? "Choose the Balance Check Workflow used to read this payer's balance."
-      : "Choose the Payment Workflow that may run on this phone.";
+    uiLiteralText(
+      $("workflow-settings-help"),
+      balanceMode
+        ? "Choose the Balance Check Workflow used to read this payer's balance."
+        : "Choose the Payment Workflow that may run on this phone.",
+    );
     renderWorkflowSettingsOptions();
     renderBalanceWorkflowOptions();
     if (balanceMode) $("workflow-settings-balance-search").focus();
@@ -3344,7 +3876,7 @@ const cameraSourceNames = new Map();
 const cameraStableIds = new Map();
 
 function setCameraSettingsError(message = "") {
-  $("camera-settings-error").textContent = message;
+  uiErrorText($("camera-settings-error"), message);
   $("camera-settings-error").hidden = !message;
 }
 
@@ -3375,7 +3907,20 @@ function populateCameraSources(cameras, current) {
       cameraStableIds.set(String(camera.source), camera.stable_id);
     const option = document.createElement("option");
     option.value = String(camera.source);
-    option.textContent = `${camera.name || `Camera ${camera.index ?? camera.source}`} — ${camera.available ? "Available" : "Unavailable"}`;
+    const cameraName =
+      camera.name ||
+      deviceUi("camera.named", `Camera ${camera.index ?? camera.source}`, {
+        id: camera.index ?? camera.source,
+      });
+    const availability = camera.available
+      ? deviceUi("common.available", "Available")
+      : deviceUi("common.unavailable", "Unavailable");
+    deviceUiText(
+      option,
+      "camera.sourceOption",
+      `${cameraName} — ${availability}`,
+      { name: cameraName, status: availability },
+    );
     options.push(option);
   }
   if (
@@ -3385,7 +3930,12 @@ function populateCameraSources(cameras, current) {
   ) {
     const option = document.createElement("option");
     option.value = String(current);
-    option.textContent = `Saved source ${current} — Unavailable`;
+    deviceUiText(
+      option,
+      "camera.savedUnavailable",
+      `Saved source ${current} — Unavailable`,
+      { source: current },
+    );
     options.unshift(option);
   }
   list.replaceChildren(...options);
@@ -3396,8 +3946,12 @@ async function openCameraSettings(device) {
   cameraSettingsDeviceId = device.id;
   const details = deviceCameraDetails?.[device.id] || {};
   const config = details.config || {};
-  $("camera-settings-title").textContent =
-    `Camera Settings · ${device.name || device.id}`;
+  deviceUiText(
+    $("camera-settings-title"),
+    "camera.settingsNamed",
+    `Camera Settings · ${device.name || device.id}`,
+    { name: device.name || device.id },
+  );
   $("camera-settings-rotation").value = String(config.rotation ?? 90);
   $("camera-settings-enabled").checked = config.enabled === true;
   $("camera-settings-status").textContent = cameraState(details).label;
@@ -3438,7 +3992,7 @@ async function testCameraSettings() {
       cameraSourceValue($("camera-settings-source").value),
       Number($("camera-settings-rotation").value),
     );
-    $("camera-settings-status").textContent = "Available";
+    deviceUiText($("camera-settings-status"), "common.available", "Available");
     applyCameraPreviewGeometry(
       $("camera-test-preview"),
       result.width,
@@ -3448,11 +4002,15 @@ async function testCameraSettings() {
     $("camera-test-image").hidden = !result.preview;
     $("camera-test-placeholder").hidden = !!result.preview;
   } catch (error) {
-    $("camera-settings-status").textContent = "Unavailable";
+    deviceUiText(
+      $("camera-settings-status"),
+      "common.unavailable",
+      "Unavailable",
+    );
     applyCameraPreviewGeometry($("camera-test-preview"));
     $("camera-test-image").hidden = true;
     $("camera-test-placeholder").hidden = false;
-    $("camera-test-placeholder").textContent = "Camera test failed";
+    uiLiteralText($("camera-test-placeholder"), "Camera test failed");
     setCameraSettingsError(error.message);
   } finally {
     button.disabled = false;
@@ -3501,9 +4059,13 @@ async function saveDeviceCamera(event) {
       notice(
         "Camera configuration changed. Existing screen calibration may no longer match. Recalibrate before control.",
       );
-      if (selectedCameraChanged) $("calibrate").textContent = "Recalibrate";
+      if (selectedCameraChanged) uiLiteralText($("calibrate"), "Recalibrate");
     } else {
-      notice(`Camera settings saved for ${deviceId}.`);
+      notice(
+        deviceUi("camera.savedFor", `Camera settings saved for ${deviceId}.`, {
+          deviceId,
+        }),
+      );
     }
   } catch (error) {
     try {
@@ -3549,18 +4111,28 @@ async function deleteDevice(device, button) {
   }
   if (
     !window.confirm(
-      `Delete ${device.id}? This will unregister and unpair this phone from the Raspberry Pi.`,
+      deviceUi(
+        "device.deleteConfirm",
+        `Delete ${device.id}? This will unregister and unpair this phone from the Raspberry Pi.`,
+        { deviceId: device.id },
+      ),
     )
   )
     return;
   deviceDeletesInFlight.add(device.id);
   button.disabled = true;
-  button.textContent = "Deleting…";
+  deviceUiText(button, "common.deleting", "Deleting…");
   try {
     const result = await deviceService.remove(device.id);
     if (Array.isArray(result.devices)) deviceCatalog = result;
     if (deviceCameraDetails) delete deviceCameraDetails[device.id];
-    notice(`Deleted ${device.id} from the Raspberry Pi.`);
+    notice(
+      deviceUi(
+        "device.deleted",
+        `Deleted ${device.id} from the Raspberry Pi.`,
+        { deviceId: device.id },
+      ),
+    );
     deviceRenderSignature = null;
     renderDevices();
     await loadDevices();
@@ -3621,16 +4193,22 @@ function releaseKeyboard() {
 function renderKeyboard() {
   if (!keyboardEligible()) keyboardArmed = false;
   const enabled = keyboardActive();
-  $("keyboard-state").textContent = enabled
-    ? busy
-      ? "Keyboard control paused · command in progress"
-      : "Keyboard control active"
-    : "Keyboard control inactive";
+  uiLiteralText(
+    $("keyboard-state"),
+    enabled
+      ? busy
+        ? "Keyboard control paused · command in progress"
+        : "Keyboard control active"
+      : "Keyboard control inactive",
+  );
   $("keyboard-state").classList.toggle("active", enabled && !busy);
   canvas.classList.toggle("keyboard-active", enabled);
-  $("keyboard-help").textContent = enabled
-    ? "Type on your laptop to control the phone. Press Esc to release keyboard control."
-    : "Click or focus the phone view to enable keyboard control.";
+  uiLiteralText(
+    $("keyboard-help"),
+    enabled
+      ? "Type on your laptop to control the phone. Press Esc to release keyboard control."
+      : "Click or focus the phone view to enable keyboard control.",
+  );
 }
 
 function render() {
@@ -3639,39 +4217,68 @@ function render() {
   const selectedDevice = selectedPiDevice();
   $("devices").hidden = !piMode;
   $("jobs").hidden = !piMode;
-  $("serial").textContent =
-    (piMode && selectedDevice
-      ? `Controlling: ${selectedDevice.name || selectedDevice.id}`
-      : state?.device?.label) ||
-    state?.device?.serial ||
-    (piMode ? "Bluetooth phone unavailable" : "No authorized USB phone");
+  if (piMode && selectedDevice)
+    deviceUiText(
+      $("serial"),
+      "device.controllingNamed",
+      `Controlling: ${selectedDevice.name || selectedDevice.id}`,
+      { name: selectedDevice.name || selectedDevice.id },
+    );
+  else {
+    const serialLabel =
+      state?.device?.label ||
+      state?.device?.serial ||
+      (piMode ? "Bluetooth phone unavailable" : "No authorized USB phone");
+    uiLiteralText($("serial"), serialLabel);
+  }
   $("pi-connection").hidden = !piMode;
-  $("pi-api-state").textContent = deviceStatusStale
-    ? "Status unavailable"
-    : connectionState === "reconnecting"
-      ? "Pi Reconnecting..."
-      : state?.pi?.api === "online"
-        ? "Online"
-        : "Pi Offline";
-  $("pi-phone-state").textContent = deviceStatusStale
-    ? "Status unavailable"
-    : state?.pi?.phone === "connected"
-      ? "Connected"
-      : state?.pi?.api === "online"
-        ? "Phone Waiting"
-        : "Unknown";
+  uiLiteralText(
+    $("pi-api-state"),
+    deviceStatusStale
+      ? "Status unavailable"
+      : connectionState === "reconnecting"
+        ? "Pi Reconnecting..."
+        : state?.pi?.api === "online"
+          ? "Online"
+          : "Pi Offline",
+  );
+  uiLiteralText(
+    $("pi-phone-state"),
+    deviceStatusStale
+      ? "Status unavailable"
+      : state?.pi?.phone === "connected"
+        ? "Connected"
+        : state?.pi?.api === "online"
+          ? "Phone Waiting"
+          : "Unknown",
+  );
 
   const d = state?.device;
 
   $("resolution").textContent = d
     ? d.normalized
-      ? "Camera-calibrated coordinates"
-      : `${d.width} × ${d.height} · rotation ${d.rotation * 90}°`
+      ? uiLiteral("Camera-calibrated coordinates")
+      : deviceUi(
+          "camera.rotation",
+          `${d.width} × ${d.height} · rotation ${d.rotation * 90}°`,
+          {
+            name: `${d.width} × ${d.height}`,
+            rotation: d.rotation * 90,
+          },
+        )
     : "—";
 
   $("camera-state").textContent = state?.camera?.ready
-    ? `Camera ${state.camera.index} · ${state.camera.width} × ${state.camera.height}`
-    : "Unavailable / starting";
+    ? deviceUi(
+        "camera.current",
+        `Camera ${state.camera.index} · ${state.camera.width} × ${state.camera.height}`,
+        {
+          index: state.camera.index,
+          width: state.camera.width,
+          height: state.camera.height,
+        },
+      )
+    : uiLiteral("Unavailable / starting");
 
   const controllerReady = !!state && connectionState !== "reconnecting";
   const piReady =
@@ -3702,11 +4309,13 @@ function render() {
   );
   renderOperationalRecovery();
 
-  $("frame-state").textContent = fresh()
-    ? "● Live camera"
-    : "Camera feed unavailable";
+  uiLiteralText(
+    $("frame-state"),
+    fresh() ? "● Live camera" : "Camera feed unavailable",
+  );
 
-  $("mode").textContent =
+  uiLiteralText(
+    $("mode"),
     state?.control_status === "automation"
       ? "Automation running"
       : state?.pending
@@ -3717,28 +4326,34 @@ function render() {
             : "Manual control active"
           : state?.enabled && !state?.owned
             ? "Other tab"
-            : "Disabled";
+            : "Disabled",
+  );
 
   $("mode").classList.toggle("active", active());
   $("connection-banner").hidden = connectionState === "connected";
-  $("connection-state").textContent =
-    connectionState === "reconnecting" ? "Reconnecting..." : "Offline";
+  uiLiteralText(
+    $("connection-state"),
+    connectionState === "reconnecting" ? "Reconnecting..." : "Offline",
+  );
   renderKeyboard();
 
   const automation = state?.control_status === "automation";
   $("takeover").hidden = !automation && !state?.pending;
   $("takeover").disabled = busy || !!state?.pending || !state?.device;
-  $("control-help").textContent = automation
-    ? dashboardMode === "operate"
-      ? "Phone controls are unavailable while automation owns the phone."
-      : "Manual control disabled. Camera monitoring remains available. Use Take Over to interrupt automation."
-    : state?.pending
-      ? "Takeover requested. Manual input stays disabled until automation yields."
-      : dashboardMode === "operate"
-        ? active()
-          ? "Click the phone preview to tap or drag to swipe."
-          : "Start manual control to use the phone preview, Back, and Home."
-        : "Enable control when you are ready. Each click sends one tap to the phone.";
+  uiLiteralText(
+    $("control-help"),
+    automation
+      ? dashboardMode === "operate"
+        ? "Phone controls are unavailable while automation owns the phone."
+        : "Manual control disabled. Camera monitoring remains available. Use Take Over to interrupt automation."
+      : state?.pending
+        ? "Takeover requested. Manual input stays disabled until automation yields."
+        : dashboardMode === "operate"
+          ? active()
+            ? "Click the phone preview to tap or drag to swipe."
+            : "Start manual control to use the phone preview, Back, and Home."
+          : "Enable control when you are ready. Each click sends one tap to the phone.",
+  );
 
   $("enable").hidden = dashboardMode === "operate" && active();
 
@@ -3755,10 +4370,8 @@ function render() {
   $("calibrate").disabled = busy || !fresh() || !state?.device;
 
   $("cal-state").textContent = calibrating
-    ? `${corners.length}/4 selected`
-    : state?.calibrated
-      ? "Saved"
-      : "Required";
+    ? `${corners.length}/4 ${uiLiteral("selected")}`
+    : uiLiteral(state?.calibrated ? "Saved" : "Required");
 
   $("undo").disabled = !calibrating || !corners.length || busy;
 
@@ -3770,7 +4383,7 @@ function render() {
     button.disabled = !active() || busy || physicalBusy || !supported;
     button.title = supported
       ? ""
-      : "This action is not provided by the Pi API.";
+      : uiLiteral("This action is not provided by the Pi API.");
   });
 
   document.querySelectorAll("#corner-list li").forEach((item, i) => {
@@ -3780,17 +4393,29 @@ function render() {
 
   canvas.classList.toggle("interactive", calibrating || active());
 
-  $("instruction").textContent = calibrating
-    ? corners.length < 4
-      ? `Click the phone display’s ${names[corners.length]} corner.`
-      : "Check the outline, then save calibration."
-    : active()
-      ? dashboardMode === "operate"
-        ? "Click to tap or drag to swipe inside the outlined display."
-        : "Click inside the outlined display to send one tap."
-      : dashboardMode === "operate"
-        ? "Start manual control when you are ready."
-        : "Input disabled. Calibrate, then enable Manual Control.";
+  uiLiteralText(
+    $("instruction"),
+    calibrating
+      ? corners.length < 4
+        ? deviceUi(
+            "camera.clickCorner",
+            `Click the phone display’s ${names[corners.length]} corner.`,
+            {
+              corner: deviceUi(
+                `camera.corner.${names[corners.length]}`,
+                names[corners.length],
+              ),
+            },
+          )
+        : "Check the outline, then save calibration."
+      : active()
+        ? dashboardMode === "operate"
+          ? "Click to tap or drag to swipe inside the outlined display."
+          : "Click inside the outlined display to send one tap."
+        : dashboardMode === "operate"
+          ? "Start manual control when you are ready."
+          : "Input disabled. Calibrate, then enable Manual Control.",
+  );
 }
 
 function activePreviewCrop() {
@@ -4111,7 +4736,14 @@ async function refreshStatus() {
     if (version !== controlVersion) return;
     if (!error.transient) {
       manual = false;
-      notice(`Backend unavailable: ${error.message}`, true);
+      notice(
+        deviceUi(
+          "error.backendUnavailable",
+          `Backend unavailable: ${error.message}`,
+          { message: uiError(error.message) },
+        ),
+        true,
+      );
     }
     render();
   } finally {
@@ -4266,7 +4898,7 @@ async function videoLoop() {
         api("/api/control", { enabled: false }).catch(() => {});
       }
 
-      $("video-placeholder").textContent = error.message;
+      $("video-placeholder").textContent = uiError(error.message);
       $("video-placeholder").classList.remove("hidden");
 
       render();
@@ -4446,7 +5078,9 @@ function manualApi(path, data) {
       render();
       await window.phoneRecorder?.manualFailed?.(error);
       if (error.transient)
-        error.message = `${error.message} Action result uncertain; it was not retried automatically.`;
+        error.message = `${error.message} ${uiLiteral(
+          "Action result uncertain; it was not retried automatically.",
+        )}`;
       throw error;
     },
   );
@@ -4804,6 +5438,13 @@ $("dashboard-admin").addEventListener("click", () => {
   void switchDashboardMode("admin");
 });
 
+window.addEventListener?.("phonecontroller:languagechange", () => {
+  renderControllerTag();
+  renderDevices();
+  renderOperationalRecovery();
+  render();
+});
+
 $("diagnostics-refresh").addEventListener(
   "click",
   () => void loadDiagnostics(),
@@ -4860,7 +5501,15 @@ async function loadStatus() {
     if (pi.api === "offline")
       beginReconnect(new Error(pi.message || "Pi temporarily unavailable."));
   } catch (error) {
-    if (!error.transient) notice(`Backend unavailable: ${error.message}`, true);
+    if (!error.transient)
+      notice(
+        deviceUi(
+          "error.backendUnavailable",
+          `Backend unavailable: ${error.message}`,
+          { message: uiError(error.message) },
+        ),
+        true,
+      );
   }
   await refreshStatus();
   if (state?.manual_backend === "raspberry_pi") await loadDevices();

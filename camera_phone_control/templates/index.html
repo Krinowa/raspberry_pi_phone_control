@@ -28,6 +28,8 @@
       src="{{ url_for('static', filename='phone_gestures.js') }}"
     ></script>
 
+    <script defer src="{{ url_for('static', filename='i18n.js') }}"></script>
+
     <script defer src="{{ url_for('static', filename='app.js') }}"></script>
 
     <script
@@ -48,9 +50,16 @@
           <h1>Local control</h1>
         </div>
 
-        <span id="controller-tag" class="local-tag"
-          >● Checking controller…</span
-        >
+        <div class="header-controls">
+          <label for="language-selector">Language</label>
+          <select id="language-selector" aria-label="Language">
+            <option value="en">English</option>
+            <option value="zh-HK">繁體中文（香港）</option>
+          </select>
+          <span id="controller-tag" class="local-tag"
+            >● Checking controller…</span
+          >
+        </div>
       </header>
 
       <nav class="dashboard-tabs" aria-label="Dashboard mode">
