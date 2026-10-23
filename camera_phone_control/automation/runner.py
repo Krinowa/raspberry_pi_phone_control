@@ -5,7 +5,7 @@ import logging
 import signal
 import threading
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from android_control import AndroidControl, DeviceError
@@ -41,6 +41,8 @@ class RunState:
     step_id: str | None = None
     step_count: int = 0
     checkpoint_message: str | None = None
+    error_code: str | None = None
+    error_params: dict = field(default_factory=dict)
 
     @property
     def exit_code(self):
@@ -120,6 +122,7 @@ class Runner:
             if script is None:
                 state.status = "failed"
                 state.message = "Unknown script. Use --list to see available scripts."
+                state.error_code = "workflow_not_found"
                 return state
 
             if cancel_event.is_set():
@@ -200,10 +203,14 @@ class Runner:
         except DeviceBusy as exc:
             state.status = "failed"
             state.message = f"Device busy ({exc.owner}). No further input sent."
+            state.error_code = "device_busy"
+            state.error_params = {"owner": exc.owner}
         except PiApiError as exc:
             state.status = "failed"
             # PiApiClient messages exclude payloads and describe uncertain input.
             state.message = str(exc)
+            state.error_code = getattr(exc, "error_code", None)
+            state.error_params = getattr(exc, "error_params", {})
         except DeviceError as exc:
             state.status = "failed"
             # Discovery happens before scripts receive any input. Runtime exceptions
@@ -216,9 +223,11 @@ class Runner:
                     "phone geometry. An input may have occurred; it will not be retried."
                 )
             )
+            state.error_code = "device_command_failed"
         except (UnsupportedOperation, ScreenStabilityError, ScreenStateError) as exc:
             state.status = "failed"
             state.message = str(exc)
+            state.error_code = "workflow_failed"
         except (Exception, SystemExit):
             state.status = "failed"
             state.message = (
@@ -226,6 +235,7 @@ class Runner:
                 if stage == "locking"
                 else "Script failed. Check the script implementation at the reported step; no retry attempted."
             )
+            state.error_code = "workflow_failed"
         finally:
             if acquired:
                 self.logger.info(

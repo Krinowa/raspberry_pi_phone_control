@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from flask import jsonify, request
 
+from automation.error_codes import error_fields, exception_error_fields
 from automation.workflows.validation import resolve_variables
 
 from .executor import BackgroundJobExecutor
@@ -48,6 +49,12 @@ def register_jobs(
 
     def public_job(job):
         result = scheduler.public(job)
+        if result.get("error"):
+            result.setdefault("error_code", "workflow_failed")
+            result.setdefault("error_params", {})
+        if result.get("recovery_error"):
+            result.setdefault("recovery_error_code", "workflow_recovery_failed")
+            result.setdefault("recovery_error_params", {})
         manager = app.extensions.get("withdraw_manager")
         if manager is not None:
             result.update(manager.job_withdrawal_state(job))
@@ -55,16 +62,23 @@ def register_jobs(
 
     @app.errorhandler(RecordNotFound)
     def missing_record(exc):
-        return jsonify(ok=False, error="Record not found."), 404
+        return (
+            jsonify(**error_fields("Record not found.", "record_not_found", ok=False)),
+            404,
+        )
 
     @app.errorhandler(RecordConflict)
     def conflicting_record(exc):
-        return jsonify(ok=False, error=str(exc)), 409
+        return jsonify(**exception_error_fields(exc, ok=False)), 409
 
     def ensure_registered_device(device_id):
         if state.pi_bridge is None:
             if device_id not in {workflow_service.device_id, "phone_A"}:
-                raise RecordConflict("Device is not registered.")
+                raise RecordConflict(
+                    "Device is not registered.",
+                    "device_unavailable",
+                    {"device_id": device_id},
+                )
             return
         with state.lock:
             registered = device_id in state.pi_devices
@@ -76,7 +90,11 @@ def register_jobs(
                 state.pi_catalog_initialized = True
                 registered = device_id in state.pi_devices
         if not registered:
-            raise RecordConflict("Device is not registered.")
+            raise RecordConflict(
+                "Device is not registered.",
+                "device_unavailable",
+                {"device_id": device_id},
+            )
 
     app.extensions["ensure_registered_device"] = ensure_registered_device
 

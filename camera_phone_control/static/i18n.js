@@ -238,6 +238,26 @@
     "status.FAILED": "FAILED",
     "status.INTERRUPTED": "INTERRUPTED",
     "status.CANCELLED": "CANCELLED",
+    "status.COMPLETED": "Completed",
+    "status.NEEDS_ATTENTION": "Needs Attention",
+    "status.READY": "Ready",
+    "status.RECOVERING": "Recovering",
+    "status.IDLE": "Idle",
+    "status.BUSY": "Busy",
+    "status.STARTING": "Starting",
+    "status.CONNECTING": "Connecting",
+    "status.WAITING_FOR_CONNECTION": "Waiting for Connection",
+    "status.DISCONNECTED": "Disconnected",
+    "status.AUTH_FAILED": "Authentication Required",
+    "status.CONFIGURATION_ERROR": "Configuration Required",
+    "status.UNKNOWN": "Unknown",
+    "status.VALID": "Valid",
+    "status.REFRESHING": "Refreshing",
+    "status.STALE": "Stale",
+    "status.ERROR": "Error",
+    "status.STOPPED": "Stopped",
+    "status.PAYING": "Paying",
+    "status.CONFIRMING": "Confirming",
     "status.passed": "passed",
     "status.failed": "failed",
     "status.cancelled": "cancelled",
@@ -311,13 +331,13 @@
     "app.eyebrow": "手機控制／外置相機",
     "app.localControl": "本機控制",
     "nav.dashboardMode": "控制台模式",
-    "nav.operate": "操作",
-    "nav.admin": "管理",
+    "nav.operate": "操作模式",
+    "nav.admin": "管理模式",
     "common.checking": "檢查中…",
     "common.starting": "啟動中…",
     "common.loading": "載入中…",
     "common.available": "可用",
-    "common.unavailable": "無法使用",
+    "common.unavailable": "暫時無法取得",
     "common.disabled": "已停用",
     "common.unassigned": "未指派",
     "common.connected": "已連線",
@@ -440,7 +460,7 @@
     "withdraw.changeAccount": "更改帳戶",
     "withdraw.reconnect": "重新連線",
     "withdraw.reconnecting": "重新連線中…",
-    "withdraw.authRequired": "需要驗證",
+    "withdraw.authRequired": "需要重新驗證",
     "withdraw.configRequired": "需要設定",
     "withdraw.cancel": "取消提款",
     "withdraw.cancelling": "正在取消提款…",
@@ -532,6 +552,26 @@
     "status.FAILED": "失敗",
     "status.INTERRUPTED": "已中斷",
     "status.CANCELLED": "已取消",
+    "status.COMPLETED": "已完成",
+    "status.NEEDS_ATTENTION": "需要處理",
+    "status.READY": "就緒",
+    "status.RECOVERING": "復原中",
+    "status.IDLE": "閒置",
+    "status.BUSY": "忙碌中",
+    "status.STARTING": "啟動中",
+    "status.CONNECTING": "連線中",
+    "status.WAITING_FOR_CONNECTION": "等待連線",
+    "status.DISCONNECTED": "已中斷連線",
+    "status.AUTH_FAILED": "需要重新驗證",
+    "status.CONFIGURATION_ERROR": "需要設定",
+    "status.UNKNOWN": "未知",
+    "status.VALID": "有效",
+    "status.REFRESHING": "更新中",
+    "status.STALE": "資料已過時",
+    "status.ERROR": "錯誤",
+    "status.STOPPED": "已停止",
+    "status.PAYING": "付款中",
+    "status.CONFIRMING": "確認中",
     "status.passed": "已通過",
     "status.failed": "失敗",
     "status.cancelled": "已取消",
@@ -592,6 +632,73 @@
   };
 
   Object.assign(en, {
+    "workflow.roi.enable": "Use Region OCR",
+    "workflow.roi.instructions":
+      "Select on the calibrated current screen snapshot; refresh after the phone screen changes.",
+    "workflow.roi.selectCurrent": "Select on Current Screen",
+    "workflow.roi.clear": "Clear OCR Region",
+    "workflow.roi.width": "Width",
+    "workflow.roi.height": "Height",
+    "workflow.roi.test": "Test ROI OCR",
+    "backendError.pi_api_timeout": "Pi API {path} timed out.",
+    "backendError.pi_api_no_socket":
+      "Pi API {path} connected without a socket.",
+    "backendError.pi_api_http_error": "Pi API {path} returned HTTP {status}.",
+    "backendError.pi_api_response_too_large":
+      "Pi API response exceeded the size limit.",
+    "backendError.pi_api_invalid_json": "Pi API {path} returned invalid JSON.",
+    "backendError.pi_api_invalid_response":
+      "Pi API {path} returned an invalid response.",
+    "backendError.pi_api_rejected":
+      "Pi rejected {path}. Check the Pi service and phone connection.",
+    "backendError.pi_api_rejected_hid":
+      "Pi rejected {path}. Check the Bluetooth HID connection to the phone.",
+    "backendError.pi_api_unreachable":
+      "Cannot reach Pi API for {path}. Check the Pi address and private Wi-Fi.",
+    "backendError.pi_api_invalid_status":
+      "Pi /status returned an invalid response.",
+    "backendError.camera_device_required": "Choose a device first.",
+    "backendError.camera_unavailable": "The camera is unavailable.",
+    "backendError.camera_frame_unavailable": "No camera frame is available.",
+    "backendError.camera_selection_changed":
+      "The selected camera changed. Please try again.",
+    "backendError.camera_operation_failed": "The camera operation failed.",
+    "backendError.camera_preview_failed": "The camera preview failed.",
+    "backendError.calibration_missing":
+      "Camera calibration is missing for {device_id}.",
+    "backendError.device_unavailable": "Device {device_id} is unavailable.",
+    "backendError.device_busy": "The device is busy ({owner}).",
+    "backendError.device_command_failed": "The device command failed.",
+    "backendError.device_not_ready": "The device is not ready.",
+    "backendError.authentication_required": "Log in again to continue.",
+    "backendError.session_expired": "Your session expired. Log in again.",
+    "backendError.invalid_credentials":
+      "The username or password is incorrect.",
+    "backendError.invalid_authentication_code":
+      "The authentication code is invalid.",
+    "backendError.rate_limited": "Too many attempts. Please try again later.",
+    "backendError.account_assignment_required":
+      "Assign and enable an account first.",
+    "backendError.balance_workflow_failed":
+      "The Balance Check Workflow is unavailable.",
+    "backendError.balance_unknown": "The payer balance is unavailable.",
+    "backendError.payment_readiness_failed": "Payment is not ready.",
+    "backendError.withdrawal_state_unresolved":
+      "The withdrawal needs attention before continuing.",
+    "backendError.withdrawal_cancel_uncertain":
+      "The cancellation result is uncertain. Reconciliation is required.",
+    "backendError.retry_blocked": "This job cannot be retried yet.",
+    "backendError.workflow_not_found": "Workflow not found.",
+    "backendError.workflow_failed": "The workflow failed.",
+    "backendError.workflow_recovery_failed": "Phone recovery failed.",
+    "backendError.workflow_screen_failed":
+      "The workflow could not read the phone screen.",
+    "backendError.ocr_busy": "OCR is busy. Please try again shortly.",
+    "backendError.record_not_found": "Record not found.",
+    "backendError.same_origin_required": "A same-origin request is required.",
+    "backendError.invalid_control_token": "The control session is invalid.",
+    "backendError.json_request_required": "A JSON request is required.",
+    "backendError.dashboard_request_failed": "The dashboard request failed.",
     "ui.automations": "Automations",
     "ui.jobHistory": "Job History",
     "ui.diagnostics": "Diagnostics / Logs",
@@ -659,6 +766,62 @@
     "ui.dashboardModeLabel": "Dashboard mode",
   });
   Object.assign(zhHK, {
+    "workflow.roi.enable": "啟用區域 OCR",
+    "workflow.roi.instructions":
+      "請在目前已校正的螢幕截圖上選取區域；手機畫面變更後請重新整理。",
+    "workflow.roi.selectCurrent": "在目前畫面上選取",
+    "workflow.roi.clear": "清除 OCR 區域",
+    "workflow.roi.width": "寬度",
+    "workflow.roi.height": "高度",
+    "workflow.roi.test": "測試 ROI OCR",
+    "backendError.pi_api_timeout": "Pi API {path} 請求逾時。",
+    "backendError.pi_api_no_socket":
+      "Pi API {path} 已連線，但沒有可用的通訊端。",
+    "backendError.pi_api_http_error": "Pi API {path} 傳回 HTTP {status}。",
+    "backendError.pi_api_response_too_large": "Pi API 回應超出大小限制。",
+    "backendError.pi_api_invalid_json": "Pi API {path} 傳回無效的 JSON。",
+    "backendError.pi_api_invalid_response": "Pi API {path} 傳回無效回應。",
+    "backendError.pi_api_rejected":
+      "Pi 拒絕 {path}。請檢查 Pi 服務及手機連線。",
+    "backendError.pi_api_rejected_hid":
+      "Pi 拒絕 {path}。請檢查手機的 Bluetooth HID 連線。",
+    "backendError.pi_api_unreachable":
+      "無法連接 {path} 的 Pi API。請檢查 Pi 位址及私人 Wi-Fi。",
+    "backendError.pi_api_invalid_status": "Pi /status 傳回無效回應。",
+    "backendError.camera_device_required": "請先選擇裝置。",
+    "backendError.camera_unavailable": "相機無法使用。",
+    "backendError.camera_frame_unavailable": "沒有可用的相機畫面。",
+    "backendError.camera_selection_changed": "所選相機已變更，請再試一次。",
+    "backendError.camera_operation_failed": "相機操作失敗。",
+    "backendError.camera_preview_failed": "相機預覽失敗。",
+    "backendError.calibration_missing": "裝置 {device_id} 尚未完成相機校準。",
+    "backendError.device_unavailable": "裝置 {device_id} 無法使用。",
+    "backendError.device_busy": "裝置正忙碌（{owner}）。",
+    "backendError.device_command_failed": "裝置指令執行失敗。",
+    "backendError.device_not_ready": "裝置尚未就緒。",
+    "backendError.authentication_required": "請重新登入以繼續。",
+    "backendError.session_expired": "登入時段已過期，請重新登入。",
+    "backendError.invalid_credentials": "用戶名稱或密碼不正確。",
+    "backendError.invalid_authentication_code": "驗證碼無效。",
+    "backendError.rate_limited": "嘗試次數過多，請稍後再試。",
+    "backendError.account_assignment_required": "請先指派並啟用帳戶。",
+    "backendError.balance_workflow_failed": "餘額檢查工作流程無法使用。",
+    "backendError.balance_unknown": "付款人餘額無法使用。",
+    "backendError.payment_readiness_failed": "付款尚未就緒。",
+    "backendError.withdrawal_state_unresolved": "提款狀態需要處理後才能繼續。",
+    "backendError.withdrawal_cancel_uncertain":
+      "取消結果未能確定，需要進行核對。",
+    "backendError.retry_blocked": "此工作目前無法重試。",
+    "backendError.workflow_not_found": "找不到工作流程。",
+    "backendError.workflow_failed": "工作流程執行失敗。",
+    "backendError.workflow_recovery_failed": "手機復原失敗。",
+    "backendError.workflow_screen_failed": "工作流程無法讀取手機畫面。",
+    "backendError.ocr_busy": "OCR 正在忙碌，請稍後再試。",
+    "backendError.record_not_found": "找不到記錄。",
+    "backendError.same_origin_required": "必須使用同源請求。",
+    "backendError.invalid_control_token": "控制時段無效。",
+    "backendError.json_request_required": "必須使用 JSON 請求。",
+    "backendError.dashboard_request_failed": "儀表板請求失敗。",
     "ui.automations": "自動化",
     "ui.jobHistory": "工作記錄",
     "ui.diagnostics": "診斷／記錄",
@@ -930,9 +1093,9 @@
     "Secure input belongs on the phone. Avoid typing sensitive values while recording.":
       "敏感資料應在手機上安全輸入；錄製期間請避免輸入敏感資料。",
     "Select issue": "選擇問題",
-    "Select on Current Screen": "在目前畫面選擇",
+    "Select on Current Screen": "在目前畫面上選取",
     "Select on the calibrated current screen snapshot; refresh after the phone screen changes.":
-      "在已校正的目前畫面快照上選擇；手機畫面變更後請更新快照。",
+      "請在目前已校正的螢幕截圖上選取區域；手機畫面變更後請重新整理。",
     "Sometimes something extra appears here. Record what to do when it does.":
       "如這裡有時會出現額外內容，請錄製出現時要執行的操作。",
     "Start Recording": "開始錄製",
@@ -944,7 +1107,7 @@
       "已錄製的值會被移除。播放時會暫停，讓你在手機上完成此步驟。",
     "Top-left": "左上角",
     "Top-right": "右上角",
-    "Use Region OCR": "使用區域 OCR",
+    "Use Region OCR": "啟用區域 OCR",
     "Use only for keyboards whose key positions stay the same between runs. Do not use this for PIN, OTP, password, randomized, or authorization keypads.":
       "只適用於每次執行時按鍵位置不變的鍵盤。請勿用於 PIN、OTP、密碼、隨機排列或授權鍵盤。",
     "Use this input as": "將此輸入用作",
@@ -1064,7 +1227,7 @@
     "Choose expected text": "選擇預期文字",
     "Use Region": "使用區域",
     "Clear OCR Region": "清除 OCR 區域",
-    "Test ROI OCR": "測試區域 OCR",
+    "Test ROI OCR": "測試 ROI OCR",
     "Wait duration (seconds)": "等待時間（秒）",
     "Wait up to": "最多等待",
     "Check for up to": "最多檢查",
@@ -1373,6 +1536,27 @@
     "Logs copied.": "已複製記錄。",
     "Copy is not available in this browser.": "此瀏覽器不支援複製功能。",
     "Collecting recent OCR performance samples.": "正在收集近期 OCR 效能樣本。",
+    "Current pool exceeds the detected hardware safety ceiling.":
+      "目前的工作程序池超出偵測到的硬件安全上限。",
+    "Sustained CPU saturation and slow OCR inference indicate contention.":
+      "CPU 持續飽和且 OCR 推理緩慢，顯示資源出現競爭。",
+    "Current workers already match the hardware safety ceiling.":
+      "目前的工作程序數目已達硬件安全上限。",
+    "CPU headroom is too low to add another OCR worker.":
+      "CPU 可用容量不足，無法新增 OCR 工作程序。",
+    "Memory headroom is too low to add another OCR worker.":
+      "記憶體可用容量不足，無法新增 OCR 工作程序。",
+    "OCR queue pressure is low.": "OCR 佇列壓力偏低。",
+    "Workers are frequently idle despite recent queue delay.":
+      "儘管近期佇列有延遲，工作程序仍經常處於閒置狀態。",
+    "Inference slowed after the last increase without enough queue improvement.":
+      "上次增加工作程序後推理速度變慢，而佇列情況未有足夠改善。",
+    "Sustained OCR queue wait has available CPU and memory headroom.":
+      "OCR 佇列持續等候，但 CPU 及記憶體仍有可用容量。",
+    "CPU usage is elevated; keep the current worker count.":
+      "CPU 使用量偏高；請維持目前的工作程序數目。",
+    "Workflow completed.": "工作流程已完成。",
+    "Workflow cancelled.": "工作流程已取消。",
     "Withdrawal recovery requires attention.": "提款復原需要處理。",
     "This phone needs attention.": "此手機需要處理。",
     "Retry queued from the selected failed step.": "已從所選失敗步驟排入重試。",
@@ -1496,6 +1680,9 @@
     "ocr.health": "Healthy · {count} {worker} · Queue {queue}",
     "ocr.worker.one": "worker",
     "ocr.worker.many": "workers",
+    "ocr.workerStatus": "Worker {number} — {state}",
+    "ocr.poolClamped":
+      "Configured OCR worker pool size {configured} exceeds the detected safe ceiling {ceiling}; started {started} worker(s). The stored setting was not changed.",
     "jobs.queuePosition": "{status} · queue {position}",
     "workflow.afterStep": "After {number}. {step}",
     "error.ocrStatus": "OCR status unavailable: {message}",
@@ -1548,6 +1735,9 @@
     "ocr.health": "正常 · {count} 個工作程序 · 佇列 {queue}",
     "ocr.worker.one": "個工作程序",
     "ocr.worker.many": "個工作程序",
+    "ocr.workerStatus": "工作程序 {number} — {state}",
+    "ocr.poolClamped":
+      "設定的 OCR 工作程序池大小 {configured} 超出偵測到的安全上限 {ceiling}；已啟動 {started} 個工作程序。已儲存的設定未有更改。",
     "jobs.queuePosition": "{status} · 佇列位置 {position}",
     "workflow.afterStep": "在第 {number} 步「{step}」之後",
     "error.ocrStatus": "無法取得 OCR 狀態：{message}",
@@ -1608,7 +1798,37 @@
 
   function t(key, params) {
     const value = dictionaries[locale]?.[key] ?? en[key] ?? key;
-    return interpolate(value, params);
+    return interpolate(decodeNumericEntities(value), params);
+  }
+
+  function hasTranslation(key) {
+    return Object.prototype.hasOwnProperty.call(en, key);
+  }
+
+  function translateStatus(status) {
+    if (typeof status !== "string" || !status) return status;
+    const key = `status.${status}`;
+    return hasTranslation(key) ? t(key) : status;
+  }
+
+  function decodeNumericEntities(value) {
+    return value.replace(
+      /&#(?:x([0-9a-f]+)|(\d+));/gi,
+      (entity, hex, decimal) => {
+        const codePoint = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
+        if (
+          !Number.isInteger(codePoint) ||
+          codePoint < 0 ||
+          codePoint > 0x10ffff
+        )
+          return entity;
+        try {
+          return String.fromCodePoint(codePoint);
+        } catch {
+          return entity;
+        }
+      },
+    );
   }
 
   function translateEnglish(source) {
@@ -1618,78 +1838,23 @@
     return source;
   }
 
+  function translateBackendError(errorCode, errorParams, fallback) {
+    if (typeof errorCode !== "string" || !errorCode) return fallback;
+    const key = `backendError.${errorCode}`;
+    if (!Object.prototype.hasOwnProperty.call(en, key)) return fallback;
+    const translated = t(key, errorParams);
+    return errorParams?.input_may_have_occurred
+      ? translated + t("error.physicalMayHaveOccurred")
+      : translated;
+  }
+
   function translateError(source) {
     if (typeof source !== "string" || !source) return source;
-    const uncertainSuffix = " Input may have occurred; no retry attempted.";
-    const hasUncertainSuffix = source.endsWith(uncertainSuffix);
-    const message = hasUncertainSuffix
-      ? source.slice(0, -uncertainSuffix.length)
-      : source;
-    const patterns = [
-      [
-        /^Pi API (\S+) timed out\.$/,
-        "error.piApiTimeout",
-        ([, path]) => ({ path }),
-      ],
-      [
-        /^Pi API (\S+) connected without a socket\.$/,
-        "error.piApiNoSocket",
-        ([, path]) => ({ path }),
-      ],
-      [
-        /^Pi API (\S+) returned HTTP (\d{3})\.$/,
-        "error.piApiHttp",
-        ([, path, status]) => ({ path, status }),
-      ],
-      [
-        /^Pi API response exceeded the size limit\.$/,
-        "error.piApiTooLarge",
-        () => ({}),
-      ],
-      [
-        /^Pi API (\S+) returned invalid JSON\.$/,
-        "error.piApiInvalidJson",
-        ([, path]) => ({ path }),
-      ],
-      [
-        /^Pi API (\S+) returned an invalid response \(expected boolean ok\)\.$/,
-        "error.piApiInvalidResponse",
-        ([, path]) => ({ path }),
-      ],
-      [
-        /^Pi rejected (\S+)\. Check the Pi service and phone connection\.$/,
-        "error.piRejectedService",
-        ([, path]) => ({ path }),
-      ],
-      [
-        /^Pi rejected (\S+)\. Check the Bluetooth HID connection to the phone\.$/,
-        "error.piRejectedHid",
-        ([, path]) => ({ path }),
-      ],
-      [
-        /^Cannot reach Pi API for (\S+)\. Check the Pi address and private Wi-Fi\.$/,
-        "error.piApiUnreachable",
-        ([, path]) => ({ path }),
-      ],
-      [
-        /^Pi \/status response is missing boolean connected\.$/,
-        "error.piStatusInvalid",
-        () => ({}),
-      ],
-    ];
-    for (const [pattern, key, params] of patterns) {
-      const match = message.match(pattern);
-      if (!match) continue;
-      return (
-        t(key, params(match)) +
-        (hasUncertainSuffix ? t("error.physicalMayHaveOccurred") : "")
-      );
-    }
-    if (/^The operation was aborted due to timeout\.?$/i.test(message))
+    if (/^The operation was aborted due to timeout\.?$/i.test(source))
       return t("error.browserTimeout");
     if (
       /^(?:Failed to fetch|Load failed|Network request failed|NetworkError when attempting to fetch resource\.)$/i.test(
-        message,
+        source,
       )
     )
       return t("error.networkRequestFailed");
@@ -1728,7 +1893,9 @@
     const walker = doc.createTreeWalker(doc.body, root.NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
-      const trimmed = node.nodeValue.trim().replace(/\s+/g, " ");
+      const trimmed = decodeNumericEntities(node.nodeValue)
+        .trim()
+        .replace(/\s+/g, " ");
       const key = staticTextKeys.get(trimmed);
       if (!key) continue;
       const leading = node.nodeValue.match(/^\s*/)?.[0] || "";
@@ -1840,7 +2007,10 @@
     getLocale: () => locale,
     setLocale,
     t,
+    hasTranslation,
+    translateStatus,
     translateEnglish,
+    translateBackendError,
     translateError,
     bindText,
     bindComputedText,

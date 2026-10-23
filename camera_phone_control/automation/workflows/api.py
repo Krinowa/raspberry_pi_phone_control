@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 from flask import jsonify, request
 
+from automation.error_codes import error_fields
+
 from ..backends import backend_names, select_device
 from ..context import AutomationContext
 from ..coordinates import normalized_roi
@@ -151,7 +153,7 @@ def register_workflows(
         try:
             return jsonify(ocr_settings.restart())
         except OCRPoolBusy as exc:
-            return jsonify(ok=False, error=str(exc)), 409
+            return jsonify(**error_fields(str(exc), "ocr_busy", ok=False)), 409
 
     # Bounded, short-lived calibrated snapshots: testing uses exactly the image
     # displayed in the picker, even if the live phone changes meanwhile.
@@ -371,11 +373,11 @@ def register_workflows(
 
     @app.errorhandler(FileNotFoundError)
     def missing_file(exc):
-        return jsonify(error="Workflow not found."), 404
+        return jsonify(**error_fields("Workflow not found.", "workflow_not_found")), 404
 
     @app.errorhandler(ScreenStateError)
     def screen_state_error(exc):
-        return jsonify(error=str(exc)), 503
+        return jsonify(**error_fields(str(exc), "workflow_screen_failed")), 503
 
     def run_snapshot(run_id):
         try:

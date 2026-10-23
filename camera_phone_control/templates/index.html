@@ -2149,20 +2149,30 @@ Select Refresh Logs to load recent activity.</pre
         <template id="region-ocr-template">
           <div class="region-ocr-picker">
             <label
-              ><input data-roi-control="enabled" type="checkbox" /> Use Region
-              OCR</label
+              ><input data-roi-control="enabled" type="checkbox" />
+              <span data-roi-i18n="workflow.roi.enable"
+                >Use Region OCR</span
+              ></label
             >
 
-            <p>
+            <p data-roi-i18n="workflow.roi.instructions">
               Select on the calibrated current screen snapshot; refresh after
               the phone screen changes.
             </p>
 
-            <button data-roi-control="refresh" type="button">
+            <button
+              data-roi-control="refresh"
+              data-roi-i18n="workflow.roi.selectCurrent"
+              type="button"
+            >
               Select on Current Screen
             </button>
 
-            <button data-roi-control="clear" type="button">
+            <button
+              data-roi-control="clear"
+              data-roi-i18n="workflow.roi.clear"
+              type="button"
+            >
               Clear OCR Region
             </button>
 
@@ -2175,7 +2185,7 @@ Select Refresh Logs to load recent activity.</pre
 
             <div class="row">
               <label
-                >x
+                >X
 
                 <input
                   data-roi-control="x"
@@ -2186,7 +2196,7 @@ Select Refresh Logs to load recent activity.</pre
               /></label>
 
               <label
-                >y
+                >Y
 
                 <input
                   data-roi-control="y"
@@ -2197,7 +2207,7 @@ Select Refresh Logs to load recent activity.</pre
               /></label>
 
               <label
-                >width
+                ><span data-roi-i18n="workflow.roi.width">Width</span>
 
                 <input
                   data-roi-control="width"
@@ -2208,7 +2218,7 @@ Select Refresh Logs to load recent activity.</pre
               /></label>
 
               <label
-                >height
+                ><span data-roi-i18n="workflow.roi.height">Height</span>
 
                 <input
                   data-roi-control="height"
@@ -2221,7 +2231,13 @@ Select Refresh Logs to load recent activity.</pre
 
             <output data-roi-control="values" aria-live="polite"></output>
 
-            <button data-roi-control="test" type="button">Test ROI OCR</button>
+            <button
+              data-roi-control="test"
+              data-roi-i18n="workflow.roi.test"
+              type="button"
+            >
+              Test ROI OCR
+            </button>
 
             <p data-roi-control="result" role="status"></p>
           </div>

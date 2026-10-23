@@ -491,9 +491,24 @@ class WithdrawManager:
             status.update(
                 payment_ready=payment_ready,
                 payment_readiness_error=payment_readiness_error,
+                payment_readiness_error_code=(
+                    "payment_readiness_failed" if payment_readiness_error else None
+                ),
+                payment_readiness_error_params={},
                 balance_workflow_ready=balance_ready,
                 balance_workflow_error=balance_readiness_error,
+                balance_workflow_error_code=(
+                    "balance_workflow_failed" if balance_readiness_error else None
+                ),
+                balance_workflow_error_params={},
             )
+
+            if status.get("error"):
+                status.setdefault("error_code", "withdrawal_state_unresolved")
+                status.setdefault("error_params", {})
+            if status.get("balance_error"):
+                status.setdefault("balance_error_code", "balance_unknown")
+                status.setdefault("balance_error_params", {})
 
             return status
 
@@ -512,6 +527,8 @@ class WithdrawManager:
             "reconciliation_complete": False,
             "authentication_available": False,
             "error": record.get("error") if blocked else None,
+            "error_code": "withdrawal_state_unresolved" if blocked else None,
+            "error_params": {},
             "physical_socket_connected": self.realtime_transport.physical_connected,
             "phase": record.get("phase"),
             "job_id": record.get("job_id"),
@@ -524,8 +541,16 @@ class WithdrawManager:
             "cancel_allowed": False,
             "payment_ready": payment_ready,
             "payment_readiness_error": payment_readiness_error,
+            "payment_readiness_error_code": (
+                "payment_readiness_failed" if payment_readiness_error else None
+            ),
+            "payment_readiness_error_params": {},
             "balance_workflow_ready": balance_ready,
             "balance_workflow_error": balance_readiness_error,
+            "balance_workflow_error_code": (
+                "balance_workflow_failed" if balance_readiness_error else None
+            ),
+            "balance_workflow_error_params": {},
         }
 
     def payment_readiness(self, device_id):
@@ -1385,7 +1410,8 @@ class WithdrawManager:
         ):
 
             raise RecordConflict(
-                "Enable and assign a valid Withdraw account before reconnecting."
+                "Enable and assign a valid Withdraw account before reconnecting.",
+                "account_assignment_required",
             )
 
         with self.lock:
@@ -1396,13 +1422,15 @@ class WithdrawManager:
 
                 raise RecordConflict(
                     "Withdraw authentication is not active. Use Login Again and enter "
-                    "your password and a fresh 6-digit Google 2FA code."
+                    "your password and a fresh 6-digit Google 2FA code.",
+                    "authentication_required",
                 )
 
             if not worker.authentication_available():
                 raise RecordConflict(
                     "Withdraw authentication expired. Use Login Again and enter your "
-                    "password and a fresh 6-digit Google 2FA code."
+                    "password and a fresh 6-digit Google 2FA code.",
+                    "session_expired",
                 )
 
             worker.request_reconnect(force_reauthentication=False)
@@ -1423,27 +1451,30 @@ class WithdrawManager:
         if not api.get("enabled") or not api.get("operator_id"):
 
             raise RecordConflict(
-                "Assign and enable a Withdraw account " "before refreshing balance."
+                "Assign and enable a Withdraw account " "before refreshing balance.",
+                "account_assignment_required",
             )
 
         balance_ready, balance_error = self.balance_readiness(device_id)
 
         if not balance_ready:
 
-            raise RecordConflict(balance_error)
+            raise RecordConflict(balance_error, "balance_workflow_failed")
 
         worker = self.workers.get(device_id)
 
         if worker is None or worker.thread is None or not worker.thread.is_alive():
 
             raise RecordConflict(
-                "Reconnect the Withdraw account " "before refreshing balance."
+                "Reconnect the Withdraw account " "before refreshing balance.",
+                "authentication_required",
             )
 
         if not worker.session_available():
 
             raise RecordConflict(
-                "Reconnect the Withdraw account " "before refreshing balance."
+                "Reconnect the Withdraw account " "before refreshing balance.",
+                "session_expired",
             )
 
         worker.request_balance_refresh("manual")
@@ -1703,7 +1734,8 @@ class WithdrawManager:
         if worker is None:
 
             raise RecordConflict(
-                "Reconnect the Withdraw account before " "cancelling this withdrawal."
+                "Reconnect the Withdraw account before " "cancelling this withdrawal.",
+                "authentication_required",
             )
 
         # Retry creation uses the same manager lock. Holding it through the

@@ -2034,7 +2034,7 @@ class WithdrawWorker:
                     ambiguity_error_reason=safe_reason,
                 )
 
-                raise RecordConflict(message) from None
+                raise RecordConflict(message, "withdrawal_cancel_uncertain") from None
 
             # ---------------------------------------------------------
             # 2. External call returned successfully.
@@ -2075,7 +2075,7 @@ class WithdrawWorker:
                     self.state = "NEEDS_ATTENTION"
                     self.error = message
 
-                raise RecordConflict(message) from None
+                raise RecordConflict(message, "withdrawal_cancel_uncertain") from None
 
             # ---------------------------------------------------------
             # 3. Confirmed external cancellation + persisted local state

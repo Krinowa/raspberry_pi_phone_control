@@ -20,6 +20,8 @@ var uiLiteralText = (element, text) => {
 };
 var uiError = (message) =>
   window.PhoneI18n?.translateError?.(message) ?? message;
+var uiBackendError = (code, params, fallback) =>
+  window.PhoneI18n?.translateBackendError?.(code, params, fallback) ?? fallback;
 var uiErrorText = (element, message) => {
   if (window.PhoneI18n?.bindComputedText)
     return window.PhoneI18n.bindComputedText(
@@ -71,6 +73,7 @@ let deviceCameraDetails = {};
 let deviceRefreshInFlight = false;
 let deviceRefreshTimer = null;
 let deviceRenderSignature = null;
+let renderedDeviceManagementBlocked = false;
 let devicePollingStopped = false;
 const deviceDeletesInFlight = new Set();
 const devicePreviewTimers = new Map();
@@ -130,6 +133,7 @@ let workflowRuntime = null;
 let diagnosticsLogs = [];
 let previewConsecutiveFailures = 0;
 let previewCalibrationRequired = false;
+let noticeRevision = 0;
 
 function setDashboardMode(mode) {
   dashboardMode = mode === "admin" ? "admin" : "operate";
@@ -270,6 +274,7 @@ function recordPreviewTiming(fetchMs, bodyMs, decodeMs, totalMs) {
 }
 
 function notice(text, error = false) {
+  const revision = ++noticeRevision;
   const node = $("notice");
   if (window.PhoneI18n?.bindComputedText)
     window.PhoneI18n.bindComputedText(
@@ -278,6 +283,7 @@ function notice(text, error = false) {
     );
   else node.textContent = text;
   node.classList.toggle("error", error);
+  return revision;
 }
 
 function renderControllerTag() {
@@ -360,15 +366,24 @@ async function api(path, data, method = "POST", options = {}) {
     }
 
     if (!response.ok) {
-      if (response.status === 403 && body.error === "Admin login required.")
+      if (
+        response.status === 403 &&
+        (body.error_code === "authentication_required" ||
+          body.error === "Admin login required.")
+      )
         lockAdminState();
+      const rawMessage = body.error || null;
       const error = new Error(
-        body.error ||
+        (rawMessage &&
+          uiBackendError(body.error_code, body.error_params, rawMessage)) ||
           ui("error.requestFailed", `Request failed (${response.status})`, {
             status: response.status,
           }),
       );
       error.status = response.status;
+      error.rawMessage = rawMessage;
+      error.errorCode = body.error_code;
+      error.errorParams = body.error_params || {};
       error.transient = transientFailure(error, response.status);
       throw error;
     }
@@ -500,6 +515,11 @@ var uiLiteralText =
 var uiError =
   uiError ||
   ((message) => window.PhoneI18n?.translateError?.(message) ?? message);
+var uiBackendError =
+  uiBackendError ||
+  ((code, params, fallback) =>
+    window.PhoneI18n?.translateBackendError?.(code, params, fallback) ??
+    fallback);
 var uiErrorText =
   uiErrorText ||
   ((element, message) => {
@@ -512,7 +532,7 @@ var uiErrorText =
     return element;
   });
 const deviceStatusLabel = (status) =>
-  deviceUi(`status.${status}`, status || "—");
+  window.PhoneI18n?.translateStatus?.(status) ?? status ?? "—";
 
 const TERMINAL_WITHDRAW_PHASES = new Set([
   "CONFIRMED",
@@ -681,7 +701,7 @@ function setOperationalHealth(id, label, healthy) {
     "OCR unavailable": "error.ocrUnavailable",
   }[label];
   if (key) deviceUiText(element, key, label);
-  else element.textContent = label;
+  else uiLiteralText(element, label);
   element.className = healthy ? "health-ok" : "health-problem";
 }
 
@@ -771,11 +791,22 @@ function renderOCRStatus(status) {
   $("ocr-average-inference").textContent = formatOCRMilliseconds(
     status.average_inference_ms,
   );
-  $("ocr-recommendation-reason").textContent =
+  uiLiteralText(
+    $("ocr-recommendation-reason"),
     status.recommendation_reason ||
-    uiLiteral("Collecting recent OCR performance samples.");
+      "Collecting recent OCR performance samples.",
+  );
   const warning = $("ocr-settings-warning");
-  warning.textContent = status.warning || "";
+  const warningMatch = status.warning?.match(
+    /^Configured OCR worker pool size (\d+) exceeds the detected safe ceiling (\d+); started (\d+) worker\(s\)\. The stored setting was not changed\.$/,
+  );
+  if (warningMatch)
+    deviceUiText(warning, "ocr.poolClamped", status.warning, {
+      configured: warningMatch[1],
+      ceiling: warningMatch[2],
+      started: warningMatch[3],
+    });
+  else uiLiteralText(warning, status.warning || "");
   warning.hidden = !status.warning;
   $("ocr-apply-recommendation").disabled =
     ocrRecommendedWorkerCount === null ||
@@ -785,7 +816,16 @@ function renderOCRStatus(status) {
   $("ocr-workers").replaceChildren(
     ...workers.map((worker) => {
       const item = document.createElement("span");
-      item.textContent = `Worker ${worker.worker_id} — ${worker.state}`;
+      deviceUiText(
+        item,
+        "ocr.workerStatus",
+        `Worker ${worker.worker_id} — ${worker.state}`,
+        () => ({
+          number: worker.worker_id,
+          state:
+            window.PhoneI18n?.translateStatus?.(worker.state) ?? worker.state,
+        }),
+      );
       return item;
     }),
   );
@@ -1085,7 +1125,12 @@ function startDevicePreview(deviceId, image, placeholder) {
       if (!response.ok) {
         let message = "Camera unavailable";
         try {
-          message = (await response.json()).error || message;
+          const body = await response.json();
+          message = uiBackendError(
+            body.error_code,
+            body.error_params,
+            body.error || message,
+          );
         } catch {
           /* The generic message is safe for a non-JSON camera failure. */
         }
@@ -1154,7 +1199,7 @@ function startDevicePreview(deviceId, image, placeholder) {
   void loadNextFrame();
 }
 
-function createDeviceJobActions(job, deviceId) {
+function createDeviceJobActions(job, deviceId, managementBlocked) {
   const actions = document.createElement("div");
   actions.className = "device-job-actions";
 
@@ -1165,7 +1210,7 @@ function createDeviceJobActions(job, deviceId) {
     if (action === "manual_assistance") {
       button.className = "primary danger-action";
       deviceUiText(button, "device.manualAssistance", "Manual Assistance");
-      button.disabled = deviceManagementBlocked();
+      button.disabled = managementBlocked;
       button.addEventListener("click", () =>
         resolveDeviceIssue(deviceId, job.job_id),
       );
@@ -1250,7 +1295,12 @@ function payerBalanceView(details) {
       value: deviceUi("common.unavailable", "Unavailable"),
       checkedAt: null,
       stateLabel:
-        status.balance_error ||
+        (status.balance_error &&
+          uiBackendError(
+            status.balance_error_code,
+            status.balance_error_params,
+            status.balance_error,
+          )) ||
         deviceUi("balance.failed", "Balance check failed"),
     };
   }
@@ -1275,22 +1325,22 @@ function withdrawRuntimeView(details) {
 
   if (status.state === "AUTH_FAILED")
     return {
-      session: "Authentication required",
-      realtime: "Disconnected",
+      session: deviceUi("withdraw.authRequired", "Authentication required"),
+      realtime: deviceUi("common.disconnected", "Disconnected"),
       ready: false,
       action: "login",
     };
   if (!authenticationAvailable)
     return {
-      session: "Authentication required",
-      realtime: "Disconnected",
+      session: deviceUi("withdraw.authRequired", "Authentication required"),
+      realtime: deviceUi("common.disconnected", "Disconnected"),
       ready: false,
       action: "login",
     };
   if (status.state === "CONFIGURATION_ERROR")
     return {
-      session: "Configuration required",
-      realtime: "Disconnected",
+      session: deviceUi("withdraw.configRequired", "Configuration required"),
+      realtime: deviceUi("common.disconnected", "Disconnected"),
       ready: false,
       action: "reconnect",
     };
@@ -1299,29 +1349,37 @@ function withdrawRuntimeView(details) {
   // the worker intentionally keeps this READY session alive to renew its lock.
   if (connected)
     return {
-      session: "Connected",
-      realtime: "Connected",
+      session: deviceUi("common.connected", "Connected"),
+      realtime: deviceUi("common.connected", "Connected"),
       ready: true,
       action: null,
     };
   if (status.state === "NEEDS_ATTENTION")
     return {
-      session: "Authenticated",
-      realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
+      session: deviceUi("common.authenticated", "Authenticated"),
+      realtime: status.physical_socket_connected
+        ? deviceUi("common.connected", "Connected")
+        : deviceUi("common.disconnected", "Disconnected"),
       ready: false,
       action: "reconnect",
     };
   if (["CONNECTING", "WAITING_FOR_CONNECTION"].includes(status.state))
     return {
       session:
-        status.state === "CONNECTING" ? "Authenticating" : "Reconnecting",
-      realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
+        status.state === "CONNECTING"
+          ? deviceUi("common.authenticating", "Authenticating")
+          : deviceUi("common.reconnecting", "Reconnecting"),
+      realtime: status.physical_socket_connected
+        ? deviceUi("common.connected", "Connected")
+        : deviceUi("common.disconnected", "Disconnected"),
       ready: false,
       action: "reconnect",
     };
   return {
-    session: "Authenticated",
-    realtime: status.physical_socket_connected ? "Connected" : "Disconnected",
+    session: deviceUi("common.authenticated", "Authenticated"),
+    realtime: status.physical_socket_connected
+      ? deviceUi("common.connected", "Connected")
+      : deviceUi("common.disconnected", "Disconnected"),
     ready: false,
     action: "reconnect",
   };
@@ -1417,6 +1475,10 @@ function deviceJobRenderSnapshot(job) {
     result: job.result,
     recovery_status: job.recovery_status,
     recovery_error: job.recovery_error,
+    error_code: job.error_code,
+    error_params: job.error_params,
+    recovery_error_code: job.recovery_error_code,
+    recovery_error_params: job.recovery_error_params,
     failed_step_index: job.failed_step_index,
     failed_step_type: job.failed_step_type,
     retry_of_job_id: job.retry_of_job_id,
@@ -1425,7 +1487,13 @@ function deviceJobRenderSnapshot(job) {
   };
 }
 
-function deviceCardRenderSignature(device, details, withdraw, latestJob) {
+function deviceCardRenderSignature(
+  device,
+  details,
+  withdraw,
+  latestJob,
+  managementBlocked,
+) {
   const status = withdraw?.status || {};
   return JSON.stringify({
     locale: window.PhoneI18n?.getLocale?.() || "en",
@@ -1442,7 +1510,7 @@ function deviceCardRenderSignature(device, details, withdraw, latestJob) {
     selected: device.id === deviceCatalog?.selected_device,
     stale: deviceStatusStale,
     returned: device.id === returnedDeviceId,
-    management_blocked: deviceManagementBlocked(),
+    management_blocked: managementBlocked,
     camera: {
       config: details?.config,
       ready: details?.status?.ready,
@@ -1457,17 +1525,25 @@ function deviceCardRenderSignature(device, details, withdraw, latestJob) {
       state: status.state,
       phase: status.phase,
       error: status.error,
+      error_code: status.error_code,
+      error_params: status.error_params,
       session_state: status.session_state,
       physical_socket_connected: status.physical_socket_connected,
       payment_ready: status.payment_ready,
       payment_readiness_error: status.payment_readiness_error,
+      payment_readiness_error_code: status.payment_readiness_error_code,
+      payment_readiness_error_params: status.payment_readiness_error_params,
       balance_state: status.balance_state,
       balance_valid: status.balance_valid,
       last_balance: status.last_balance,
       balance_observed_at: status.balance_observed_at,
       balance_error: status.balance_error,
+      balance_error_code: status.balance_error_code,
+      balance_error_params: status.balance_error_params,
       balance_workflow_ready: status.balance_workflow_ready,
       balance_workflow_error: status.balance_workflow_error,
+      balance_workflow_error_code: status.balance_workflow_error_code,
+      balance_workflow_error_params: status.balance_workflow_error_params,
       cancel_allowed: status.cancel_allowed,
       withdraw_id: status.withdraw_id,
       tx_id: status.tx_id,
@@ -1511,10 +1587,16 @@ function devicePreviewRenderSignature(device, details) {
   });
 }
 
-function renderDevices() {
+function renderDevices({ presentationOnly = false } = {}) {
   const devices = Array.isArray(deviceCatalog?.devices)
     ? deviceCatalog.devices
     : [];
+  // Eligibility is a behavior-only snapshot. Rendering translated labels must
+  // not cause action gates to be read again partway through the same render.
+  const managementBlocked = presentationOnly
+    ? renderedDeviceManagementBlocked
+    : deviceManagementBlocked();
+  if (!presentationOnly) renderedDeviceManagementBlocked = managementBlocked;
 
   const deviceList = $("device-list");
   const existingCards = new Map(
@@ -1583,6 +1665,7 @@ function renderDevices() {
       details,
       withdraw,
       latestJob,
+      managementBlocked,
     );
     const existingCard = existingCards.get(device.id);
     if (existingCard?.dataset?.renderSignature === cardSignature)
@@ -1641,7 +1724,7 @@ function renderDevices() {
     operationalBadge.className = `badge device-state-badge device-state-badge--${operationalState}`;
     const operationalLabel = {
       "needs-attention": ["health.needsAttentionWarning", "⚠ Needs Attention"],
-      recovering: ["common.reconnecting", "Recovering"],
+      recovering: ["status.RECOVERING", "Recovering"],
       running: ["device.running", "Running"],
       offline: ["device.offline", "Offline"],
       ready: ["common.ready", "Ready"],
@@ -1709,7 +1792,7 @@ function renderDevices() {
     let preview;
     if (existingPreview?.dataset?.renderSignature === previewSignature) {
       preview = existingPreview;
-      preview.disabled = device.id === selected || deviceManagementBlocked();
+      preview.disabled = device.id === selected || managementBlocked;
       preview.setAttribute?.(
         "aria-label",
         deviceUi(
@@ -1737,7 +1820,7 @@ function renderDevices() {
         details.status?.height,
       );
 
-      preview.disabled = device.id === selected || deviceManagementBlocked();
+      preview.disabled = device.id === selected || managementBlocked;
       preview.setAttribute?.(
         "aria-label",
         deviceUi(
@@ -1879,7 +1962,7 @@ function renderDevices() {
       assignedWorkflow ? "common.change" : "workflow.assign",
       assignedWorkflow ? "Change" : "Assign",
     );
-    paymentWorkflowAction.disabled = deviceManagementBlocked();
+    paymentWorkflowAction.disabled = managementBlocked;
     paymentWorkflowAction.addEventListener("click", () =>
       openWorkflowSettings(device, "payment"),
     );
@@ -1907,7 +1990,7 @@ function renderDevices() {
       workflowAssignment.balance_workflow ? "Change" : "Assign",
     );
 
-    balanceWorkflowAction.disabled = deviceManagementBlocked();
+    balanceWorkflowAction.disabled = managementBlocked;
     balanceWorkflowAction.addEventListener("click", () =>
       openWorkflowSettings(device, "balance"),
     );
@@ -1978,7 +2061,9 @@ function renderDevices() {
         const balanceHelp = document.createElement("span");
         balanceHelp.className = "device-balance-help";
         if (withdraw.status?.balance_workflow_error) {
-          balanceHelp.textContent = uiError(
+          balanceHelp.textContent = uiBackendError(
+            withdraw.status.balance_workflow_error_code,
+            withdraw.status.balance_workflow_error_params,
             withdraw.status.balance_workflow_error,
           );
         } else {
@@ -2060,7 +2145,9 @@ function renderDevices() {
         ) {
           const readinessDetail = document.createElement("span");
           readinessDetail.className = "withdraw-payment-warning-detail";
-          readinessDetail.textContent = uiError(
+          readinessDetail.textContent = uiBackendError(
+            withdraw.status.payment_readiness_error_code,
+            withdraw.status.payment_readiness_error_params,
             withdraw.status.payment_readiness_error,
           );
           withdrawSummary.append(readinessDetail);
@@ -2080,15 +2167,14 @@ function renderDevices() {
             : "Reconnect",
         );
         reconnect.disabled =
-          deviceManagementBlocked() ||
-          withdrawReconnectsInFlight.has(device.id);
+          managementBlocked || withdrawReconnectsInFlight.has(device.id);
         reconnect.addEventListener("click", () => reconnectWithdraw(device.id));
         withdrawSummary.append(reconnect);
       } else if (runtime.action === "login") {
         const loginAgain = document.createElement("button");
         loginAgain.type = "button";
         deviceUiText(loginAgain, "withdraw.loginAgain", "Login Again");
-        loginAgain.disabled = deviceManagementBlocked();
+        loginAgain.disabled = managementBlocked;
         loginAgain.addEventListener("click", () =>
           openWithdrawSettings(device, withdraw, { reauthenticate: true }),
         );
@@ -2102,7 +2188,7 @@ function renderDevices() {
       withdrawAssigned ? "withdraw.changeAccount" : "withdraw.loginAssign",
       withdrawAssigned ? "Change Account" : "Login & Assign",
     );
-    withdrawButton.disabled = deviceManagementBlocked();
+    withdrawButton.disabled = managementBlocked;
     withdrawButton.addEventListener("click", () =>
       openWithdrawSettings(device, withdraw),
     );
@@ -2167,11 +2253,23 @@ function renderDevices() {
 
       const error =
         latestJob.error || latestJob.recovery_error || withdrawReason;
+      const errorCode = latestJob.error
+        ? latestJob.error_code
+        : latestJob.recovery_error
+          ? latestJob.recovery_error_code
+          : withdraw.status?.error_code;
+      const errorParams = latestJob.error
+        ? latestJob.error_params
+        : latestJob.recovery_error
+          ? latestJob.recovery_error_params
+          : withdraw.status?.error_params;
 
       if (error) {
         const message = document.createElement("span");
         message.className = "job-error";
-        const friendlyError = friendlyOperationalError(String(error));
+        const friendlyError = errorCode
+          ? uiBackendError(errorCode, errorParams, String(error))
+          : friendlyOperationalError(String(error));
         deviceUiText(message, "device.error", `Error: ${friendlyError}`, {
           message: friendlyError,
         });
@@ -2181,7 +2279,7 @@ function renderDevices() {
         const message = document.createElement("span");
         message.className = "job-result";
         deviceUiText(message, "device.result", `Result: ${latestJob.result}`, {
-          result: latestJob.result,
+          result: uiLiteral(latestJob.result),
         });
         jobSummary.append(message);
       }
@@ -2197,10 +2295,13 @@ function renderDevices() {
       );
 
       const issueMessage = document.createElement("span");
-      issueMessage.textContent = friendlyOperationalError(
-        withdraw.status?.error ||
-          uiLiteral("Withdrawal recovery requires attention."),
-      );
+      issueMessage.textContent = withdraw.status?.error
+        ? uiBackendError(
+            withdraw.status.error_code,
+            withdraw.status.error_params,
+            withdraw.status.error,
+          )
+        : uiLiteral("Withdrawal recovery requires attention.");
 
       const jobState = document.createElement("span");
       deviceUiText(jobState, "device.currentJob.none", "Current job: —");
@@ -2232,10 +2333,14 @@ function renderDevices() {
       device.id === selected ? "common.controlling" : "common.select",
       device.id === selected ? "Controlling" : "Select",
     );
-    select.disabled = device.id === selected || deviceManagementBlocked();
+    select.disabled = device.id === selected || managementBlocked;
     select.addEventListener("click", () => selectDashboardDevice(device.id));
 
-    const jobActions = createDeviceJobActions(latestJob, device.id);
+    const jobActions = createDeviceJobActions(
+      latestJob,
+      device.id,
+      managementBlocked,
+    );
     if (canManuallyCancelWithdrawal(withdraw)) {
       const cancelWithdrawal = document.createElement("button");
       cancelWithdrawal.type = "button";
@@ -2260,7 +2365,7 @@ function renderDevices() {
       assist.type = "button";
       assist.className = "primary danger-action";
       deviceUiText(assist, "device.manualAssistance", "Manual Assistance");
-      assist.disabled = deviceManagementBlocked();
+      assist.disabled = managementBlocked;
       assist.addEventListener("click", () =>
         resolveDeviceIssue(device.id, null),
       );
@@ -2271,7 +2376,7 @@ function renderDevices() {
     settings.className = "admin-only";
     settings.type = "button";
     deviceUiText(settings, "device.cameraSettings", "Camera Settings");
-    settings.disabled = deviceManagementBlocked();
+    settings.disabled = managementBlocked;
     settings.addEventListener("click", () => openCameraSettings(device));
 
     const remove = document.createElement("button");
@@ -2284,8 +2389,7 @@ function renderDevices() {
         : "common.delete",
       deviceDeletesInFlight.has(device.id) ? "Deleting…" : "Delete",
     );
-    remove.disabled =
-      deviceDeletesInFlight.has(device.id) || deviceManagementBlocked();
+    remove.disabled = deviceDeletesInFlight.has(device.id) || managementBlocked;
     remove.addEventListener("click", () => deleteDevice(device, remove));
     actions.append(
       ...(jobActions.children.length ? [jobActions] : []),
@@ -2318,7 +2422,7 @@ function renderDevices() {
   $("device-enrollment-active").hidden = !enrollment.active;
   $("device-enrollment-form").hidden =
     !addPhonePanelOpen || !!enrollment.active;
-  $("device-add").disabled = !!enrollment.active || deviceManagementBlocked();
+  $("device-add").disabled = !!enrollment.active || managementBlocked;
 
   if (enrollment.active) {
     if (enrollment.target_device_id)
@@ -2535,7 +2639,9 @@ function renderJobs() {
         const error = document.createElement("span");
         error.className = "job-error";
         const technical = String(job.error);
-        error.textContent = friendlyOperationalError(technical);
+        error.textContent = job.error_code
+          ? uiBackendError(job.error_code, job.error_params, technical)
+          : friendlyOperationalError(technical);
         item.append(error);
         if (error.textContent !== technical) {
           const details = document.createElement("details");
@@ -2555,7 +2661,7 @@ function renderJobs() {
       if (job.result) {
         const result = document.createElement("span");
         result.className = "job-result";
-        result.textContent = job.result;
+        uiLiteralText(result, job.result);
         item.append(result);
       }
       if (job.recovery_status) {
@@ -3698,20 +3804,32 @@ function deviceRenderSnapshot(catalog, cameras, withdrawDetails, jobs) {
             state: details?.status?.state,
             phase: details?.status?.phase,
             error: details?.status?.error,
+            error_code: details?.status?.error_code,
+            error_params: details?.status?.error_params,
             session_state: details?.status?.session_state,
             physical_socket_connected:
               details?.status?.physical_socket_connected,
 
             payment_ready: details?.status?.payment_ready,
             payment_readiness_error: details?.status?.payment_readiness_error,
+            payment_readiness_error_code:
+              details?.status?.payment_readiness_error_code,
+            payment_readiness_error_params:
+              details?.status?.payment_readiness_error_params,
 
             balance_state: details?.status?.balance_state,
             balance_valid: details?.status?.balance_valid,
             last_balance: details?.status?.last_balance,
             balance_observed_at: details?.status?.balance_observed_at,
             balance_error: details?.status?.balance_error,
+            balance_error_code: details?.status?.balance_error_code,
+            balance_error_params: details?.status?.balance_error_params,
             balance_workflow_ready: details?.status?.balance_workflow_ready,
             balance_workflow_error: details?.status?.balance_workflow_error,
+            balance_workflow_error_code:
+              details?.status?.balance_workflow_error_code,
+            balance_workflow_error_params:
+              details?.status?.balance_workflow_error_params,
 
             cancel_allowed: details?.status?.cancel_allowed,
             withdraw_id: details?.status?.withdraw_id,
@@ -4640,7 +4758,13 @@ async function recoverConnection() {
     }
     if (state?.manual_backend === "raspberry_pi" && pi.api !== "online")
       throw Object.assign(
-        new Error(pi.message || "Pi temporarily unavailable."),
+        new Error(
+          uiBackendError(
+            pi.error_code,
+            pi.error_params,
+            pi.message || "Pi temporarily unavailable.",
+          ),
+        ),
         {
           transient: true,
         },
@@ -4658,9 +4782,9 @@ async function recoverConnection() {
     connectionState = "connected";
     recoveryAttempt = 0;
     recoveryHadManualControl = false;
-    notice("Connection restored.");
+    const restoredNoticeRevision = notice("Connection restored.");
     setTimeout(() => {
-      if ($("notice").textContent === "Connection restored.") notice("");
+      if (noticeRevision === restoredNoticeRevision) notice("");
     }, 2500);
     render();
     draw();
@@ -4725,11 +4849,22 @@ async function refreshStatus() {
     state = next;
     if (state.manual_backend === "raspberry_pi" && state.pi?.api === "offline")
       beginReconnect(
-        new Error(state.pi.message || "Pi temporarily unavailable."),
+        new Error(
+          uiBackendError(
+            state.pi.error_code,
+            state.pi.error_params,
+            state.pi.message || "Pi temporarily unavailable.",
+          ),
+        ),
       );
     if (!state.owned && !state.pending_owned) manual = false;
-    if (!state.camera.ready || !state.device) notice(state.message, true);
-    else if (state.message !== previousMessage) notice(state.message);
+    const statusMessage = uiBackendError(
+      state.message_error_code,
+      state.message_error_params,
+      state.message,
+    );
+    if (!state.camera.ready || !state.device) notice(statusMessage, true);
+    else if (state.message !== previousMessage) notice(statusMessage);
     render();
     draw();
   } catch (error) {
@@ -4786,7 +4921,12 @@ async function videoLoop() {
 
     if (!response.ok) {
       const status = response.status;
-      const error = (await response.json()).error || "Camera unavailable";
+      const errorBody = await response.json();
+      const error = uiBackendError(
+        errorBody.error_code,
+        errorBody.error_params,
+        errorBody.error || "Camera unavailable",
+      );
       if (status === 409 && requestedDevice && !calibrating) {
         // The calibrated endpoint fails closed. Fetch raw explicitly so the
         // operator can enter calibration mode, while retaining camera-space
@@ -4797,10 +4937,16 @@ async function videoLoop() {
           cache: "no-store",
           signal: AbortSignal.timeout(4000),
         });
-        if (!response.ok)
+        if (!response.ok) {
+          const fallbackBody = await response.json();
           throw new Error(
-            (await response.json()).error || "Camera unavailable",
+            uiBackendError(
+              fallbackBody.error_code,
+              fallbackBody.error_params,
+              fallbackBody.error || "Camera unavailable",
+            ),
           );
+        }
         previewCalibrationRequired = true;
         notice(error, true);
       } else {
@@ -5440,7 +5586,7 @@ $("dashboard-admin").addEventListener("click", () => {
 
 window.addEventListener?.("phonecontroller:languagechange", () => {
   renderControllerTag();
-  renderDevices();
+  renderDevices({ presentationOnly: true });
   renderOperationalRecovery();
   render();
 });
@@ -5499,7 +5645,15 @@ async function loadStatus() {
     // This endpoint checks the Pi once (and is a no-op in Appium mode).
     const pi = await api("/api/pi/status", undefined, "GET");
     if (pi.api === "offline")
-      beginReconnect(new Error(pi.message || "Pi temporarily unavailable."));
+      beginReconnect(
+        new Error(
+          uiBackendError(
+            pi.error_code,
+            pi.error_params,
+            pi.message || "Pi temporarily unavailable.",
+          ),
+        ),
+      );
   } catch (error) {
     if (!error.transient)
       notice(

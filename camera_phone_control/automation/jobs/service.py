@@ -307,12 +307,15 @@ class JobScheduler:
             if original.action == "withdraw_v2" and not withdraw_authorized:
 
                 raise RecordConflict(
-                    "Withdraw Bot retry requires integration safety validation."
+                    "Withdraw Bot retry requires integration safety validation.",
+                    "retry_blocked",
                 )
 
             if original.status not in {"FAILED", "INTERRUPTED"}:
 
-                raise RecordConflict("Only failed or interrupted jobs can be retried.")
+                raise RecordConflict(
+                    "Only failed or interrupted jobs can be retried.", "retry_blocked"
+                )
 
             if mode == "failed_step":
 
@@ -325,13 +328,15 @@ class JobScheduler:
                 if original.recovery_status not in allowed_recovery_states:
 
                     raise RecordConflict(
-                        "The phone must be restored and marked ready before retrying."
+                        "The phone must be restored and marked ready before retrying.",
+                        "retry_blocked",
                     )
 
                 if original.failed_step_index is None:
 
                     raise RecordConflict(
-                        "The failed workflow step is unavailable; restart the workflow instead."
+                        "The failed workflow step is unavailable; restart the workflow instead.",
+                        "retry_blocked",
                     )
 
                 start_step_index = original.failed_step_index
@@ -342,7 +347,8 @@ class JobScheduler:
 
                     raise RecordConflict(
                         "Phone is not verified ready. Use Manual Assistance and "
-                        "Verify Phone Ready before restarting the workflow."
+                        "Verify Phone Ready before restarting the workflow.",
+                        "retry_blocked",
                     )
 
                 start_step_index = 0
@@ -365,7 +371,9 @@ class JobScheduler:
                 for candidate in self.list_jobs()
             ):
 
-                raise RecordConflict("A retry for this job is already active.")
+                raise RecordConflict(
+                    "A retry for this job is already active.", "retry_blocked"
+                )
 
             ready = self.is_device_ready(original.device_id)["ready"]
 

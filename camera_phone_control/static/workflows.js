@@ -19,6 +19,11 @@
     window.PhoneI18n?.translateEnglish?.(text) ?? text;
   const workflowError = (message) =>
     window.PhoneI18n?.translateError?.(message) ?? message;
+  const workflowBackendError = (code, params, fallback) =>
+    window.PhoneI18n?.translateBackendError?.(code, params, fallback) ??
+    fallback;
+  const workflowStatus = (status) =>
+    window.PhoneI18n?.translateStatus?.(status) ?? status;
   const workflowLiteralText = (element, text) =>
     workflowUiComputed(element, () => workflowLiteral(text));
   let recording = {
@@ -1590,6 +1595,14 @@
     const template = $("region-ocr-template");
     if (!template?.content) return;
     const fragment = template.content.cloneNode(true);
+    for (const label of fragment.querySelectorAll("[data-roi-i18n]")) {
+      workflowUiText(
+        label,
+        label.dataset.roiI18n,
+        label.textContent.trim().replace(/\s+/g, " "),
+      );
+      label.removeAttribute("data-roi-i18n");
+    }
     for (const control of fragment.querySelectorAll("[data-roi-control]")) {
       control.id = `${prefix}-roi-${control.dataset.roiControl}`;
       control.removeAttribute("data-roi-control");
@@ -1640,16 +1653,29 @@
       });
     }
 
+    function valueSummary() {
+      if (!hasValues()) return workflowLiteral("No OCR region selected.");
+      return roiKeys
+        .map((key) => {
+          const label =
+            key === "width"
+              ? workflowUi("workflow.roi.width", "Width")
+              : key === "height"
+                ? workflowUi("workflow.roi.height", "Height")
+                : key.toUpperCase();
+          return `${label}: ${read(false)[key].toFixed(4)}`;
+        })
+        .join(" · ");
+    }
+
     function draw() {
-      const roi = read(false);
-      $(`${prefix}-roi-values`).textContent = hasValues()
-        ? roiKeys.map((key) => `${key}: ${roi[key].toFixed(4)}`).join(" · ")
-        : workflowLiteral("No OCR region selected.");
+      $(`${prefix}-roi-values`).textContent = valueSummary();
       $(`${prefix}-roi-result`).textContent = "";
       if (!image) return;
       const context = canvas.getContext("2d");
       context.drawImage(image, 0, 0);
       if (!hasValues()) return;
+      const roi = read(false);
       context.strokeStyle = "#ff3b30";
       context.lineWidth = Math.max(2, canvas.width / 200);
       context.strokeRect(
@@ -1659,6 +1685,8 @@
         roi.height * canvas.height,
       );
     }
+
+    workflowUiComputed($(`${prefix}-roi-values`), valueSummary);
 
     function reset(roi) {
       generation++;
@@ -3351,14 +3379,19 @@
           : workflowUi("common.starting", "Starting")
       }${running.checkpoint_message ? " — " + workflowError(running.checkpoint_message) : ""}${
         terminal.has(running.status)
-          ? " — " + workflowError(running.message || "")
+          ? " — " +
+            workflowBackendError(
+              running.error_code,
+              running.error_params,
+              running.message || "",
+            )
           : ""
       }`;
       return workflowUi(
         "workflow.runState",
-        `${workflowUi(`status.${running.status}`, running.status)} · Step ${running.step_index || 0}/${running.step_count || 0} · ${detail}`,
+        `${workflowStatus(running.status)} · Step ${running.step_index || 0}/${running.step_count || 0} · ${detail}`,
         {
-          status: workflowUi(`status.${running.status}`, running.status),
+          status: workflowStatus(running.status),
           current: running.step_index || 0,
           total: running.step_count || 0,
           detail,

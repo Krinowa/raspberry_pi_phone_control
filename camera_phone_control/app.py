@@ -39,6 +39,7 @@ from automation.backends import backend_names, select_device
 from automation.context import AutomationContext
 from automation.coordinates import normalized_to_device, unit
 from automation.diagnostics import install_recent_log_handler
+from automation.error_codes import exception_error_fields, error_fields
 from automation.screen.camera import CalibratedPreviewCache
 from automation.screen.stability import ScreenStabilityError
 from automation.workflows.api import register_workflows
@@ -353,6 +354,13 @@ class ControlState:
             self.disable(
                 "Automation running. Manual control disabled. Use Take Over to interrupt."
             )
+        message_error_code = None
+        message_error_params = {}
+        if self.pi_connection.get(
+            "error_code"
+        ) and self.message == self.pi_connection.get("message"):
+            message_error_code = self.pi_connection["error_code"]
+            message_error_params = self.pi_connection.get("error_params", {})
         return {
             "device": asdict(self.device) if self.device else None,
             "manual_backend": (
@@ -373,6 +381,8 @@ class ControlState:
             "pending_owned": self.pending and self.owner == client,
             "control_status": control_status,
             "message": self.message,
+            "message_error_code": message_error_code,
+            "message_error_params": message_error_params,
         }
 
 
@@ -502,14 +512,37 @@ def create_app(
                 request_metrics["active"] += 1
         # Reject cross-site fetches/embeds, including camera requests. No CORS enabled.
         if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
-            return jsonify(error="Only same-origin local requests are accepted."), 403
+            return (
+                jsonify(
+                    error_fields(
+                        "Only same-origin local requests are accepted.",
+                        "same_origin_required",
+                    )
+                ),
+                403,
+            )
         if request.method != "GET":
             if not secrets.compare_digest(
                 request.headers.get("X-Control-Token", ""), token
             ):
-                return jsonify(error="Invalid control token. Reload this page."), 403
+                return (
+                    jsonify(
+                        error_fields(
+                            "Invalid control token. Reload this page.",
+                            "invalid_control_token",
+                        )
+                    ),
+                    403,
+                )
             if not request.is_json:
-                return jsonify(error="Expected a JSON request."), 415
+                return (
+                    jsonify(
+                        error_fields(
+                            "Expected a JSON request.", "json_request_required"
+                        )
+                    ),
+                    415,
+                )
 
     @app.after_request
     def local_headers(response):
@@ -528,12 +561,18 @@ def create_app(
 
     @app.errorhandler(ValueError)
     def invalid_input(exc):
-        return jsonify(ok=False, error=str(exc)), 400
+        return jsonify(ok=False, **exception_error_fields(exc)), 400
 
     @app.errorhandler(CameraManagerError)
     def camera_error(exc):
         LOG.warning("Camera operation failed: %s", exc)
-        return jsonify(ok=False, error=str(exc)), 503
+        return (
+            jsonify(
+                ok=False,
+                **error_fields(str(exc), "camera_operation_failed"),
+            ),
+            503,
+        )
 
     @app.errorhandler(PiApiError)
     @app.errorhandler(DeviceError)
@@ -541,7 +580,13 @@ def create_app(
         with state.lock:
             state.disable(str(exc))
         LOG.warning("%s", exc)
-        return jsonify(error=str(exc)), (
+        fields = exception_error_fields(exc)
+        if isinstance(exc, DeviceError) and "error_code" not in fields:
+            fields.update(
+                error_code="device_command_failed",
+                error_params={},
+            )
+        return jsonify(**fields), (
             404 if getattr(exc, "http_status", None) == 404 else 409
         )
 
@@ -553,6 +598,8 @@ def create_app(
                     jsonify(
                         ok=False,
                         error="takeover_requested",
+                        error_code="device_busy",
+                        error_params={"owner": exc.owner},
                         owner=exc.owner,
                         pending=True,
                     ),
@@ -561,11 +608,29 @@ def create_app(
             state.disable(
                 "Device busy. Enable Manual Control again after it is released."
             )
-        return jsonify(ok=False, error="device_busy", owner=exc.owner), 409
+        return (
+            jsonify(
+                ok=False,
+                error="device_busy",
+                error_code="device_busy",
+                error_params={"owner": exc.owner},
+                owner=exc.owner,
+            ),
+            409,
+        )
 
     @app.errorhandler(NoAutomation)
     def no_automation(exc):
-        return jsonify(ok=False, error="no_automation", owner="free"), 409
+        return (
+            jsonify(
+                ok=False,
+                error="no_automation",
+                error_code="device_not_ready",
+                error_params={},
+                owner="free",
+            ),
+            409,
+        )
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
@@ -575,7 +640,13 @@ def create_app(
     def unexpected_error(exc):
         LOG.exception("Unhandled dashboard request error")
         return (
-            jsonify(ok=False, error="The dashboard could not complete this request."),
+            jsonify(
+                ok=False,
+                **error_fields(
+                    "The dashboard could not complete this request.",
+                    "dashboard_request_failed",
+                ),
+            ),
             500,
         )
 
@@ -1139,7 +1210,10 @@ def create_app(
                 if requested_device is None:
                     return (
                         jsonify(
-                            error="Select a phone before requesting a camera frame."
+                            **error_fields(
+                                "Select a phone before requesting a camera frame.",
+                                "camera_device_required",
+                            )
                         ),
                         409,
                     )
@@ -1150,13 +1224,30 @@ def create_app(
                     state.camera = active_camera
                 camera_status = active_camera.status()
                 if not camera_status["ready"]:
-                    return jsonify(error=camera_status["error"]), 503
+                    return (
+                        jsonify(
+                            **error_fields(camera_status["error"], "camera_unavailable")
+                        ),
+                        503,
+                    )
                 latest = active_camera.frame()
                 if latest is None:
-                    return jsonify(error="Camera frame unavailable."), 503
+                    return (
+                        jsonify(
+                            **error_fields(
+                                "Camera frame unavailable.", "camera_frame_unavailable"
+                            )
+                        ),
+                        503,
+                    )
                 if not camera_manager.is_current(requested_device, active_camera):
                     return (
-                        jsonify(error="Camera selection changed; request a new frame."),
+                        jsonify(
+                            **error_fields(
+                                "Camera selection changed; request a new frame.",
+                                "camera_selection_changed",
+                            )
+                        ),
                         409,
                     )
         jpeg, number, _, _ = latest
@@ -1239,10 +1330,22 @@ def create_app(
                 active_camera = camera_manager.get_camera(device_id)
                 camera_status = active_camera.status()
                 if not camera_status["ready"]:
-                    return jsonify(error=camera_status["error"]), 503
+                    return (
+                        jsonify(
+                            **error_fields(camera_status["error"], "camera_unavailable")
+                        ),
+                        503,
+                    )
                 latest = active_camera.frame()
                 if latest is None:
-                    return jsonify(error="Camera frame unavailable."), 503
+                    return (
+                        jsonify(
+                            **error_fields(
+                                "Camera frame unavailable.", "camera_frame_unavailable"
+                            )
+                        ),
+                        503,
+                    )
                 preview_frame = (
                     latest[0],
                     latest[1],
@@ -1261,7 +1364,13 @@ def create_app(
                     preview_device = state.device
                 else:
                     return (
-                        jsonify(error="This logical phone is not available."),
+                        jsonify(
+                            **error_fields(
+                                "This logical phone is not available.",
+                                "device_unavailable",
+                                {"device_id": device_id},
+                            )
+                        ),
                         404,
                     )
 
@@ -1275,7 +1384,13 @@ def create_app(
                     )
                 if calibration is None:
                     return (
-                        jsonify(error="Calibration required for this phone."),
+                        jsonify(
+                            **error_fields(
+                                "Calibration required for this phone.",
+                                "calibration_missing",
+                                {"device_id": device_id},
+                            )
+                        ),
                         409,
                     )
 
@@ -1288,12 +1403,17 @@ def create_app(
                 preview_frame,
             )
         except ScreenStabilityError as exc:
-            return jsonify(error=str(exc)), 503
+            return jsonify(**error_fields(str(exc), "camera_preview_failed")), 503
 
         with camera_manager.lock:
             if not camera_manager.is_current(device_id, active_camera):
                 return (
-                    jsonify(error="Camera selection changed; request a new preview."),
+                    jsonify(
+                        **error_fields(
+                            "Camera selection changed; request a new preview.",
+                            "camera_selection_changed",
+                        )
+                    ),
                     409,
                 )
         return Response(

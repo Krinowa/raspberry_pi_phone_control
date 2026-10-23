@@ -301,7 +301,15 @@ def authenticated_admin():
 
 def require_admin():
     if not authenticated_admin():
-        return jsonify(ok=False, error="Admin login required."), 403
+        return (
+            jsonify(
+                ok=False,
+                error="Admin login required.",
+                error_code="authentication_required",
+                error_params={},
+            ),
+            403,
+        )
     return None
 
 
@@ -551,15 +559,39 @@ def register_auth(app, payload, store):
     def auth_login_api():
         data = payload()
         if set(data) != {"username", "password"}:
-            return jsonify(ok=False, error="Invalid username or password."), 401
+            return (
+                jsonify(
+                    ok=False,
+                    error="Invalid username or password.",
+                    error_code="invalid_credentials",
+                    error_params={},
+                ),
+                401,
+            )
         key = rate_key("api-password", data.get("username", ""))
         if not limiter.check(key):
-            return jsonify(ok=False, error="Too many attempts. Try again later."), 429
+            return (
+                jsonify(
+                    ok=False,
+                    error="Too many attempts. Try again later.",
+                    error_code="rate_limited",
+                    error_params={},
+                ),
+                429,
+            )
         user = store.authenticate_admin(data["username"], data["password"])
         if user is None or not user["two_factor_enabled"]:
             limiter.fail(key)
             session.clear()
-            return jsonify(ok=False, error="Invalid username or password."), 401
+            return (
+                jsonify(
+                    ok=False,
+                    error="Invalid username or password.",
+                    error_code="invalid_credentials",
+                    error_params={},
+                ),
+                401,
+            )
         limiter.success(key)
         session.clear()
         session["pending_2fa_user_id"] = user["id"]
@@ -570,17 +602,41 @@ def register_auth(app, payload, store):
         data = payload()
         user = store.get_user(session.get("pending_2fa_user_id"))
         if user is None or set(data) != {"code"}:
-            return jsonify(ok=False, error="Invalid authentication code."), 401
+            return (
+                jsonify(
+                    ok=False,
+                    error="Invalid authentication code.",
+                    error_code="invalid_authentication_code",
+                    error_params={},
+                ),
+                401,
+            )
         key = rate_key("api-totp", user["username"])
         if not limiter.check(key):
-            return jsonify(ok=False, error="Too many attempts. Try again later."), 429
+            return (
+                jsonify(
+                    ok=False,
+                    error="Too many attempts. Try again later.",
+                    error_code="rate_limited",
+                    error_params={},
+                ),
+                429,
+            )
         if (
             not _totp_module()
             .TOTP(user["totp_secret"])
             .verify(data["code"], valid_window=1)
         ):
             limiter.fail(key)
-            return jsonify(ok=False, error="Invalid authentication code."), 401
+            return (
+                jsonify(
+                    ok=False,
+                    error="Invalid authentication code.",
+                    error_code="invalid_authentication_code",
+                    error_params={},
+                ),
+                401,
+            )
         limiter.success(key)
         finish_login(user)
         return jsonify(authenticated=True, username=user["username"], role="admin")

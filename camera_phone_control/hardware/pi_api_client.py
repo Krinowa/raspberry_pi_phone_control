@@ -26,9 +26,18 @@ SLOW_REQUEST_SECONDS = float(os.environ.get("PI_API_SLOW_REQUEST_SECONDS", "0.5"
 class PiApiError(RuntimeError):
     """Safe-to-display Pi error: never includes typed text or response bodies."""
 
-    def __init__(self, message, *, http_status=None):
+    def __init__(
+        self,
+        message,
+        *,
+        http_status=None,
+        error_code=None,
+        error_params=None,
+    ):
         super().__init__(message)
         self.http_status = http_status
+        self.error_code = error_code
+        self.error_params = dict(error_params or {})
 
 
 def timeout_value(value, name):
@@ -193,7 +202,14 @@ class PiApiClient:
 
             # After TCP connect, use the longer read timeout.
             if connection.sock is None:
-                raise PiApiError(f"Pi API {path} connected without a socket." + suffix)
+                raise PiApiError(
+                    f"Pi API {path} connected without a socket." + suffix,
+                    error_code="pi_api_no_socket",
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
+                )
 
             connection.sock.settimeout(self.read_timeout)
 
@@ -262,6 +278,12 @@ class PiApiClient:
                 raise PiApiError(
                     f"Pi API {path} returned " f"HTTP {response.status}." + suffix,
                     http_status=response.status,
+                    error_code="pi_api_http_error",
+                    error_params={
+                        "path": path,
+                        "status": response.status,
+                        "input_may_have_occurred": physical_action,
+                    },
                 )
 
             # -----------------------------------------------------------------
@@ -297,7 +319,11 @@ class PiApiClient:
                 )
 
             if len(raw) > MAX_RESPONSE_BYTES:
-                raise PiApiError("Pi API response exceeded " "the size limit." + suffix)
+                raise PiApiError(
+                    "Pi API response exceeded " "the size limit." + suffix,
+                    error_code="pi_api_response_too_large",
+                    error_params={"input_may_have_occurred": physical_action},
+                )
 
             # -----------------------------------------------------------------
             # Parse JSON
@@ -310,14 +336,24 @@ class PiApiClient:
                 UnicodeError,
             ):
                 raise PiApiError(
-                    f"Pi API {path} returned " "invalid JSON." + suffix
+                    f"Pi API {path} returned " "invalid JSON." + suffix,
+                    error_code="pi_api_invalid_json",
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
                 ) from None
 
             if not isinstance(result, dict) or type(result.get("ok")) is not bool:
                 raise PiApiError(
                     f"Pi API {path} returned "
                     "an invalid response "
-                    "(expected boolean ok)." + suffix
+                    "(expected boolean ok)." + suffix,
+                    error_code="pi_api_invalid_response",
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
                 )
 
             # -----------------------------------------------------------------
@@ -339,7 +375,18 @@ class PiApiClient:
                 if isinstance(error, str) and "connect" in error.lower():
                     detail = " Check the Bluetooth " "HID connection to " "the phone."
 
-                raise PiApiError(f"Pi rejected {path}." + detail + suffix)
+                raise PiApiError(
+                    f"Pi rejected {path}." + detail + suffix,
+                    error_code=(
+                        "pi_api_rejected_hid"
+                        if "Bluetooth" in detail
+                        else "pi_api_rejected"
+                    ),
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
+                )
 
             # -----------------------------------------------------------------
             # Retain async metadata
@@ -371,7 +418,14 @@ class PiApiClient:
                 flush=True,
             )
 
-            raise PiApiError(f"Pi API {path} timed out." + suffix) from None
+            raise PiApiError(
+                f"Pi API {path} timed out." + suffix,
+                error_code="pi_api_timeout",
+                error_params={
+                    "path": path,
+                    "input_may_have_occurred": physical_action,
+                },
+            ) from None
 
         except PiApiError:
             # Preserve already-sanitized Pi API errors.
@@ -397,7 +451,12 @@ class PiApiClient:
                 f"Cannot reach Pi API "
                 f"for {path}. "
                 "Check the Pi address "
-                "and private Wi-Fi." + suffix
+                "and private Wi-Fi." + suffix,
+                error_code="pi_api_unreachable",
+                error_params={
+                    "path": path,
+                    "input_may_have_occurred": physical_action,
+                },
             ) from None
 
         finally:
@@ -416,7 +475,11 @@ class PiApiClient:
         )
 
         if type(result.get("connected")) is not bool:
-            raise PiApiError("Pi /status response " "is missing boolean connected.")
+            raise PiApiError(
+                "Pi /status response " "is missing boolean connected.",
+                error_code="pi_api_invalid_status",
+                error_params={"path": self._device_path("status")},
+            )
 
         return result
 

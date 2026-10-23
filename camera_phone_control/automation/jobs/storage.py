@@ -22,7 +22,10 @@ class RecordNotFound(KeyError):
 
 
 class RecordConflict(ValueError):
-    pass
+    def __init__(self, message, error_code=None, error_params=None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.error_params = dict(error_params or {})
 
 
 class _JsonStore:
