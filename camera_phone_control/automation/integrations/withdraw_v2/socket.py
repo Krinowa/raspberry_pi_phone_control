@@ -56,10 +56,7 @@ def _safe_websocket_endpoint(identity):
         return "unconfigured"
     host, port, _key, scheme = identity
     websocket_scheme = "wss" if scheme == "https" else "ws"
-    return (
-        f"{websocket_scheme}://{host}:{port}/app/<redacted>"
-        "?protocol=7&client=phone-controller&version=1.0"
-    )
+    return f"{websocket_scheme}://{host}:{port}/app/<redacted>"
 
 
 def _settings(realtime):
@@ -159,15 +156,14 @@ class SharedPusherTransport:
         host, port, key, scheme = identity
         LOG.info(
             "Withdraw realtime metadata device=%s host=%s port=%s scheme=%s "
-            "key_present=%s auth_endpoint=%s session_channel=%s queue_channels=%s",
+            "key_present=%s auth_endpoint_present=%s queue_channel_count=%s",
             owner,
             host,
             port,
             scheme,
             bool(key),
-            endpoint,
-            session_channel,
-            sorted(queue_channels),
+            bool(endpoint),
+            len(queue_channels),
         )
         with self.lock:
             if not self.sessions:
@@ -216,15 +212,7 @@ class SharedPusherTransport:
                     daemon=True,
                 )
                 self.thread.start()
-            LOG.info(
-                "Registered Withdraw realtime logical session device=%s operator=%s",
-                owner,
-                (
-                    getattr(client, "profile", {}).get("id")
-                    if isinstance(getattr(client, "profile", None), dict)
-                    else "unknown"
-                ),
-            )
+            LOG.info("Registered Withdraw realtime logical session device=%s", owner)
             self.wake.set()
             return session
 
@@ -417,10 +405,7 @@ class SharedPusherTransport:
             self.channel_authorizers.clear()
             for session in self.sessions.values():
                 self._set_state_locked(session, "SUBSCRIBING")
-        LOG.info(
-            "Withdraw realtime received pusher:connection_established socket_id=%s",
-            socket_id,
-        )
+        LOG.info("Withdraw realtime received pusher:connection_established")
         ws.settimeout(1)
 
     def _sync_subscriptions(self):
@@ -451,21 +436,15 @@ class SharedPusherTransport:
                 attempted = True
                 try:
                     LOG.info(
-                        "Authorizing Withdraw realtime channel owner=%s "
-                        "endpoint=%s socket_id=%s channel=%s",
+                        "Authorizing Withdraw realtime channel owner=%s",
                         session.owner,
-                        session.endpoint,
-                        self.socket_id,
-                        channel,
                     )
                     auth = session.client.authorize(
                         session.endpoint, self.socket_id, channel
                     )
                     LOG.info(
-                        "Withdraw realtime channel authorization accepted "
-                        "owner=%s channel=%s",
+                        "Withdraw realtime channel authorization accepted " "owner=%s",
                         session.owner,
-                        channel,
                     )
                     self._send(
                         "pusher:subscribe",
@@ -484,8 +463,7 @@ class SharedPusherTransport:
                 # No healthy logical owner can authenticate this channel. Keep
                 # the physical socket alive for all unrelated sessions.
                 LOG.warning(
-                    "Withdraw channel authorization failed channel=%s code=%s",
-                    channel,
+                    "Withdraw channel authorization failed code=%s",
                     getattr(last_error, "code", 0),
                 )
         self.wake.clear()
@@ -554,7 +532,7 @@ class SharedPusherTransport:
                         ),
                     )
         elif event == "pusher_internal:subscription_succeeded":
-            LOG.info("Subscribed Withdraw realtime channel %s", channel)
+            LOG.info("Subscribed Withdraw realtime channel")
             with self.lock:
                 self.subscribing.discard(channel)
                 self.subscribed.add(channel)

@@ -17,6 +17,7 @@ from automation.jobs.storage import RecordConflict, RecordNotFound
 from automation.workflows.validation import resolve_variables
 
 from automation.workflows.values import parse_currency
+from diagnostic_logging import log_event
 
 from .balance import BalanceCache, balance_check_workflow, final_amount
 
@@ -593,7 +594,15 @@ class WithdrawWorker:
 
                 self.balance_initial_attempted = True
 
-        LOG.info("balance_refresh_started device=%s reason=%s", self.device_id, reason)
+        balance_started = time.monotonic()
+        log_event(
+            LOG,
+            logging.INFO,
+            "balance",
+            "balance_refresh_started",
+            device_id=self.device_id,
+            reason=reason,
+        )
 
         deferred = False
 
@@ -611,10 +620,14 @@ class WithdrawWorker:
 
             self.observe_balance(amount)
 
-            LOG.info(
-                "balance_refresh_completed device=%s value=%s",
-                self.device_id,
-                format(amount, ".2f"),
+            log_event(
+                LOG,
+                logging.INFO,
+                "balance",
+                "balance_refresh_completed",
+                device_id=self.device_id,
+                duration_ms=round((time.monotonic() - balance_started) * 1000),
+                outcome="completed",
             )
 
         except RecordConflict as exc:
@@ -641,11 +654,17 @@ class WithdrawWorker:
 
         except Exception as exc:
 
-            LOG.warning(
-                "balance_refresh_failed device=%s reason=%s error=%s",
-                self.device_id,
-                reason,
-                exc,
+            log_event(
+                LOG,
+                logging.WARNING,
+                "balance",
+                "balance_refresh_failed",
+                device_id=self.device_id,
+                reason=reason,
+                error_code=getattr(exc, "error_code", None)
+                or "balance_workflow_failed",
+                exception_type=type(exc).__name__,
+                duration_ms=round((time.monotonic() - balance_started) * 1000),
             )
 
             with self.lock:
@@ -864,7 +883,7 @@ class WithdrawWorker:
 
         self.cache.invalidate()
 
-        self.journal.update(
+        current = self.journal.update(
             self.device_id,
             phase="NEEDS_ATTENTION",
             error=message,
@@ -872,6 +891,17 @@ class WithdrawWorker:
         )
 
         self.set_state("NEEDS_ATTENTION", message)
+        log_event(
+            LOG,
+            logging.ERROR,
+            "withdrawal",
+            "reconciliation_required",
+            device_id=self.device_id,
+            job_id=current.get("job_id"),
+            workflow_id=current.get("workflow_id"),
+            error_code="withdrawal_state_unresolved",
+            outcome="needs_attention",
+        )
 
     def authorize_retry(self, original_job_id, retry_job_id):
         """Authorize one validated retry while retaining this worker's lock lease."""
@@ -1772,11 +1802,11 @@ class WithdrawWorker:
             # before changing expiry() parsing rules.
             LOG.info(
                 "Withdraw lock expiry diagnostic "
-                "device=%s withdraw_id=%s value_type=%s value=%r",
+                "device=%s withdraw_id=%s value_type=%s value_present=%s",
                 self.device_id,
                 item["id"],
                 type(lock_expires_at).__name__,
-                lock_expires_at,
+                lock_expires_at is not None,
             )
 
             if expiry(lock_expires_at) <= time.time() + 30:
@@ -2019,6 +2049,17 @@ class WithdrawWorker:
                     error_code,
                     safe_reason,
                 )
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "withdrawal",
+                    "cancel_failed",
+                    device_id=self.device_id,
+                    job_id=current.get("job_id"),
+                    error_code="withdrawal_cancel_uncertain",
+                    exception_type=type(exc).__name__,
+                    outcome="uncertain",
+                )
 
                 message = (
                     f"External cancellation failed ({safe_description}). "
@@ -2100,6 +2141,15 @@ class WithdrawWorker:
                         del self.scheduler.reservations[self.device_id]
 
             self.set_state("IDLE")
+            log_event(
+                LOG,
+                logging.INFO,
+                "withdrawal",
+                "withdrawal_cancelled",
+                device_id=self.device_id,
+                job_id=current.get("job_id"),
+                outcome="cancelled",
+            )
 
             if self.dispatcher:
                 self.dispatcher.wake()
@@ -2302,6 +2352,16 @@ class WithdrawWorker:
         )
 
         self.allowed_job = job.job_id
+
+        log_event(
+            LOG,
+            logging.INFO,
+            "withdrawal",
+            "withdrawal_started",
+            device_id=self.device_id,
+            job_id=job.job_id,
+            workflow_id=workflow["id"],
+        )
 
         self._finish_payment_job(raw, job)
 
@@ -2543,19 +2603,17 @@ class WithdrawWorker:
                 payer_balance = parse_currency(payer_balance)
             except (AttributeError, TypeError, ValueError):
                 LOG.warning(
-                    "payment_balance_rejected device=%s job_id=%s value=%r",
+                    "payment_balance_rejected device=%s job_id=%s",
                     self.device_id,
                     job.job_id,
-                    payer_balance,
                 )
                 self.cache.confirmed_payment(final_amount(raw))
             else:
                 self.observe_balance(payer_balance)
                 LOG.info(
-                    "payment_balance_updated device=%s job_id=%s value=%s",
+                    "payment_balance_updated device=%s job_id=%s",
                     self.device_id,
                     job.job_id,
-                    format(payer_balance, ".2f"),
                 )
         else:
             LOG.info(
@@ -2926,16 +2984,22 @@ class WithdrawWorker:
                     )
                 )
 
-                LOG.error(
-                    "[withdraw-worker] execution failed "
-                    "device=%s withdraw_id=%s phase=%s job_id=%s "
-                    "error_type=%s error=%s",
-                    self.device_id,
-                    current.get("withdraw_id") if current else None,
-                    current.get("phase") if current else None,
-                    current.get("job_id") if current else None,
-                    type(exc).__name__,
-                    safe_error,
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "withdrawal",
+                    "withdrawal_failed",
+                    device_id=self.device_id,
+                    job_id=current.get("job_id") if current else None,
+                    workflow_id=current.get("workflow_id") if current else None,
+                    phase=current.get("phase") if current else None,
+                    error_code=(
+                        "authentication_required"
+                        if isinstance(exc, AuthenticationFailed)
+                        else getattr(exc, "error_code", None) or "withdrawal_failed"
+                    ),
+                    exception_type=type(exc).__name__,
+                    outcome="failed",
                 )
 
                 requires_intervention = isinstance(

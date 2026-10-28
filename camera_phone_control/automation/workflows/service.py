@@ -3,11 +3,13 @@
 import logging
 import threading
 import uuid
+import time
 from collections import deque
 from copy import deepcopy
 from dataclasses import asdict
 
 from ..backends import backend_names
+from diagnostic_logging import diagnostic_context, log_event
 from ..runner import Runner
 from .runner import WorkflowRunner
 from .screenshots import WorkflowScreenshotStore
@@ -87,6 +89,7 @@ class WorkflowService:
         device_id=None,
         cancel_event=None,
         start_step_index=0,
+        job_id=None,
     ):
         workflow = validate_workflow(workflow)
         variables = deepcopy(variables)
@@ -116,6 +119,7 @@ class WorkflowService:
                 "resume": resume,
                 "workflow_id": workflow["id"],
                 "device_id": target_device_id,
+                "job_id": job_id,
                 "logs": handler,
                 "backend": backend_names()[0],
                 "steps": self.preview_steps(workflow),
@@ -124,6 +128,7 @@ class WorkflowService:
                 "active": True,
                 "screenshots": [],
                 "outputs": {},
+                "diagnostic_failure": None,
             }
 
             external_screen = self.external_screen
@@ -154,26 +159,46 @@ class WorkflowService:
                 with self.lock:
                     item["outputs"][name] = value
 
+            def store_diagnostic_failure(failure):
+                with self.lock:
+                    if item["diagnostic_failure"] is None:
+                        item["diagnostic_failure"] = dict(failure)
+
             def execute():
+                started_at = time.monotonic()
                 try:
-                    runner.run_task(
-                        workflow["id"],
-                        lambda ctx: WorkflowRunner(
-                            ctx,
-                            external_screen,
-                            screen_state_provider,
-                            timing=item["timing"],
-                            capture_screen=capture_screen,
-                            output_callback=store_output,
-                        ).run(
-                            workflow,
-                            variables,
-                            start_step_index=start_step_index,
-                        ),
-                        cancel_event=cancel,
-                        resume_event=resume,
+                    with diagnostic_context(
                         device_id=target_device_id,
-                    )
+                        job_id=job_id,
+                        workflow_id=workflow["id"],
+                        workflow_run_id=run_id,
+                    ):
+                        log_event(
+                            logging.getLogger("workflow"),
+                            logging.INFO,
+                            "workflow",
+                            "workflow_started",
+                            retry_count=1 if start_step_index else 0,
+                        )
+                        runner.run_task(
+                            workflow["id"],
+                            lambda ctx: WorkflowRunner(
+                                ctx,
+                                external_screen,
+                                screen_state_provider,
+                                timing=item["timing"],
+                                capture_screen=capture_screen,
+                                output_callback=store_output,
+                                diagnostic_failure_callback=store_diagnostic_failure,
+                            ).run(
+                                workflow,
+                                variables,
+                                start_step_index=start_step_index,
+                            ),
+                            cancel_event=cancel,
+                            resume_event=resume,
+                            device_id=target_device_id,
+                        )
                 finally:
                     if isinstance(variables, dict):
                         variables.clear()
@@ -183,7 +208,46 @@ class WorkflowService:
                     with self.lock:
                         item["active"] = False
                     try:
-                        self._notify_completion(self.snapshot(run_id))
+                        snapshot = self.snapshot(run_id)
+                        diagnostic_failure = item.get("diagnostic_failure") or {}
+                        status = snapshot.get("status")
+                        event = {
+                            "passed": "workflow_completed",
+                            "cancelled": "workflow_cancelled",
+                        }.get(status, "workflow_failed")
+                        level = (
+                            logging.INFO
+                            if status in {"passed", "cancelled"}
+                            else logging.ERROR
+                        )
+                        with diagnostic_context(
+                            device_id=target_device_id,
+                            job_id=job_id,
+                            workflow_id=workflow["id"],
+                            workflow_run_id=run_id,
+                        ):
+                            log_event(
+                                logging.getLogger("workflow"),
+                                level,
+                                "workflow",
+                                event,
+                                step_id=diagnostic_failure.get("step_id")
+                                or snapshot.get("step_id"),
+                                error_code=diagnostic_failure.get("error_code")
+                                or snapshot.get("error_code")
+                                or (
+                                    "workflow_failed"
+                                    if status not in {"passed", "cancelled"}
+                                    else None
+                                ),
+                                exception_type=diagnostic_failure.get("exception_type"),
+                                duration_ms=round(
+                                    (time.monotonic() - started_at) * 1000
+                                ),
+                                outcome=status,
+                                retry_count=1 if start_step_index else 0,
+                            )
+                        self._notify_completion(snapshot)
                     finally:
                         completed.set()
 
@@ -199,7 +263,7 @@ class WorkflowService:
         """Worker entry point with a device fixed at job creation."""
         if workflow.get("id") != job.workflow:
             raise ValueError("Job workflow does not match the loaded workflow.")
-        options = {"device_id": job.device_id}
+        options = {"device_id": job.device_id, "job_id": job.job_id}
         options["start_step_index"] = job.start_step_index
         if cancel_event is not None:
             options["cancel_event"] = cancel_event

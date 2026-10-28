@@ -34,6 +34,7 @@ from .worker import (
 )
 
 from automation.workflows.values import parse_currency
+from diagnostic_logging import EVENT_DEDUPLICATOR, log_event
 
 from flask import jsonify, request
 
@@ -356,19 +357,20 @@ class WithdrawManager:
 
             return
 
-        LOG.info(
-            "balance_read device=%s value=%s",
-            device_id,
-            format(amount, ".2f"),
+        log_event(
+            LOG,
+            logging.INFO,
+            "balance",
+            "balance_refresh_completed",
+            device_id=device_id,
+            workflow_id=workflow_id,
+            workflow_run_id=snapshot.get("run_id"),
+            outcome="completed",
         )
 
         worker.observe_balance(amount)
 
-        LOG.info(
-            "balance_cache_updated device=%s value=%s",
-            device_id,
-            format(amount, ".2f"),
-        )
+        LOG.debug("Balance cache updated for device=%s", device_id)
 
         self.dispatcher.wake()
 
@@ -596,6 +598,25 @@ class WithdrawManager:
                 raise ValueError(balance_error)
 
         except (KeyError, RecordNotFound, ValueError) as error:
+
+            reason = type(error).__name__
+            error_code = (
+                getattr(error, "error_code", None) or "payment_readiness_failed"
+            )
+            if EVENT_DEDUPLICATOR.should_log(
+                "withdrawal",
+                "payment_readiness_failed",
+                (device_id, reason, error_code),
+            ):
+                log_event(
+                    LOG,
+                    logging.WARNING,
+                    "withdrawal",
+                    "payment_readiness_failed",
+                    device_id=device_id,
+                    error_code=error_code,
+                    exception_type=reason,
+                )
 
             return False, str(error)
 

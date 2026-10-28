@@ -162,11 +162,11 @@ class WithdrawDispatcher:
                 tx_id = item.get("tx_id")
                 LOG.info(
                     "[withdraw-dispatch] client-pending device=%s id=%s "
-                    "tx_id=%s final_amount=%s",
+                    "tx_id=%s final_amount_present=%s",
                     worker.device_id,
                     _sanitized_pending_value(withdraw_id),
                     _sanitized_pending_value(tx_id),
-                    _sanitized_pending_value(item.get("final_amount")),
+                    item.get("final_amount") is not None,
                 )
                 if (
                     type(withdraw_id) is not int
@@ -175,10 +175,10 @@ class WithdrawDispatcher:
                 ):
                     LOG.info(
                         "[withdraw-dispatch] client-pending skip reason=invalid_identity "
-                        "id=%s tx_id=%s final_amount=%s",
+                        "id=%s tx_id=%s final_amount_present=%s",
                         _sanitized_pending_value(withdraw_id),
                         _sanitized_pending_value(tx_id),
-                        _sanitized_pending_value(item.get("final_amount")),
+                        item.get("final_amount") is not None,
                     )
                     continue
 
@@ -190,10 +190,10 @@ class WithdrawDispatcher:
                         LOG.info(
                             "[withdraw-dispatch] client-pending skip "
                             "reason=inconsistent_identity id=%s tx_id=%s "
-                            "final_amount=%s",
+                            "final_amount_present=%s",
                             _sanitized_pending_value(withdraw_id),
                             _sanitized_pending_value(tx_id),
-                            _sanitized_pending_value(item.get("final_amount")),
+                            item.get("final_amount") is not None,
                         )
                     found["visible"].add(worker.device_id)
                     continue
@@ -221,12 +221,12 @@ class WithdrawDispatcher:
         suffix = f" detail={detail}" if detail else ""
         LOG.info(
             "[withdraw-dispatch] client-pending skip device=%s reason=%s "
-            "id=%s tx_id=%s final_amount=%s%s",
+            "id=%s tx_id=%s final_amount_present=%s%s",
             worker.device_id,
             reason,
             _sanitized_pending_value(item.get("id")),
             _sanitized_pending_value(item.get("tx_id")),
-            _sanitized_pending_value(item.get("final_amount")),
+            item.get("final_amount") is not None,
             suffix,
         )
         return False
@@ -325,11 +325,7 @@ class WithdrawDispatcher:
         if not self.scheduler.is_device_ready(worker.device_id)["ready"]:
             unavailable[worker.device_id] = "scheduler_not_ready"
             return self._log_skip(worker, item, "scheduler_not_ready")
-        LOG.info(
-            "dispatcher_balance device=%s value=%s",
-            worker.device_id,
-            format(worker.cache.available_balance, ".2f"),
-        )
+        LOG.debug("Dispatcher balance is available for device=%s", worker.device_id)
         if self.stop.is_set():
             return False
 
@@ -543,19 +539,19 @@ class WithdrawDispatcher:
         except (ValueError, TypeError):
             LOG.info(
                 "[withdraw-dispatch] client-pending skip reason=invalid_amount "
-                "id=%s tx_id=%s final_amount=%s",
+                "id=%s tx_id=%s final_amount_present=%s",
                 _sanitized_pending_value(item.get("id")),
                 _sanitized_pending_value(item.get("tx_id")),
-                _sanitized_pending_value(item.get("final_amount")),
+                item.get("final_amount") is not None,
             )
             return False
         if self.journal.identity_conflict(item["id"], item["tx_id"]):
             LOG.info(
                 "[withdraw-dispatch] client-pending skip "
-                "reason=duplicate_withdrawal id=%s tx_id=%s final_amount=%s",
+                "reason=duplicate_withdrawal id=%s tx_id=%s final_amount_present=%s",
                 _sanitized_pending_value(item.get("id")),
                 _sanitized_pending_value(item.get("tx_id")),
-                _sanitized_pending_value(item.get("final_amount")),
+                item.get("final_amount") is not None,
             )
             return False
         for worker in self._ordered_candidates(item, visible, unavailable):

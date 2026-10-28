@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import threading
+import logging
 
 
 import time
@@ -16,6 +17,9 @@ from dataclasses import replace
 
 
 from automation.workflows.models import now
+from diagnostic_logging import log_event
+
+LOG = logging.getLogger("jobs")
 
 
 from .models import (
@@ -262,6 +266,39 @@ class JobScheduler:
             timestamp,
             "Recovery was interrupted by backend restart; it was not replayed.",
         )
+
+        for job_id in jobs:
+            try:
+                job = self.store.get(job_id)
+            except Exception:
+                continue
+            log_event(
+                LOG,
+                logging.ERROR,
+                "workflow",
+                "workflow_interrupted",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=job.workflow,
+                error_code="backend_restarted",
+                outcome="interrupted",
+            )
+        for job_id in recoveries:
+            try:
+                job = self.store.get(job_id)
+            except Exception:
+                continue
+            log_event(
+                LOG,
+                logging.ERROR,
+                "workflow",
+                "reconciliation_required",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=job.recovery_workflow_id,
+                error_code="recovery_interrupted",
+                outcome="needs_attention",
+            )
 
         return jobs + recoveries
 

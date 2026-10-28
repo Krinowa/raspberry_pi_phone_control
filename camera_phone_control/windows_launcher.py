@@ -14,10 +14,16 @@ import urllib.error
 import urllib.request
 import webbrowser
 from ctypes import wintypes
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from windows_runtime import RuntimePaths
+from diagnostic_logging import (
+    application_version,
+    configure_production_logging,
+    log_event,
+    register_sensitive_environment,
+    write_startup_error,
+)
+from windows_runtime import RuntimePaths, default_data_root
 
 LOG = logging.getLogger("windows-launcher")
 APP_MUTEX_NAME = "Local\\PhoneController.Backend"
@@ -29,28 +35,16 @@ HEALTH_CLIENT = "launcher-health"
 
 
 def _configure_logging(log_directory: Path):
-    log_directory.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        log_directory / "phone-controller.log",
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
+    return configure_production_logging(
+        log_directory, version=application_version(), packaged=True
     )
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-    )
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.handlers.clear()
-    root.addHandler(handler)
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 def _message_box(title, message):
     if os.name == "nt":
         ctypes.windll.user32.MessageBoxW(None, str(message), str(title), 0x10)
     else:
-        LOG.error("%s: %s", title, message)
+        LOG.error("Could not display Windows message box: %s", title)
 
 
 def _win32_handle(function, *args):
@@ -163,6 +157,7 @@ def _prepare_environment(paths):
     os.environ.setdefault(
         "PHONE_SESSION_SECRET", load_or_create_secret_key(paths.config)
     )
+    register_sensitive_environment()
 
 
 def _create_application(paths):
@@ -216,8 +211,15 @@ def _warm_ocr(app):
         return
     try:
         start_worker()
-    except Exception:
-        LOG.exception("PaddleOCR worker warmup failed")
+    except Exception as exc:
+        log_event(
+            LOG,
+            logging.ERROR,
+            "ocr",
+            "ocr_worker_start_failed",
+            error_code="ocr_worker_start_failed",
+            exception_type=type(exc).__name__,
+        )
 
 
 def _close_application(app, camera_manager):
@@ -281,7 +283,7 @@ def main(argv=None):
     dashboard_url = f"http://127.0.0.1:{args.port}/"
     paths = None
     mutex_handle = shutdown_handle = None
-    app = camera_manager = server = None
+    app = camera_manager = server = logging_runtime = None
     try:
         mutex_handle, already_running = _acquire_instance_mutex()
         if already_running:
@@ -293,7 +295,7 @@ def main(argv=None):
             )
 
         paths = RuntimePaths.create()
-        _configure_logging(paths.logs)
+        logging_runtime = _configure_logging(paths.logs)
         shutdown_handle = _create_shutdown_event()
         _prepare_environment(paths)
         app, camera_manager = _create_application(paths)
@@ -316,11 +318,43 @@ def main(argv=None):
             name="windows-shutdown-event",
             daemon=True,
         ).start()
-        LOG.info("Phone Controller listening at %s", dashboard_url)
+        log_event(
+            LOG,
+            logging.INFO,
+            "app",
+            "app_listening",
+            host="127.0.0.1",
+            port=args.port,
+            app_version=logging_runtime.app_version,
+            session_id=logging_runtime.session_id,
+        )
         server.serve_forever()
         return 0
     except Exception as exc:
-        LOG.exception("Phone Controller startup failed")
+        if logging_runtime is not None:
+            log_event(
+                LOG,
+                logging.CRITICAL,
+                "app",
+                "app_start_failed",
+                "Phone Controller startup failed",
+                error_code="app_start_failed",
+                exception_type=type(exc).__name__,
+                app_version=logging_runtime.app_version,
+                session_id=logging_runtime.session_id,
+            )
+        else:
+            try:
+                fallback_root = (
+                    paths.logs if paths is not None else default_data_root() / "logs"
+                )
+                write_startup_error(
+                    fallback_root,
+                    "Phone Controller startup failed",
+                    exception_type=type(exc).__name__,
+                )
+            except Exception:
+                pass
         _message_box(
             "Phone Controller could not start",
             f"{exc}\n\n"
@@ -332,15 +366,33 @@ def main(argv=None):
         )
         return 1
     finally:
+        if logging_runtime is not None:
+            log_event(
+                LOG,
+                logging.INFO,
+                "app",
+                "app_stopping",
+                app_version=logging_runtime.app_version,
+                session_id=logging_runtime.session_id,
+            )
         if server is not None:
             server.server_close()
         if app is not None and camera_manager is not None:
             try:
                 _close_application(app, camera_manager)
-            except Exception:
-                LOG.exception("Phone Controller cleanup failed")
+            except Exception as exc:
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "app",
+                    "app_cleanup_failed",
+                    error_code="app_cleanup_failed",
+                    exception_type=type(exc).__name__,
+                )
         _close_handle(shutdown_handle)
         _close_handle(mutex_handle)
+        if logging_runtime is not None:
+            logging_runtime.stop()
 
 
 if __name__ == "__main__":

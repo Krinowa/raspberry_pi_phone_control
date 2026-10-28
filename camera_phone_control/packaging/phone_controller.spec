@@ -28,6 +28,11 @@ required_model_files = (
     "inference.yml",
 )
 workflow_seeds = APP_ROOT / "packaging" / "workflow_seeds"
+build_version = os.environ.get("PHONE_CONTROLLER_BUILD_VERSION", "").strip()
+version_marker = APP_ROOT / "build" / "phone-controller-version.txt"
+if build_version:
+    version_marker.parent.mkdir(parents=True, exist_ok=True)
+    version_marker.write_text(build_version[:80] + "\n", encoding="utf-8")
 
 subprocess.run(
     [
@@ -44,6 +49,8 @@ datas = [
     (str(workflow_seeds), "automation/workflow_data"),
     (str(APP_ROOT / "packaging" / "defaults"), "packaging/defaults"),
 ]
+if build_version and version_marker.is_file():
+    datas.append((str(version_marker), "."))
 binaries = []
 hiddenimports = []
 

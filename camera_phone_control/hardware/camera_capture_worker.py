@@ -9,6 +9,12 @@ import time
 
 import cv2
 
+from diagnostic_logging import (
+    configure_child_logging,
+    current_logging_queue,
+    log_event,
+)
+
 from hardware.camera_identity import discover_macos_devices
 
 LOG = logging.getLogger("camera-worker")
@@ -181,6 +187,7 @@ def capture_worker_main(
     identity_discovery=None,
 ):
     """Own one AVFoundation handle until stopped or frame delivery fails."""
+    configure_child_logging(config.get("_diagnostic_log_queue"))
     capture = None
     capture_factory = capture_factory or cv2.VideoCapture
     identity_discovery = identity_discovery or discover_macos_devices
@@ -296,7 +303,16 @@ def capture_worker_main(
             target_fps = fps_value.value if fps_value is not None else config["fps"]
             stop_event.wait(max(0, 1 / target_fps - elapsed))
     except Exception as exc:
-        LOG.error("%s", exc)
+        log_event(
+            LOG,
+            logging.ERROR,
+            "camera",
+            "camera_worker_exited",
+            device_id=config.get("device_id"),
+            camera_id=config.get("stable_id") or config.get("camera_name"),
+            error_code="camera_worker_exited",
+            exception_type=type(exc).__name__,
+        )
         message = {
             "type": "error",
             "error": str(exc),
@@ -315,6 +331,9 @@ class CameraCaptureWorker:
 
     def __init__(self, config, *, context=None, target=capture_worker_main):
         self.config = dict(config)
+        log_queue = current_logging_queue()
+        if log_queue is not None:
+            self.config["_diagnostic_log_queue"] = log_queue
         self.context = context or multiprocessing.get_context("spawn")
         self.fps_value = self.context.Value("d", float(self.config["fps"]))
         self.config["fps_value"] = self.fps_value

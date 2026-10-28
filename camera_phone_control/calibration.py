@@ -13,6 +13,7 @@ import numpy as np
 
 from automation.coordinates import normalized_to_device, unit
 from hardware.device_config import DEFAULT_DEVICE_ID, validate_device_id
+from diagnostic_logging import EVENT_DEDUPLICATOR, log_event
 
 LOG = logging.getLogger("calibration")
 DEFAULT_CALIBRATION_PATH = (
@@ -179,9 +180,32 @@ class CalibrationStorage:
                 return cached[1]
 
             if not path.exists():
+                device_id = getattr(device, "device_id", None) or DEFAULT_DEVICE_ID
+                if EVENT_DEDUPLICATOR.should_log(
+                    "camera", "calibration_missing", (device_id,)
+                ):
+                    log_event(
+                        LOG,
+                        logging.WARNING,
+                        "camera",
+                        "calibration_missing",
+                        device_id=device_id,
+                        error_code="calibration_missing",
+                    )
                 return None
             if path.is_symlink():
-                LOG.warning("Saved calibration file is invalid; starting uncalibrated.")
+                device_id = getattr(device, "device_id", None) or DEFAULT_DEVICE_ID
+                if EVENT_DEDUPLICATOR.should_log(
+                    "camera", "calibration_invalid", (device_id,)
+                ):
+                    log_event(
+                        LOG,
+                        logging.WARNING,
+                        "camera",
+                        "calibration_invalid",
+                        device_id=device_id,
+                        error_code="calibration_invalid",
+                    )
                 return None
             try:
                 if path.stat().st_size > 64 * 1024:
@@ -227,7 +251,18 @@ class CalibrationStorage:
 
                 calibration = Calibration(data.get("corners"))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                LOG.warning("Saved calibration file is invalid; starting uncalibrated.")
+                device_id = getattr(device, "device_id", None) or DEFAULT_DEVICE_ID
+                if EVENT_DEDUPLICATOR.should_log(
+                    "camera", "calibration_invalid", (device_id,)
+                ):
+                    log_event(
+                        LOG,
+                        logging.WARNING,
+                        "camera",
+                        "calibration_invalid",
+                        device_id=device_id,
+                        error_code="calibration_invalid",
+                    )
                 return None
 
             LOG.info("Loaded saved camera calibration.")

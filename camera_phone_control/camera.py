@@ -9,6 +9,8 @@ from collections import deque
 
 import cv2
 
+from diagnostic_logging import log_event, sanitize_url
+
 from hardware.camera_capture_worker import (
     STABLE_IDENTITY_MISMATCH,
     CameraCaptureWorker,
@@ -325,7 +327,16 @@ class Camera:
                     self.error = ""
         except Exception as exc:
             if not self.stop_event.is_set():
-                LOG.error("%s", exc)
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "camera",
+                    "camera_worker_exited",
+                    device_id=getattr(self, "device_id", None),
+                    camera_id=getattr(self, "configured_source", None),
+                    error_code="camera_worker_exited",
+                    exception_type=type(exc).__name__,
+                )
                 with self.lock:
                     if self.open_succeeded is None:
                         self.open_succeeded = False
@@ -361,7 +372,7 @@ class Camera:
         if isinstance(self.source, str):
             LOG.info(
                 "Opening network camera stream: %s",
-                self.source,
+                sanitize_url(self.source),
             )
 
             return cv2.VideoCapture(
@@ -602,10 +613,26 @@ class Camera:
                         failure_seconds=failure_seconds,
                     )
                     if consecutive_read_failures == 1:
-                        LOG.warning(
-                            "%s Retrying for up to %.2fs before recovery.",
-                            message,
-                            failure_limit,
+                        log_event(
+                            LOG,
+                            logging.WARNING,
+                            "camera",
+                            "camera_read_failed",
+                            "Camera frame delivery failed; recovery will be attempted.",
+                            device_id=getattr(self, "device_id", None),
+                            camera_id=getattr(self, "configured_source", None),
+                            error_code="camera_read_failed",
+                            duration_ms=round(failure_seconds * 1000),
+                            recovery_attempt=1,
+                        )
+                        log_event(
+                            LOG,
+                            logging.WARNING,
+                            "camera",
+                            "camera_recovery_started",
+                            device_id=getattr(self, "device_id", None),
+                            camera_id=getattr(self, "configured_source", None),
+                            recovery_attempt=1,
                         )
 
                     if failure_seconds >= failure_limit:
@@ -615,11 +642,17 @@ class Camera:
                     continue
 
                 if consecutive_read_failures:
-                    LOG.info(
-                        "Camera frame delivery recovered without reopen after "
-                        "%d failed reads and %.3fs",
-                        consecutive_read_failures,
-                        time.monotonic() - failure_started,
+                    log_event(
+                        LOG,
+                        logging.INFO,
+                        "camera",
+                        "camera_recovered",
+                        "Camera frame delivery recovered.",
+                        device_id=getattr(self, "device_id", None),
+                        camera_id=getattr(self, "configured_source", None),
+                        failed_reads=consecutive_read_failures,
+                        duration_ms=round((time.monotonic() - failure_started) * 1000),
+                        outcome="recovered",
                     )
                 failure_started = None
                 consecutive_read_failures = 0
@@ -719,10 +752,19 @@ class Camera:
                 self.stop_event.wait(wait_time)
 
         except Exception as exc:
-
-            LOG.error(
-                "%s",
-                exc,
+            log_event(
+                LOG,
+                logging.ERROR,
+                "camera",
+                (
+                    "camera_open_failed"
+                    if self.open_succeeded is None
+                    else "camera_read_failed"
+                ),
+                device_id=getattr(self, "device_id", None),
+                camera_id=getattr(self, "configured_source", None),
+                error_code="camera_unavailable",
+                exception_type=type(exc).__name__,
             )
 
             with self.lock:

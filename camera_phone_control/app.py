@@ -8,6 +8,7 @@ import secrets
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -24,6 +25,12 @@ from flask import (
     url_for,
 )
 from werkzeug.exceptions import HTTPException
+from diagnostic_logging import (
+    EVENT_DEDUPLICATOR,
+    configure_development_logging,
+    log_event,
+    register_secrets,
+)
 
 from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration, CalibrationStorage
@@ -501,11 +508,13 @@ def create_app(
         device_workflow_store or DeviceWorkflowAssignmentStore()
     )
     app.config["CONTROL_TOKEN"] = token
+    register_secrets(token, session_secret)
     diagnostics = install_recent_log_handler(secrets=(token, session_secret))
     app.extensions["recent_diagnostics"] = diagnostics
 
     @app.before_request
     def protect_local_requests():
+        g.request_id = uuid.uuid4().hex
         if preview_debug:
             g.preview_request_started = time.monotonic()
             with request_metrics["lock"]:
@@ -546,6 +555,7 @@ def create_app(
 
     @app.after_request
     def local_headers(response):
+        response.headers["X-Request-Id"] = getattr(g, "request_id", "")
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -621,6 +631,18 @@ def create_app(
 
     @app.errorhandler(NoAutomation)
     def no_automation(exc):
+        route = request.url_rule.rule if request.url_rule is not None else request.path
+        if EVENT_DEDUPLICATOR.should_log("device", "device_not_ready", (route,)):
+            log_event(
+                LOG,
+                logging.WARNING,
+                "device",
+                "device_not_ready",
+                request_id=getattr(g, "request_id", None),
+                route=route,
+                error_code="device_not_ready",
+                exception_type=type(exc).__name__,
+            )
         return (
             jsonify(
                 ok=False,
@@ -638,7 +660,19 @@ def create_app(
 
     @app.errorhandler(Exception)
     def unexpected_error(exc):
-        LOG.exception("Unhandled dashboard request error")
+        log_event(
+            LOG,
+            logging.ERROR,
+            "api",
+            "api_request_failed",
+            request_id=getattr(g, "request_id", None),
+            route=(
+                request.url_rule.rule if request.url_rule is not None else request.path
+            ),
+            method=request.method,
+            error_code="dashboard_request_failed",
+            exception_type=type(exc).__name__,
+        )
         return (
             jsonify(
                 ok=False,
@@ -698,6 +732,71 @@ def create_app(
         if not 1 <= limit <= 500:
             raise ValueError("Diagnostic log limit must be between 1 and 500.")
         return jsonify(logs=diagnostics.recent(limit=limit, query=query))
+
+    frontend_diagnostic_events = {
+        "frontend_api_network_failed",
+        "frontend_action_failed",
+        "frontend_preview_unavailable",
+        "frontend_preview_recovered",
+        "frontend_manual_assistance_failed",
+        "frontend_workflow_command_failed",
+        "frontend_recorder_command_uncertain",
+    }
+    frontend_diagnostic_fields = {
+        "device_id",
+        "job_id",
+        "operation",
+        "error_code",
+        "status",
+        "consecutive_failures",
+    }
+    frontend_diagnostic_rate = {"lock": threading.Lock(), "times": []}
+
+    @app.post("/api/diagnostics/frontend")
+    def frontend_diagnostic():
+        data = payload()
+        if set(data) != {"event", "params"}:
+            raise ValueError("Invalid frontend diagnostic fields.")
+        event = data.get("event")
+        params = data.get("params")
+        if event not in frontend_diagnostic_events or not isinstance(params, dict):
+            raise ValueError("Invalid frontend diagnostic event.")
+        if set(params) - frontend_diagnostic_fields or len(params) > 5:
+            raise ValueError("Invalid frontend diagnostic parameters.")
+        safe = {}
+        for key, value in params.items():
+            if isinstance(value, str):
+                if not 1 <= len(value) <= 120 or any(ord(char) < 32 for char in value):
+                    raise ValueError("Invalid frontend diagnostic parameter.")
+            elif not isinstance(value, (int, bool)):
+                raise ValueError("Invalid frontend diagnostic parameter.")
+            safe[key] = value
+        current = time.monotonic()
+        with frontend_diagnostic_rate["lock"]:
+            recent = [
+                stamp
+                for stamp in frontend_diagnostic_rate["times"]
+                if current - stamp < 60
+            ]
+            frontend_diagnostic_rate["times"] = recent
+            if len(recent) >= 30:
+                return jsonify(ok=True)
+            recent.append(current)
+        identity = tuple((key, safe[key]) for key in sorted(safe))
+        if EVENT_DEDUPLICATOR.should_log("frontend", event, identity):
+            log_event(
+                LOG,
+                (
+                    logging.INFO
+                    if event == "frontend_preview_recovered"
+                    else logging.WARNING
+                ),
+                "frontend",
+                event,
+                request_id=getattr(g, "request_id", None),
+                **safe,
+            )
+        return jsonify(ok=True)
 
     @app.get("/api/pi/status")
     def pi_status():
@@ -1921,12 +2020,7 @@ def main():
     ):
         parser.error("Invalid camera index, port, or frame size.")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(name)s] %(message)s",
-    )
-
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    configure_development_logging()
 
     # Use network stream if provided,
     # otherwise use local camera index.
@@ -1953,7 +2047,14 @@ def main():
             try:
                 start_ocr_worker()
             except Exception as exc:
-                LOG.warning("PaddleOCR worker warmup failed: %s", exc)
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "ocr",
+                    "ocr_worker_start_failed",
+                    error_code="ocr_worker_start_failed",
+                    exception_type=type(exc).__name__,
+                )
 
         threading.Thread(
             target=warm_ocr_worker,

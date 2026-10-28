@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from android_control import AndroidControl, DeviceError
 from device_lock import DeviceBusy, DeviceLocks
 from hardware.pi_api_client import PiApiError
+from diagnostic_logging import configure_development_logging
 from .context import AutomationContext, Cancelled
 from .backends import select_device, backend_names
 from .input.base import UnsupportedOperation
@@ -277,7 +278,7 @@ def main(argv=None):
     if not args.script:
         parser.error("a script name is required (or use --list)")
 
-    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+    configure_development_logging()
     cancel_event = threading.Event()
     previous = signal.signal(signal.SIGINT, lambda signum, frame: cancel_event.set())
 

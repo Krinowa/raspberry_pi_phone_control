@@ -44,6 +44,7 @@ developer (Python is not required on client machines):
 
 ```bat
 cd C:\path\to\phone_controller\camera_phone_control
+set APP_VERSION=1.0.0
 packaging\build_windows.bat
 ```
 

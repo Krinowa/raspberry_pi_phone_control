@@ -16,6 +16,12 @@ from collections import deque
 import cv2
 import numpy as np
 
+from diagnostic_logging import (
+    configure_child_logging,
+    current_logging_queue,
+    log_event,
+)
+
 try:
     import resource
 except ImportError:  # Windows has no POSIX resource module.
@@ -140,6 +146,7 @@ def _plain_result(result):
 
 def _paddle_worker(connection, config):
     """Persistent child entry point. The model is initialized exactly once."""
+    configure_child_logging(config.get("_diagnostic_log_queue"))
     worker_pid = os.getpid()
     try:
         started = time.monotonic()
@@ -223,6 +230,9 @@ class _PaddleWorkerClient:
 
     def __init__(self, config, timeout, *, context=None, target=None):
         self.config = dict(config)
+        log_queue = current_logging_queue()
+        if log_queue is not None:
+            self.config["_diagnostic_log_queue"] = log_queue
         self.timeout = float(timeout)
         self.context = context or multiprocessing.get_context("spawn")
         self.target = target or _paddle_worker
@@ -256,6 +266,15 @@ class _PaddleWorkerClient:
                 ) from exc
             if not process.is_alive():
                 exitcode = process.exitcode
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "ocr",
+                    "ocr_worker_exited",
+                    worker_id=process.pid,
+                    exit_code=exitcode,
+                    error_code="ocr_worker_exited",
+                )
                 self._stop(force=True)
                 raise ScreenStateError(
                     f"PaddleOCR worker stopped unexpectedly (exit code {exitcode})."
@@ -293,6 +312,15 @@ class _PaddleWorkerClient:
             raise
         if message[0] == "startup_error":
             _, pid, error_type, detail = message
+            log_event(
+                LOG,
+                logging.ERROR,
+                "ocr",
+                "ocr_worker_start_failed",
+                worker_id=pid,
+                exception_type=error_type,
+                error_code="ocr_worker_start_failed",
+            )
             self._stop(force=True)
             raise TextDetectionUnavailable(
                 f"PaddleOCR worker {pid} could not initialize: "
@@ -304,16 +332,14 @@ class _PaddleWorkerClient:
                 "PaddleOCR worker returned an invalid startup response."
             )
         _, pid, self.initialization_seconds = message
-        LOG.info(
-            "PaddleOCR worker ready pid=%d main_pid=%d model_init=%.2fs "
-            "language=%s textline_orientation=%s cpu_threads=%d rec_batch=%s",
-            pid,
-            os.getpid(),
-            self.initialization_seconds,
-            self.config["language"],
-            self.config["textline_orientation"],
-            self.config["cpu_threads"],
-            self.config.get("recognition_batch_size"),
+        log_event(
+            LOG,
+            logging.INFO,
+            "ocr",
+            "ocr_worker_ready",
+            worker_id=pid,
+            duration_ms=round(self.initialization_seconds * 1000),
+            outcome="ready",
         )
         return time.monotonic() - started
 
@@ -507,9 +533,9 @@ class _PaddleWorkerPool:
             slot["state"] = "FAILED"
             self.condition.notify_all()
 
-    def request(self, image):
+    def request(self, image, *, request_id=None):
         submitted = time.monotonic()
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         deadline = submitted + self.timeout
         with self.condition:
             if not self.accepting:
@@ -1275,9 +1301,19 @@ class CameraOCRScreenStateProvider:
                 timings["input_height"] = prepared.shape[0]
                 self._save_debug_image(prepared)
                 request_started = time.monotonic()
+                ocr_request_id = uuid.uuid4().hex
+                log_event(
+                    LOG,
+                    logging.DEBUG,
+                    "ocr",
+                    "ocr_request_started",
+                    ocr_request_id=ocr_request_id,
+                )
                 try:
-                    results, worker_timings = self._worker.request(prepared)
-                except Exception:
+                    results, worker_timings = self._worker.request(
+                        prepared, request_id=ocr_request_id
+                    )
+                except Exception as exc:
                     # A failed recognition invalidates even an older successful
                     # screen result; the next request must ask Paddle again.
                     self._cache_by_scope.clear()
@@ -1287,10 +1323,37 @@ class CameraOCRScreenStateProvider:
                     self._record_workflow_timings(
                         timings, frame_id, False, failed=True, scope=scope
                     )
+                    try:
+                        timed_out = "timed out" in str(exc).casefold()
+                    except Exception:
+                        timed_out = False
+                    log_event(
+                        LOG,
+                        logging.WARNING if timed_out else logging.ERROR,
+                        "ocr",
+                        "ocr_timeout" if timed_out else "ocr_inference_failed",
+                        ocr_request_id=ocr_request_id,
+                        error_code=(
+                            "ocr_timeout" if timed_out else "ocr_inference_failed"
+                        ),
+                        exception_type=type(exc).__name__,
+                        duration_ms=round(timings["total"] * 1000),
+                    )
                     raise
                 worker_queue_wait = worker_timings.pop("queue_wait", 0.0)
                 timings.update(worker_timings)
                 timings["queue_wait"] = provider_queue_wait + worker_queue_wait
+                log_event(
+                    LOG,
+                    logging.DEBUG,
+                    "ocr",
+                    "ocr_request_completed",
+                    ocr_request_id=ocr_request_id,
+                    worker_id=worker_timings.get("worker_id")
+                    or worker_timings.get("worker_pid"),
+                    duration_ms=round((time.monotonic() - request_started) * 1000),
+                    outcome="completed",
+                )
                 postprocess_started = time.monotonic()
                 candidates = self._candidates_from_results(results)
                 timings["postprocess"] = time.monotonic() - postprocess_started

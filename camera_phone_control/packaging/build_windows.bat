@@ -31,6 +31,8 @@ set "PHONE_CONTROLLER_BUILD_CACHE=%CD%\build\paddlex"
 python packaging\prepare_ocr_models.py --cache-root "%PHONE_CONTROLLER_BUILD_CACHE%"
 if errorlevel 1 exit /b 1
 set "PHONE_CONTROLLER_BUILD_MODEL_ROOT=%PHONE_CONTROLLER_BUILD_CACHE%\official_models"
+if not defined APP_VERSION set "APP_VERSION=development"
+set "PHONE_CONTROLLER_BUILD_VERSION=%APP_VERSION%"
 
 if not exist "packaging\vendor\ffmpeg.exe" (
   echo WARNING: packaging\vendor\ffmpeg.exe is absent.

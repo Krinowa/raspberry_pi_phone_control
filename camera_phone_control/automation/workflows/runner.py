@@ -1,7 +1,10 @@
 """Transport-independent execution. Ownership is supplied by automation.Runner."""
 
 import re
+import logging
 import time
+
+from diagnostic_logging import diagnostic_context, log_event
 
 from .validation import validate_workflow, resolve_variables
 from ..context import Cancelled
@@ -87,6 +90,7 @@ class WorkflowRunner:
         timing=None,
         capture_screen=None,
         output_callback=None,
+        diagnostic_failure_callback=None,
     ):
         self.context = context
         self.external_screen = external_screen
@@ -98,6 +102,23 @@ class WorkflowRunner:
         self.timing = timing or WorkflowTiming()
         self.capture_screen = capture_screen
         self.output_callback = output_callback
+        self.diagnostic_failure_callback = diagnostic_failure_callback
+
+    @staticmethod
+    def _diagnostic_error_code(exc, step_type):
+        code = getattr(exc, "error_code", None)
+        if isinstance(code, str) and code:
+            return code
+        if step_type in {"wait_for_text", "verify_text", "if_text", "ocr_value"}:
+            try:
+                timed_out = "timed out" in str(exc).casefold()
+            except Exception:
+                timed_out = False
+            if timed_out:
+                return "ocr_timeout"
+            if isinstance(exc, ScreenStateError):
+                return "ocr_inference_failed"
+        return "workflow_step_failed"
 
     def run(self, workflow, variables=None, *, start_step_index=0):
         workflow = validate_workflow(workflow)
@@ -120,6 +141,15 @@ class WorkflowRunner:
                 ctx.state.step_index = index
                 ctx.state.step_id = step["id"]
                 ctx.state.current_step = step["type"]
+                log_event(
+                    logging.getLogger("workflow"),
+                    logging.INFO,
+                    "workflow",
+                    "step_started",
+                    step_id=step["id"],
+                    step_type=step["type"],
+                    step_index=index,
+                )
                 ctx.logger.info(
                     "Workflow step %s/%s started: %s",
                     index,
@@ -128,25 +158,53 @@ class WorkflowRunner:
                 )
                 self.timing.begin_step(index, step["type"])
                 try:
-                    following = (
-                        workflow["steps"][index]
-                        if index < len(workflow["steps"])
-                        else None
-                    )
-                    self._prepare_text_wait_baseline(step, following)
-                    self.execute_step(step, values, workflow.get("keyboards", {}))
-                    ctx.check_cancelled()
+                    with diagnostic_context(step_id=step["id"]):
+                        following = (
+                            workflow["steps"][index]
+                            if index < len(workflow["steps"])
+                            else None
+                        )
+                        self._prepare_text_wait_baseline(step, following)
+                        self.execute_step(step, values, workflow.get("keyboards", {}))
+                        ctx.check_cancelled()
                 except Cancelled:
                     self.timing.end_step("cancelled")
                     self._log_step_timing(ctx, index)
                     ctx.logger.info("Workflow step %s cancelled.", index)
                     raise
-                except Exception:
+                except Exception as exc:
                     self.timing.end_step("failed")
                     self._log_step_timing(ctx, index)
                     ctx.logger.info(
                         "Workflow step %s failed; no retry attempted.", index
                     )
+                    diagnostic_error_code = self._diagnostic_error_code(
+                        exc, step["type"]
+                    )
+                    log_event(
+                        logging.getLogger("workflow"),
+                        logging.ERROR,
+                        "workflow",
+                        "step_failed",
+                        step_id=step["id"],
+                        step_type=step["type"],
+                        step_index=index,
+                        error_code=diagnostic_error_code,
+                        exception_type=type(exc).__name__,
+                        duration_ms=round(
+                            self.timing.snapshot()["steps"][-1]["total_seconds"] * 1000
+                        ),
+                        retry_count=0,
+                    )
+                    if self.diagnostic_failure_callback is not None:
+                        self.diagnostic_failure_callback(
+                            {
+                                "step_id": step["id"],
+                                "step_type": step["type"],
+                                "error_code": diagnostic_error_code,
+                                "exception_type": type(exc).__name__,
+                            }
+                        )
                     raise
                 self.timing.end_step("completed")
                 self._log_step_timing(ctx, index)
@@ -245,7 +303,7 @@ class WorkflowRunner:
             )
             ctx.logger.info("Screen stable for %s ms.", step["stable_ms"])
         elif kind == "wait_for_text":
-            ctx.logger.info("Waiting for text: %s", step["text"])
+            ctx.logger.info("Waiting for expected text.")
             wait_for_text(
                 self.screen_state_provider,
                 ctx,
@@ -253,7 +311,7 @@ class WorkflowRunner:
                 step["timeout_seconds"],
                 roi=step.get("roi"),
             )
-            ctx.logger.info("Text detected: %s", step["text"])
+            ctx.logger.info("Expected text detected.")
         elif kind == "verify_text":
             source = step["source"]
             reference = step.get("variable") if source == "variable" else "fixed"
@@ -288,7 +346,7 @@ class WorkflowRunner:
                 step["match_mode"],
             )
         elif kind == "if_text":
-            ctx.logger.info("Evaluating text condition: %s", step["text"])
+            ctx.logger.info("Evaluating expected-text condition.")
             matched = wait_for_text(
                 self.screen_state_provider,
                 ctx,
@@ -351,6 +409,7 @@ class WorkflowRunner:
         """Run validated nested steps through the normal step executor."""
         for index, step in enumerate(steps, 1):
             started = time.monotonic()
+            nested_step_id = step.get("id") or f"{branch_name}.{index}"
             self.context.check_cancelled()
             self.context.state.current_step = step["type"]
             self.context.logger.info(
@@ -361,10 +420,12 @@ class WorkflowRunner:
                 step["type"],
             )
             following = steps[index] if index < len(steps) else None
-            self._prepare_text_wait_baseline(step, following)
+            with diagnostic_context(step_id=nested_step_id):
+                self._prepare_text_wait_baseline(step, following)
             try:
-                self.execute_step(step, values, keyboards)
-                self.context.check_cancelled()
+                with diagnostic_context(step_id=nested_step_id):
+                    self.execute_step(step, values, keyboards)
+                    self.context.check_cancelled()
             except Cancelled:
                 self.timing.record_nested_step(
                     f"{branch_name}.{index}",
@@ -373,13 +434,35 @@ class WorkflowRunner:
                     time.monotonic() - started,
                 )
                 raise
-            except Exception:
+            except Exception as exc:
                 self.timing.record_nested_step(
                     f"{branch_name}.{index}",
                     step["type"],
                     "failed",
                     time.monotonic() - started,
                 )
+                diagnostic_error_code = self._diagnostic_error_code(exc, step["type"])
+                log_event(
+                    logging.getLogger("workflow"),
+                    logging.ERROR,
+                    "workflow",
+                    "step_failed",
+                    step_id=nested_step_id,
+                    step_type=step["type"],
+                    error_code=diagnostic_error_code,
+                    exception_type=type(exc).__name__,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    retry_count=0,
+                )
+                if self.diagnostic_failure_callback is not None:
+                    self.diagnostic_failure_callback(
+                        {
+                            "step_id": nested_step_id,
+                            "step_type": step["type"],
+                            "error_code": diagnostic_error_code,
+                            "exception_type": type(exc).__name__,
+                        }
+                    )
                 raise
             self.timing.record_nested_step(
                 f"{branch_name}.{index}",

@@ -88,6 +88,12 @@
     try {
       await fn();
     } catch (error) {
+      if (error?.transient || Number(error?.status) >= 500)
+        window.phoneReportDiagnostic?.("frontend_workflow_command_failed", {
+          operation: "workflow_command",
+          ...(error?.errorCode ? { error_code: error.errorCode } : {}),
+          ...(error?.status ? { status: error.status } : {}),
+        });
       show(error.message, true);
     } finally {
       working = false;

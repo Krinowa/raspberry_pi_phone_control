@@ -39,6 +39,7 @@ from .runner import (
 from .service import WorkflowService
 from .storage import WorkflowStorage
 from hardware.raspberry_pi_input import PiControlTarget
+from diagnostic_logging import log_event
 
 LOG = logging.getLogger("workflow_api")
 
@@ -1013,8 +1014,18 @@ def register_workflows(
                         if state.owner == client:
                             state.renew_lease()
                 return jsonify(recorder.commit_recording(owner, candidate))
-        except Exception:
+        except Exception as exc:
             if action_started:
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "recorder",
+                    "recorder_action_failed",
+                    device_id=device_id,
+                    error_code="recorder_action_uncertain",
+                    exception_type=type(exc).__name__,
+                    outcome="uncertain",
+                )
                 with lock:
                     recorder.fail_recording()
                     state.disable(
@@ -1274,7 +1285,17 @@ def register_workflows(
                             ):
                                 state.renew_lease()
 
-                except Exception:
+                except Exception as exc:
+                    log_event(
+                        LOG,
+                        logging.ERROR,
+                        "recorder",
+                        "recorder_action_failed",
+                        device_id=device_id,
+                        error_code="recorder_action_uncertain",
+                        exception_type=type(exc).__name__,
+                        outcome="uncertain",
+                    )
                     recorder.fail_recording()
 
                     state.disable(

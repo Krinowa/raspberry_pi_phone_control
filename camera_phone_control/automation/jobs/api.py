@@ -2,14 +2,44 @@
 
 from __future__ import annotations
 
-from flask import jsonify, request
+import logging
+
+from flask import g, jsonify, request
 
 from automation.error_codes import error_fields, exception_error_fields
 from automation.workflows.validation import resolve_variables
+from diagnostic_logging import EVENT_DEDUPLICATOR, log_event
 
 from .executor import BackgroundJobExecutor
 from .service import DeviceEligibility, JobScheduler
 from .storage import AccountBindingStore, JobStore, RecordConflict, RecordNotFound
+
+LOG = logging.getLogger("jobs_api")
+
+_OPERATIONAL_CONFLICT_EVENTS = {
+    "authentication_required": (
+        "authentication",
+        "authentication_required",
+        logging.WARNING,
+    ),
+    "session_expired": ("authentication", "session_expired", logging.WARNING),
+    "device_not_ready": ("device", "device_not_ready", logging.WARNING),
+    "balance_workflow_failed": (
+        "balance",
+        "balance_refresh_failed",
+        logging.WARNING,
+    ),
+    "withdrawal_state_unresolved": (
+        "withdrawal",
+        "reconciliation_required",
+        logging.ERROR,
+    ),
+    "withdrawal_cancel_uncertain": (
+        "withdrawal",
+        "cancel_failed",
+        logging.ERROR,
+    ),
+}
 
 
 def register_jobs(
@@ -69,6 +99,30 @@ def register_jobs(
 
     @app.errorhandler(RecordConflict)
     def conflicting_record(exc):
+        error_code = getattr(exc, "error_code", None)
+        diagnostic = _OPERATIONAL_CONFLICT_EVENTS.get(error_code)
+        if diagnostic is not None:
+            component, event, level = diagnostic
+            params = getattr(exc, "error_params", {}) or {}
+            device_id = params.get("device_id") or (request.view_args or {}).get(
+                "device_id"
+            )
+            route = (
+                request.url_rule.rule if request.url_rule is not None else request.path
+            )
+            identity = (device_id, route, error_code)
+            if EVENT_DEDUPLICATOR.should_log(component, event, identity):
+                log_event(
+                    LOG,
+                    level,
+                    component,
+                    event,
+                    request_id=getattr(g, "request_id", None),
+                    device_id=device_id,
+                    route=route,
+                    error_code=error_code,
+                    exception_type=type(exc).__name__,
+                )
         return jsonify(**exception_error_fields(exc, ok=False)), 409
 
     def ensure_registered_device(device_id):

@@ -134,6 +134,43 @@ let diagnosticsLogs = [];
 let previewConsecutiveFailures = 0;
 let previewCalibrationRequired = false;
 let noticeRevision = 0;
+const pendingFrontendDiagnostics = [];
+let frontendDiagnosticsInFlight = false;
+
+async function flushFrontendDiagnostics() {
+  if (frontendDiagnosticsInFlight || !pendingFrontendDiagnostics.length) return;
+  frontendDiagnosticsInFlight = true;
+  try {
+    while (pendingFrontendDiagnostics.length) {
+      const response = await fetch("/api/diagnostics/frontend", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Control-Token": token,
+          "X-Control-Client": clientId,
+        },
+        body: JSON.stringify(pendingFrontendDiagnostics[0]),
+        cache: "no-store",
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!response.ok) break;
+      pendingFrontendDiagnostics.shift();
+    }
+  } catch {
+    // The event remains queued and is retried after a later successful request.
+  } finally {
+    frontendDiagnosticsInFlight = false;
+  }
+}
+
+function reportFrontendDiagnostic(event, params = {}) {
+  if (pendingFrontendDiagnostics.length >= 10)
+    pendingFrontendDiagnostics.shift();
+  pendingFrontendDiagnostics.push({ event, params });
+  void flushFrontendDiagnostics();
+}
+
+window.phoneReportDiagnostic = reportFrontendDiagnostic;
 
 function setDashboardMode(mode) {
   dashboardMode = mode === "admin" ? "admin" : "operate";
@@ -387,9 +424,16 @@ async function api(path, data, method = "POST", options = {}) {
       error.transient = transientFailure(error, response.status);
       throw error;
     }
+    void flushFrontendDiagnostics();
     return body;
   } catch (error) {
     error.transient ??= transientFailure(error);
+    if (!error.status && path !== "/api/diagnostics/frontend")
+      reportFrontendDiagnostic("frontend_api_network_failed", {
+        operation: String(path).split("?", 1)[0].slice(0, 120),
+        error_code:
+          error.name === "TimeoutError" ? "frontend_timeout" : "network_failed",
+      });
     if (options.monitor !== false && error.transient) beginReconnect(error);
     throw error;
   }
@@ -637,6 +681,13 @@ async function cancelExternalJob(job) {
         workflowRuntime = null;
     }
   } catch (error) {
+    reportFrontendDiagnostic("frontend_action_failed", {
+      operation: "cancel_job",
+      device_id: job.device_id,
+      job_id: job.job_id,
+      ...(error?.errorCode ? { error_code: error.errorCode } : {}),
+      ...(error?.status ? { status: error.status } : {}),
+    });
     notice(
       deviceUi("error.cancelJob", `Could not cancel job: ${error.message}`, {
         message: uiError(error.message),
@@ -664,6 +715,13 @@ async function retryExternalJob(job, mode) {
         : "Workflow restart queued from step 0.",
     );
   } catch (error) {
+    reportFrontendDiagnostic("frontend_action_failed", {
+      operation: mode === "failed_step" ? "retry_failed_step" : "restart_job",
+      device_id: job.device_id,
+      job_id: job.job_id,
+      ...(error?.errorCode ? { error_code: error.errorCode } : {}),
+      ...(error?.status ? { status: error.status } : {}),
+    });
     notice(
       deviceUi("error.retryJob", `Could not create retry: ${error.message}`, {
         message: uiError(error.message),
@@ -3030,6 +3088,13 @@ async function openManualAssistance(jobId = null) {
     try {
       await enableManualControl();
     } catch (error) {
+      const params = { operation: "enable_manual_assistance" };
+      const deviceId = deviceCatalog?.selected_device;
+      if (deviceId) params.device_id = deviceId;
+      if (jobId) params.job_id = jobId;
+      if (error?.errorCode) params.error_code = error.errorCode;
+      if (error?.status) params.status = error.status;
+      reportFrontendDiagnostic("frontend_manual_assistance_failed", params);
       notice(
         deviceUi(
           "error.manualEnable",
@@ -5012,6 +5077,12 @@ async function videoLoop() {
     // Only close the old frame AFTER the new frame has been drawn.
     previousBitmap?.close();
 
+    if (previewConsecutiveFailures >= 5) {
+      const params = {};
+      const recoveredDevice = deviceCatalog?.selected_device;
+      if (recoveredDevice) params.device_id = recoveredDevice;
+      reportFrontendDiagnostic("frontend_preview_recovered", params);
+    }
     previewConsecutiveFailures = 0;
 
     render();
@@ -5026,6 +5097,13 @@ async function videoLoop() {
     succeeded = true;
   } catch (error) {
     previewConsecutiveFailures++;
+
+    if (previewConsecutiveFailures === 5) {
+      const params = { consecutive_failures: previewConsecutiveFailures };
+      const failedDevice = deviceCatalog?.selected_device;
+      if (failedDevice) params.device_id = failedDevice;
+      reportFrontendDiagnostic("frontend_preview_unavailable", params);
+    }
 
     // If we already have a good frame, keep showing it.
     // One dropped frame should NOT flash the placeholder.
