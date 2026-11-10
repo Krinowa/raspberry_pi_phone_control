@@ -11,8 +11,10 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
+from dotenv import load_dotenv
 from flask import (
     Flask,
     Response,
@@ -60,7 +62,23 @@ from hardware.raspberry_pi_input import PiControlTarget, RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
-DEVELOPER_MODE_KEY = "ocean"
+DEVELOPER_MODE_KEY_ENV = "PHONE_DEVELOPER_MODE_KEY"
+
+
+def load_source_environment():
+    """Load the checkout-local .env; the Windows launcher loads its external one."""
+    if not getattr(sys, "frozen", False):
+        load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
+
+
+def configured_developer_mode_key(environment=None):
+    """Return the configured developer key, or None to disable the feature."""
+    environment = os.environ if environment is None else environment
+    value = environment.get(DEVELOPER_MODE_KEY_ENV)
+    return value if isinstance(value, str) and value else None
+
+
+load_source_environment()
 
 
 def local_dashboard_access(view):
@@ -508,9 +526,22 @@ def create_app(
         device_workflow_store or DeviceWorkflowAssignmentStore()
     )
     app.config["CONTROL_TOKEN"] = token
-    register_secrets(token, session_secret)
-    diagnostics = install_recent_log_handler(secrets=(token, session_secret))
+    developer_mode_key = configured_developer_mode_key()
+    app.config["DEVELOPER_MODE_CONFIGURED"] = developer_mode_key is not None
+    register_secrets(token, session_secret, developer_mode_key)
+    diagnostics = install_recent_log_handler(
+        secrets=tuple(
+            value
+            for value in (token, session_secret, developer_mode_key)
+            if value is not None
+        )
+    )
     app.extensions["recent_diagnostics"] = diagnostics
+
+    def developer_mode_enabled():
+        return bool(
+            developer_mode_key is not None and session.get("developer_mode") is True
+        )
 
     @app.before_request
     def protect_local_requests():
@@ -701,8 +732,12 @@ def create_app(
     @app.get("/")
     def index():
         supplied_key = request.args.get("key")
-        if isinstance(supplied_key, str) and secrets.compare_digest(
-            supplied_key, DEVELOPER_MODE_KEY
+        if (
+            developer_mode_key is not None
+            and isinstance(supplied_key, str)
+            and secrets.compare_digest(
+                supplied_key.encode("utf-8"), developer_mode_key.encode("utf-8")
+            )
         ):
             session["developer_mode"] = True
             return redirect(url_for("index"))
@@ -710,7 +745,7 @@ def create_app(
             "index.html",
             control_token=token,
             preview_debug=preview_debug,
-            developer_mode=session.get("developer_mode") is True,
+            developer_mode=developer_mode_enabled(),
         )
 
     @app.get("/api/status")
@@ -720,7 +755,7 @@ def create_app(
 
     @app.get("/api/diagnostics/logs")
     def diagnostics_logs():
-        if session.get("developer_mode") is not True:
+        if not developer_mode_enabled():
             return jsonify(error="Developer mode required."), 403
         query = request.args.get("query", "")
         if len(query) > 100:

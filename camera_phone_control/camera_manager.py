@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from camera import Camera, rotate_frame
+from diagnostic_logging import log_event
 from hardware.device_config import DEFAULT_DEVICE_ID, validate_device_id
 from hardware.camera_identity import (
     CameraIdentityError,
@@ -34,6 +35,7 @@ CAMERA_REOPEN_DELAY_SECONDS = 0.25
 CAMERA_STARTUP_TIMEOUT_SECONDS = 15.0
 CAMERA_RECOVERY_RETRY_SECONDS = 3.0
 CAMERA_RECOVERY_MAX_ATTEMPTS = 3
+CAMERA_SLOW_RECOVERY_RETRY_SECONDS = 15.0
 CAMERA_RECOVERY_RESET_SECONDS = 30.0
 AVFOUNDATION_SOURCE_PREFIX = "avfoundation:"
 STABLE_CAMERA_PREFIXES = ("avfoundation:", "v4l2:", "v4l2-path:", "dshow:")
@@ -234,6 +236,7 @@ class CameraManager:
         startup_timeout=CAMERA_STARTUP_TIMEOUT_SECONDS,
         recovery_retry_seconds=CAMERA_RECOVERY_RETRY_SECONDS,
         recovery_max_attempts=CAMERA_RECOVERY_MAX_ATTEMPTS,
+        slow_recovery_retry_seconds=CAMERA_SLOW_RECOVERY_RETRY_SECONDS,
         recovery_reset_seconds=CAMERA_RECOVERY_RESET_SECONDS,
         identity_discovery=None,
     ):
@@ -248,9 +251,11 @@ class CameraManager:
         self.discovery_cache_seconds = discovery_cache_seconds
         self.discovery_cache = None
         self.discovery_cached_at = 0.0
+        self.identity_signature = None
         self.startup_timeout = startup_timeout
         self.recovery_retry_seconds = recovery_retry_seconds
         self.recovery_max_attempts = recovery_max_attempts
+        self.slow_recovery_retry_seconds = slow_recovery_retry_seconds
         self.recovery_reset_seconds = recovery_reset_seconds
         self.identity_discovery = (
             None if identity_discovery is False else identity_discovery
@@ -264,6 +269,7 @@ class CameraManager:
         self.cameras = {}
         self.last_opened = {}
         self.recovery_attempts = {}
+        self.disconnected_devices = set()
         self.active_device_id = None
         self.configs = self.storage.load()
         if DEFAULT_DEVICE_ID not in self.configs:
@@ -358,7 +364,101 @@ class CameraManager:
                 )
             seen.add(stable_id)
             result.append(dict(item))
+        signature = tuple(
+            sorted(
+                (
+                    item["stable_id"],
+                    item["backend"],
+                    repr(item["runtime_source"]),
+                )
+                for item in result
+            )
+        )
+        previous_signature = self.identity_signature
+        self.identity_signature = signature
+        if previous_signature is not None and signature != previous_signature:
+            previous = {item[0]: item[2] for item in previous_signature}
+            current = {item[0]: item[2] for item in signature}
+            log_event(
+                LOG,
+                logging.INFO,
+                "camera",
+                "camera_discovery_changed",
+                message="Operating-system camera discovery changed.",
+                previous_camera_count=len(previous),
+                camera_count=len(current),
+                added_count=len(current.keys() - previous.keys()),
+                removed_count=len(previous.keys() - current.keys()),
+                remapped_count=sum(
+                    1
+                    for stable_id in current.keys() & previous.keys()
+                    if current[stable_id] != previous[stable_id]
+                ),
+            )
+            self._invalidate_discovery_cache()
         return result
+
+    def _invalidate_discovery_cache(self):
+        """Discard picker results after a camera connectivity transition."""
+        self.discovery_cache = None
+        self.discovery_cached_at = 0.0
+
+    @staticmethod
+    def _identity_backend(stable_id):
+        if str(stable_id).startswith("avfoundation:"):
+            return "avfoundation"
+        if str(stable_id).startswith("dshow:"):
+            return "dshow"
+        return "v4l2"
+
+    def _configured_identity_placeholders(self, identities):
+        """Keep configured stable cameras visible while the OS is not listing them."""
+        known = {item["stable_id"] for item in identities}
+        placeholders = []
+        for config in self.configs.values():
+            stable_id = config.camera_id or config.camera_source
+            if not is_stable_camera_id(stable_id) or stable_id in known:
+                continue
+            known.add(stable_id)
+            placeholders.append(
+                {
+                    "stable_id": stable_id,
+                    "runtime_source": None,
+                    "name": config.display_name or stable_id,
+                    "backend": self._identity_backend(stable_id),
+                }
+            )
+        return placeholders
+
+    def _record_camera_disconnected(self, device_id, configured_source, reason):
+        if device_id in self.disconnected_devices:
+            return
+        self.disconnected_devices.add(device_id)
+        log_event(
+            LOG,
+            logging.WARNING,
+            "camera",
+            "camera_disconnected",
+            message="Configured camera is not available from operating-system discovery.",
+            device_id=device_id,
+            camera_id=configured_source,
+            error_code=reason,
+        )
+
+    def _record_camera_rediscovered(self, config, runtime_source):
+        if config.device_id not in self.disconnected_devices:
+            return
+        self.disconnected_devices.discard(config.device_id)
+        log_event(
+            LOG,
+            logging.INFO,
+            "camera",
+            "camera_rediscovered",
+            message="Configured camera was rediscovered and will be reopened.",
+            device_id=config.device_id,
+            camera_id=config.camera_id or config.camera_source,
+            runtime_source=runtime_source,
+        )
 
     def _resolve_source(self, source, identities=None):
         if not is_stable_camera_id(source):
@@ -460,6 +560,7 @@ class CameraManager:
         close = getattr(camera, "close", None)
         if close is not None:
             close()
+        self._invalidate_discovery_cache()
 
         for device_id in device_ids:
             if self.cameras.get(device_id) is camera:
@@ -498,6 +599,11 @@ class CameraManager:
         )
         runtime_source, identity = self._resolve_source(configured, identities)
         if runtime_source is None:
+            self._record_camera_disconnected(
+                device_id,
+                configured,
+                "camera_identity_unavailable",
+            )
             self.last_opened[device_id] = time.monotonic()
             return UnavailableCamera(
                 config,
@@ -507,6 +613,8 @@ class CameraManager:
                     else f"Configured camera {config.display_name or configured!r} is disconnected."
                 ),
             )
+
+        self._record_camera_rediscovered(config, runtime_source)
 
         shared = self._find_shared_camera(configured, runtime_source, config.rotation)
 
@@ -590,6 +698,11 @@ class CameraManager:
                     configured,
                     getattr(camera, "source", None),
                 )
+                self._record_camera_disconnected(
+                    device_id,
+                    configured,
+                    "camera_identity_mismatch",
+                )
                 self._close_shared_camera_locked(camera)
                 camera = UnavailableCamera(config, error)
                 self.cameras[device_id] = camera
@@ -625,20 +738,30 @@ class CameraManager:
 
             thread = getattr(camera, "thread", None)
             camera_status = camera.status() if camera is not None else None
-            if (
-                camera_status is not None
-                and camera_status.get("ready")
-                and time.monotonic() - self.last_opened.get(device_id, 0)
-                >= self.recovery_reset_seconds
-            ):
-                self.recovery_attempts.pop(device_id, None)
+            if camera_status is not None and camera_status.get("ready"):
+                recovered_device_ids = self._device_ids_for_camera(camera) or [
+                    device_id
+                ]
+                recovered = any(
+                    recovered_device_id in self.recovery_attempts
+                    for recovered_device_id in recovered_device_ids
+                )
+                for recovered_device_id in recovered_device_ids:
+                    self.recovery_attempts.pop(recovered_device_id, None)
+                if recovered:
+                    self._invalidate_discovery_cache()
+                    LOG.info(
+                        "Camera recovery complete device_ids=%s source=%r",
+                        sorted(recovered_device_ids),
+                        getattr(camera, "source", None),
+                    )
 
             if (
                 is_stable_camera_id(config.camera_id or config.camera_source)
                 and isinstance(camera, UnavailableCamera)
                 and not identity_mismatch_transitioned
                 and time.monotonic() - self.last_opened.get(device_id, 0)
-                >= self.recovery_retry_seconds
+                >= self.slow_recovery_retry_seconds
             ):
                 self.cameras.pop(device_id, None)
                 camera = self._new_camera(config, device_id)
@@ -654,19 +777,30 @@ class CameraManager:
             )
             camera_failed_to_open = open_succeeded is False
             thread_dead = thread is not None and not thread.is_alive()
+            recovery_attempts = self.recovery_attempts.get(device_id, 0)
+            recovery_delay = (
+                self.recovery_retry_seconds
+                if recovery_attempts < self.recovery_max_attempts
+                else self.slow_recovery_retry_seconds
+            )
 
             if (
                 camera is not None
                 and not isinstance(camera, UnavailableCamera)
                 and (camera_unhealthy or camera_failed_to_open or thread_dead)
-                and self.recovery_attempts.get(device_id, 0)
-                < self.recovery_max_attempts
                 and time.monotonic() - self.last_opened.get(device_id, 0)
-                >= self.recovery_retry_seconds
+                >= recovery_delay
             ):
-                self.recovery_attempts[device_id] = (
-                    self.recovery_attempts.get(device_id, 0) + 1
-                )
+                if recovery_attempts < self.recovery_max_attempts:
+                    self.recovery_attempts[device_id] = recovery_attempts + 1
+                else:
+                    LOG.info(
+                        "Camera remains unavailable; starting slow recovery retry "
+                        "device_id=%s source=%r retry_seconds=%s",
+                        device_id,
+                        configured,
+                        self.slow_recovery_retry_seconds,
+                    )
                 if is_stable_camera_id(config.camera_id or config.camera_source):
                     self._close_shared_camera_locked(
                         camera, preserve_recovery_state=True
@@ -732,6 +866,9 @@ class CameraManager:
             )
             if previous == config:
                 return config, set()
+
+            self.disconnected_devices.discard(device_id)
+            self._invalidate_discovery_cache()
 
             # A metadata-only save does not change the physical assignment.
             if (
@@ -976,12 +1113,14 @@ class CameraManager:
                     self.cameras[device_id] = camera
                     raise
             self.recovery_attempts.pop(device_id, None)
+            self._invalidate_discovery_cache()
             return True
         return False
 
     def release_device(self, device_id):
         with self.lock:
             self._release_locked(device_id)
+            self.disconnected_devices.discard(device_id)
 
     def release_all(self):
         with self.lock:
@@ -989,6 +1128,8 @@ class CameraManager:
             self.cameras.clear()
             self.last_opened.clear()
             self.recovery_attempts.clear()
+            self.disconnected_devices.clear()
+            self._invalidate_discovery_cache()
             for camera in cameras.values():
                 close = getattr(camera, "close", None)
                 if close is not None:
@@ -1170,9 +1311,14 @@ class CameraManager:
                     if getattr(camera, "source", None) is not None
                 }
                 identities = self._identity_devices() if self.identity_discovery else []
-                candidates = identities or [
-                    {"runtime_source": source} for source in range(first, last + 1)
-                ]
+                candidates = (
+                    identities + self._configured_identity_placeholders(identities)
+                    if self.identity_discovery
+                    else [
+                        {"runtime_source": source}
+                        for source in range(first, last + 1)
+                    ]
+                )
                 for item in candidates:
                     source = item["runtime_source"]
                     if source is None:
@@ -1188,18 +1334,17 @@ class CameraManager:
                         )
                         continue
                     if source in opened:
-                        if opened[source]:
-                            cameras.append(
-                                {
-                                    "source": item.get("stable_id", source),
-                                    "stable_id": item.get("stable_id"),
-                                    "runtime_source": source,
-                                    "index": source,
-                                    "name": item.get("name"),
-                                    "backend": item.get("backend"),
-                                    "available": True,
-                                }
-                            )
+                        cameras.append(
+                            {
+                                "source": item.get("stable_id", source),
+                                "stable_id": item.get("stable_id"),
+                                "runtime_source": source,
+                                "index": source,
+                                "name": item.get("name"),
+                                "backend": item.get("backend"),
+                                "available": bool(opened[source]),
+                            }
+                        )
                         continue
                     capture = None
                     try:
@@ -1229,6 +1374,24 @@ class CameraManager:
                     finally:
                         if capture is not None:
                             capture.release()
+                    if item.get("stable_id") is not None and not any(
+                        camera.get("stable_id") == item["stable_id"]
+                        for camera in cameras
+                    ):
+                        # OS enumeration is authoritative for identity. Keep a
+                        # temporarily unreadable camera selectable as unavailable
+                        # instead of making it disappear from the picker.
+                        cameras.append(
+                            {
+                                "source": item["stable_id"],
+                                "stable_id": item["stable_id"],
+                                "runtime_source": source,
+                                "index": source,
+                                "name": item.get("name"),
+                                "backend": item.get("backend"),
+                                "available": False,
+                            }
+                        )
                 for camera in cameras:
                     if camera.get("stable_id") is None:
                         camera.pop("index", None)

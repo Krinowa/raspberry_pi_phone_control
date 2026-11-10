@@ -123,6 +123,13 @@ Configuration is created in the writable `config` directory after installation.
 The release spec never embeds `client.env` or a source `.env`; credentials and
 environment-specific endpoints must be commissioned separately.
 
+Developer tools are disabled by default. To enable them for an installed client,
+set `PHONE_DEVELOPER_MODE_KEY` to a non-empty value in
+`%LOCALAPPDATA%\Phone Controller\config\.env`.
+
+Restart Phone Controller after provisioning or rotating the key. Never add this
+external `.env` to the PyInstaller bundle or installer inputs.
+
 ## Signing
 
 Do not store certificates, private keys or signing passwords in this repository.

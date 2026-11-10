@@ -616,6 +616,17 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
   Use manual checkpoints for authentication and final financial authorization.
   Coordinate taps cannot determine an app action's meaning.
 
+### Developer tools configuration
+
+Developer tools are disabled unless a non-empty `PHONE_DEVELOPER_MODE_KEY` is
+configured. Source execution loads the private `camera_phone_control/.env`
+file. Copy `.env.example` to `.env` and set the key there.
+
+Do not place the key in source code, frontend JavaScript, workflow data, or a
+URL saved in documentation or browser bookmarks. If the setting is absent or
+empty, developer authentication remains disabled. Restart the application after
+changing the private environment file.
+
 ## Account-routed external jobs
 
 External jobs use a persistent account binding rather than the dashboard's current

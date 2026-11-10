@@ -43,6 +43,7 @@ _SECRET_FIELD = re.compile(
 )
 _AUTH_HEADER = re.compile(r"(?i)\bauthorization\s*:\s*(?:bearer\s+)?[^\s,;]+")
 _COOKIE_HEADER = re.compile(r"(?i)\b(?:set-)?cookie\s*:\s*[^\s,;]+")
+_DEVELOPER_KEY_QUERY = re.compile(r"(?i)([?&]key=)[^&\s]+")
 _ACCOUNT_NUMBER = re.compile(r"(?<![A-Za-z0-9])(\d{7,19})(?![A-Za-z0-9])")
 _USER_PATH = re.compile(r"(?i)(?:[A-Z]:[\\/]Users[\\/]|/(?:Users|home)/)[^\\/\s]+")
 _SENSITIVE_KEYS = {
@@ -166,6 +167,7 @@ def sanitize_text(value, *, secrets=(), mask_account_numbers=True):
     message = _BEARER.sub("Bearer <redacted>", message)
     message = _AUTH_HEADER.sub("Authorization: <redacted>", message)
     message = _COOKIE_HEADER.sub("Cookie: <redacted>", message)
+    message = _DEVELOPER_KEY_QUERY.sub(r"\1<redacted>", message)
     message = _USER_PATH.sub("<user-home>", message)
     message = _SECRET_FIELD.sub(
         lambda match: (
@@ -259,6 +261,7 @@ def register_sensitive_environment(environment=None):
                     "credential",
                     "api_key",
                     "authorization",
+                    "developer_mode_key",
                 )
             )
         )

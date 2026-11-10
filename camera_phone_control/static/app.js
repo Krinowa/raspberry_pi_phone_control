@@ -4142,7 +4142,7 @@ async function openCameraSettings(device) {
   populateCameraSources([], configuredSource);
   $("camera-settings-dialog").hidden = false;
   setCameraSettingsError();
-  await refreshCameraSources(false, device.id, configuredSource);
+  await refreshCameraSources(true, device.id, configuredSource);
 }
 
 async function refreshCameraSources(
