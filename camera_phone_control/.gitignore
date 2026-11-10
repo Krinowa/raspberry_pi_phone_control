@@ -10,3 +10,4 @@ venv/
 tests/*
 automation/job_data/
 automation/auth_data/users.json
+*.secret

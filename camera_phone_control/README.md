@@ -736,6 +736,55 @@ Keyboard text and key values are excluded from logging and responses. Camera
 images stay in memory and are not saved. General input errors disable the browser's
 Manual Control; enable it again only after checking the reported condition.
 
+## RemoteViewer frame endpoint
+
+`GET /agent/v1/devices/<device_id>/frames` gives the RemoteViewer device agent,
+running on this same PC, a read-only stream of uncompressed camera frames. It
+follows section 2 of RemoteViewer's `docs/pi-interface.md`. It carries pictures
+only; there is no remote tap, text or takeover. The code is in `agent_frames.py`.
+
+**Secret file.** The agent and this app share one secret of at least 32 random
+characters, kept in a file that only the operator's Windows user can read.
+Create it once, in the folder that holds `agent.exe`:
+
+```bat
+python -c "import secrets, pathlib; pathlib.Path('pi.secret').write_text(secrets.token_urlsafe(48))"
+icacls pi.secret /inheritance:r /grant:r "%USERNAME%:F"
+```
+
+Then tell this app where the file is, either in `camera_phone_control\.env` or as
+an environment variable set before starting the app:
+
+```text
+REMOTEVIEWER_PI_SECRET_FILE=C:\full\path\to\pi.secret
+```
+
+The file is read once at start, so restart the app after creating or changing
+it. The app refuses to start if the variable is set but the file is missing or
+the secret is shorter than 32 characters. If the variable is not set, the
+endpoint answers `401` to everything. Never put the secret itself in `.env`, in
+a command line or in Git (`*.secret` is ignored).
+
+**Port.** The endpoint is served by the dashboard's own server, on `127.0.0.1`
+only, at the port given with `--port` (default `8765`). The stream is not
+encrypted; do not forward or tunnel this port.
+
+**Device ids** are the dashboard's phone ids: `phone_A`, plus every phone
+enrolled on the Pi (the ids shown in the dashboard's phone list). An id that is
+neither enrolled nor has a camera assignment answers `404`.
+
+**Check it** on the Windows PC with the app running:
+
+```bat
+agent.exe check-frames -device phone_A -pi-secret-file pi.secret -pi http://127.0.0.1:8765
+```
+
+It must print `OK: the agent can use this endpoint`.
+
+Frames come from the same capture loop as the dashboard preview, so a phone
+that is not the one selected in the dashboard is captured at the lower
+monitoring frame rate.
+
 ## Tests
 
 From `camera_phone_control` with the virtual environment active:
@@ -745,6 +794,7 @@ python -m unittest discover -s tests -p 'test_workflows.py' -v
 python -m unittest discover -s tests -p 'test_record_first.py' -v
 python -m unittest discover -s tests -p 'test_automation.py' -v
 python -m unittest discover -s tests -p 'test_takeover.py' -v
+python -m pytest tests/test_agent_frames.py -v
 node --check static/app.js
 node --check static/workflows.js
 node --test tests/test_workflow_ui.js

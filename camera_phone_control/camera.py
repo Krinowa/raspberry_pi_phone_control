@@ -8,6 +8,7 @@ import time
 from collections import deque
 
 import cv2
+import numpy as np
 
 from diagnostic_logging import log_event, sanitize_url
 
@@ -137,6 +138,8 @@ class Camera:
         self.capture_worker_factory = capture_worker_factory or CameraCaptureWorker
 
         self.lock = threading.Lock()
+        # Wakes RemoteViewer frame streams when a new frame is stored.
+        self.frame_condition = threading.Condition(self.lock)
         self.lifecycle_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = None
@@ -147,6 +150,10 @@ class Camera:
         self.open_succeeded = None
         self.identity_mismatch = False
         self.latest = None
+        # (BGR array or None, wall-clock capture time in microseconds) for the
+        # frame in ``latest``. None means only the JPEG crossed the process
+        # boundary; wait_raw_frame() decodes it on demand.
+        self.latest_raw = None
         self.raw_frame_width = None
         self.raw_frame_height = None
         self.last_successful_frame_at = None
@@ -312,6 +319,11 @@ class Camera:
                         message["width"],
                         message["height"],
                     )
+                    self.latest_raw = (
+                        None,
+                        message.get("captured_at_us") or time.time_ns() // 1000,
+                    )
+                    self.frame_condition.notify_all()
                     self.raw_frame_width = message["raw_width"]
                     self.raw_frame_height = message["raw_height"]
                     self.last_successful_frame_at = received_at
@@ -657,6 +669,7 @@ class Camera:
                 failure_started = None
                 consecutive_read_failures = 0
                 self.last_successful_frame_at = time.monotonic()
+                captured_at_us = time.time_ns() // 1000
 
                 raw_frame_height, raw_frame_width = frame.shape[:2]
 
@@ -704,6 +717,10 @@ class Camera:
                         frame_width,
                         frame_height,
                     )
+                    # read() returns a new array each time and nothing below
+                    # writes to it, so readers can share this reference.
+                    self.latest_raw = (frame, captured_at_us)
+                    self.frame_condition.notify_all()
                     self.raw_frame_width = raw_frame_width
                     self.raw_frame_height = raw_frame_height
 
@@ -823,6 +840,27 @@ class Camera:
     def frame(self):
         with self.lock:
             return self.latest
+
+    def wait_raw_frame(self, after_sequence, timeout=5.0):
+        """Block until a frame newer than ``after_sequence`` exists.
+
+        Returns ``(sequence, capture_time_us, bgr)`` for the newest frame, or
+        None on timeout. Only the newest frame is kept, so a slow caller
+        skips frames instead of queueing them.
+        """
+        with self.frame_condition:
+            if not self.frame_condition.wait_for(
+                lambda: self.latest is not None and self.latest[1] > after_sequence,
+                timeout,
+            ):
+                return None
+            jpeg, sequence = self.latest[:2]
+            bgr, captured_at_us = self.latest_raw
+        if bgr is None:
+            bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None
+        return sequence, captured_at_us, bgr
 
     def observation(self):
         """Atomically pair the latest JPEG/sequence/geometry with capture time."""

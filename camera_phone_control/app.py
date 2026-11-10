@@ -34,6 +34,7 @@ from diagnostic_logging import (
     register_secrets,
 )
 
+import agent_frames
 from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration, CalibrationStorage
 from camera import Camera
@@ -431,6 +432,7 @@ def create_app(
     ocr_resource_provider=None,
     screenshot_store=None,
     auth_store=None,
+    agent_secret=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -526,13 +528,15 @@ def create_app(
         device_workflow_store or DeviceWorkflowAssignmentStore()
     )
     app.config["CONTROL_TOKEN"] = token
+    if agent_secret is None:
+        agent_secret = agent_frames.secret_from_environment()
     developer_mode_key = configured_developer_mode_key()
     app.config["DEVELOPER_MODE_CONFIGURED"] = developer_mode_key is not None
-    register_secrets(token, session_secret, developer_mode_key)
+    register_secrets(token, session_secret, developer_mode_key, agent_secret)
     diagnostics = install_recent_log_handler(
         secrets=tuple(
             value
-            for value in (token, session_secret, developer_mode_key)
+            for value in (token, session_secret, developer_mode_key, agent_secret)
             if value is not None
         )
     )
@@ -1928,6 +1932,21 @@ def create_app(
                 )
         finally:
             state.action_lock.release()
+
+    def agent_known_device(device_id):
+        with state.lock:
+            if device_id in state.pi_devices:
+                return True
+        return device_id in camera_manager.all_configs()
+
+    # RemoteViewer agent: read-only frames, refused unless a secret is configured.
+    app.register_blueprint(
+        agent_frames.make_blueprint(camera_manager, agent_secret, agent_known_device)
+    )
+    LOG.info(
+        "RemoteViewer frame endpoint %s",
+        "enabled" if agent_secret else f"disabled ({agent_frames.SECRET_FILE_ENV} not set)",
+    )
 
     register_workflows(
         app,

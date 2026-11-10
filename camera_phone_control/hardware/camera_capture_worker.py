@@ -262,6 +262,7 @@ def capture_worker_main(
             failure_started = None
             consecutive_read_failures = 0
             last_success = time.monotonic()
+            captured_at_us = time.time_ns() // 1000
             stable_id = config.get("stable_id")
             if stable_id is not None:
                 identities = identity_discovery()
@@ -291,6 +292,7 @@ def capture_worker_main(
                     "device_id": config.get("device_id"),
                     "jpeg": encoded.tobytes(),
                     "sequence": sequence,
+                    "captured_at_us": captured_at_us,
                     "width": frame.shape[1],
                     "height": frame.shape[0],
                     "raw_width": raw_width,
