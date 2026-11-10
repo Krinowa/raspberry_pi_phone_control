@@ -17,6 +17,30 @@ from .timing import WorkflowTiming
 from .validation import validate_workflow, resolve_variables
 
 
+class RemoteTakeoverRefused(Exception):
+    """A remote takeover may not stop the run on this device right now."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def critical_step_numbers(workflow):
+    """1-based numbers of top-level steps that are, or contain, a critical step."""
+
+    def critical(step):
+        if step.get("critical") is True:
+            return True
+        return step.get("type") == "if_text" and any(
+            critical(child)
+            for child in step.get("then_steps", []) + step.get("else_steps", [])
+        )
+
+    return {
+        number for number, step in enumerate(workflow["steps"], 1) if critical(step)
+    }
+
+
 class RunLog(logging.Handler):
     def __init__(self):
         super().__init__()
@@ -48,6 +72,9 @@ class WorkflowService:
         self.lock = threading.RLock()
         self.runs = {}
         self.completion_listeners = []
+        # device_id -> details of the remote session holding it. A run on a held
+        # device stops at its next input, but never inside a critical step.
+        self.remote_holds = {}
 
     def add_completion_listener(self, listener):
         """Observe immutable completion snapshots without affecting run status."""
@@ -113,6 +140,8 @@ class WorkflowService:
             cancel = cancel_event or threading.Event()
             resume = threading.Event()
             completed = threading.Event()
+            critical_steps = critical_step_numbers(workflow)
+            remote_hold = self.remote_holds.get(target_device_id)
             item = {
                 "runner": runner,
                 "cancel": cancel,
@@ -125,11 +154,26 @@ class WorkflowService:
                 "steps": self.preview_steps(workflow),
                 "timing": WorkflowTiming(),
                 "completed": completed,
+                "critical_steps": critical_steps,
+                "remote_stop": threading.Event(),
+                "remote_takeover": deepcopy(remote_hold),
                 "active": True,
                 "screenshots": [],
                 "outputs": {},
                 "diagnostic_failure": None,
             }
+            if remote_hold is not None:
+                item["remote_stop"].set()
+
+            def remote_stop_due():
+                # Defer the stop while the current step is critical; the run
+                # stops at the first check after that step has finished.
+                if not item["remote_stop"].is_set():
+                    return False
+                state = runner.state
+                return state is None or state.step_index not in critical_steps
+
+            runner.remote_stop = remote_stop_due
 
             external_screen = self.external_screen
             screen_state_provider = self.screen_state_provider
@@ -259,6 +303,64 @@ class WorkflowService:
             thread.start()
             return self.snapshot(run_id)
 
+    def _active_item(self, device_id):
+        for run_id, item in self.runs.items():
+            if item.get("active", item["thread"].is_alive()) and (
+                item.get("device_id") == device_id
+            ):
+                return run_id, item
+        return None, None
+
+    def hold_for_remote(self, device_id, details, *, allow_during_job, job_pending):
+        """Mark device_id as held by a remote session and stop its run, if any.
+
+        job_pending: a job is claimed for the device but its run may not have
+        started yet. Raises RemoteTakeoverRefused("critical_step" or
+        "job_running"). Returns None, or {"run_id", "workflow", "step_index"}
+        (0-based index of the step the run was in).
+        """
+        with self.lock:
+            run_id, item = self._active_item(device_id)
+            if item is not None:
+                state = item["runner"].state
+                number = state.step_index if state is not None else 0
+                if number in item["critical_steps"]:
+                    raise RemoteTakeoverRefused("critical_step")
+            if (item is not None or job_pending) and not allow_during_job:
+                raise RemoteTakeoverRefused("job_running")
+            self.remote_holds[device_id] = deepcopy(details)
+            if item is None:
+                return None
+            item["remote_takeover"] = deepcopy(details)
+            item["remote_stop"].set()
+            item["runner"].logger.info("Remote takeover requested.")
+            return {
+                "run_id": run_id,
+                "workflow": item["workflow_id"],
+                "step_index": max(number - 1, 0),
+            }
+
+    def critical_step_running(self, device_id):
+        """True while a run on device_id is inside a critical step.
+
+        Covers a manual checkpoint in a critical step, during which the run
+        releases the device lock but must not lose the phone.
+        """
+        with self.lock:
+            _, item = self._active_item(device_id)
+            if item is None:
+                return False
+            state = item["runner"].state
+            return state is not None and state.step_index in item["critical_steps"]
+
+    def release_remote(self, device_id):
+        with self.lock:
+            self.remote_holds.pop(device_id, None)
+
+    def is_remote_held(self, device_id):
+        with self.lock:
+            return device_id in self.remote_holds
+
     def start_for_job(self, job, workflow, *, cancel_event=None):
         """Worker entry point with a device fixed at job creation."""
         if workflow.get("id") != job.workflow:
@@ -352,6 +454,7 @@ class WorkflowService:
                 timing=item["timing"].snapshot(),
                 screenshots=deepcopy(item["screenshots"]),
                 outputs=deepcopy(item["outputs"]),
+                remote_takeover=deepcopy(item.get("remote_takeover")),
             )
             index = result.get("step_index", 0)
             result["preview"] = deepcopy(item["steps"][index - 1]) if index else None

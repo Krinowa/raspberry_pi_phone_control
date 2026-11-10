@@ -1104,6 +1104,31 @@ button.primary:hover:not(:disabled) {
   font-family: ui-monospace, monospace;
 }
 
+.remote-control-banner {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 10px;
+  margin: 8px 0;
+  padding: 10px;
+  border: 2px solid #c2410c;
+  border-radius: 8px;
+  background: #fff4ec;
+  color: #7c2d12;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.remote-control-banner strong,
+.remote-control-banner span {
+  grid-column: 1;
+}
+
+.remote-control-banner button {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: center;
+}
+
 .job-error-details {
   grid-column: 1 / -1;
 

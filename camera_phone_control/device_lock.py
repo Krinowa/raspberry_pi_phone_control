@@ -17,7 +17,9 @@ else:
 
 class DeviceBusy(RuntimeError):
     def __init__(self, owner="controller"):
-        self.owner = owner if owner in {"manual", "automation"} else "controller"
+        self.owner = (
+            owner if owner in {"manual", "automation", "remote"} else "controller"
+        )
         super().__init__("Device busy. No input sent.")
 
 
@@ -124,6 +126,16 @@ class DeviceLocks:
             except BaseException:
                 os.close(fd)
                 raise
+
+    def claim(self, serial, owner):
+        """Take the device lock until the returned descriptor is closed.
+
+        Used by a remote takeover, which holds the phone across many requests.
+        Raises DeviceBusy if anyone else holds it.
+        """
+        if owner != "remote":
+            raise ValueError("Only a remote takeover claims a lasting device lock.")
+        return self._acquire(serial, owner)
 
     def owner(self, serial):
         with self._guard(serial):

@@ -99,6 +99,24 @@ class DeviceEligibility:
 
             self.catalog_lock.release()
 
+    def lock_identity(self, device_id):
+
+        # The DeviceLocks key every owner of device_id must use.
+
+        with self.state.lock:
+
+            if self.state.pi_bridge is not None:
+
+                identity = "pi-api:" + self.state.pi_bridge.client.base_url
+
+                if device_id != "phone_A":
+
+                    identity += "#" + device_id
+
+                return identity
+
+            return self.state.device.serial if self.state.device is not None else None
+
     def inspect(self, device_id, *, reserved=False):
 
         # The worker cannot depend on an open dashboard to refresh Pi state.
@@ -117,11 +135,7 @@ class DeviceEligibility:
 
                 runtime_healthy = self.state.pi_connection.get("api") == "online"
 
-                lock_identity = "pi-api:" + self.state.pi_bridge.client.base_url
-
-                if device_id != "phone_A":
-
-                    lock_identity += "#" + device_id
+                lock_identity = self.lock_identity(device_id)
 
                 manual_busy = self.state.pi_bridge.device_id == device_id and (
                     self.state.owner is not None or self.state.pending
@@ -137,9 +151,7 @@ class DeviceEligibility:
 
                 runtime_healthy = connected
 
-                lock_identity = (
-                    self.state.device.serial if self.state.device is not None else None
-                )
+                lock_identity = self.lock_identity(device_id)
 
                 manual_busy = self.state.owner is not None or self.state.pending
 
@@ -162,6 +174,8 @@ class DeviceEligibility:
         available = camera["status"].get("ready") is True
 
         workflow_busy = self.workflow_service.has_active_run(device_id)
+
+        remote_held = self.workflow_service.is_remote_held(device_id)
 
         reasons = []
 
@@ -193,6 +207,10 @@ class DeviceEligibility:
 
             reasons.append("device_owned")
 
+        if remote_held:
+
+            reasons.append("remote_control")
+
         if reserved:
 
             reasons.append("job_reserved")
@@ -204,7 +222,11 @@ class DeviceEligibility:
             "camera_configured": configured,
             "camera_available": available,
             "runtime_healthy": runtime_healthy,
-            "busy": workflow_busy or manual_busy or lock_busy or reserved,
+            "busy": workflow_busy
+            or manual_busy
+            or lock_busy
+            or reserved
+            or remote_held,
             "ready": not reasons,
             "reasons": reasons,
         }

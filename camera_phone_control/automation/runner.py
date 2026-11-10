@@ -63,6 +63,9 @@ class Runner:
         self.logger = logger or LOG
         self.state = None
         self._run_lock = threading.Lock()
+        # Optional callable set by the owner; when it returns True the run stops
+        # at its next cancellation check, exactly like a local takeover.
+        self.remote_stop = None
 
     def run(self, script_name, serial=None, *, cancel_event=None, device_id=None):
         if not self._run_lock.acquire(blocking=False):
@@ -154,7 +157,8 @@ class Runner:
                     cancel_event,
                     self.logger,
                     state,
-                    lambda: ownership.takeover_requested(),
+                    lambda: ownership.takeover_requested()
+                    or (self.remote_stop is not None and self.remote_stop()),
                 )
 
                 def manual_checkpoint(message):

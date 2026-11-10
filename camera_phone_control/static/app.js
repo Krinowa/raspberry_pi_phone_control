@@ -88,6 +88,7 @@ let addPhoneEnrollmentTarget = null;
 let addPhoneInitialDeviceIds = new Set();
 let deviceWithdrawDetails = {};
 let jobCatalog = [];
+let remoteControlHistory = [];
 const jobCancelsInFlight = new Set();
 const jobRetriesInFlight = new Set();
 const withdrawReconnectsInFlight = new Set();
@@ -447,6 +448,10 @@ const deviceService = {
   startEnrollment: (deviceId) =>
     api("/api/enrollment/start", { target_device_id: deviceId }),
   stopEnrollment: () => api("/api/enrollment/stop", {}),
+  endRemoteControl: (deviceId) =>
+    api(`/api/devices/${encodeURIComponent(deviceId)}/remote-control/end`, {}),
+  remoteControl: () =>
+    api("/api/remote-control", undefined, "GET", { monitor: false }),
   remove: (deviceId) =>
     api(`/api/devices/${encodeURIComponent(deviceId)}`, {}, "DELETE"),
   camera: (deviceId) =>
@@ -2467,6 +2472,7 @@ function renderDevices({ presentationOnly = false } = {}) {
       withdrawSummary,
     );
     if (jobSummary) card.append(jobSummary);
+    if (device.remote_control) card.append(remoteControlBanner(device));
     card.append(actions);
     return card;
   });
@@ -2739,9 +2745,93 @@ function renderJobs() {
     });
 
   $("jobs-list").replaceChildren(...cards);
+  renderRemoteControlHistory();
+}
+
+function localTime(iso) {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? String(iso) : date.toLocaleString();
+}
+
+function remoteControlBanner(device) {
+  const remote = device.remote_control;
+  const banner = document.createElement("div");
+  banner.className = "remote-control-banner";
+  banner.setAttribute("role", "status");
+  const heading = document.createElement("strong");
+  heading.textContent = `Remote control by ${remote.user_id}`;
+  const reason = document.createElement("span");
+  reason.textContent = `Reason: ${remote.reason}`;
+  const since = document.createElement("span");
+  since.textContent = remote.waiting_for_job
+    ? `Since ${localTime(remote.started_at)} · waiting for the job to stop`
+    : `Since ${localTime(remote.started_at)}`;
+  const end = document.createElement("button");
+  end.type = "button";
+  end.className = "stop";
+  end.textContent = "End Remote Control";
+  end.addEventListener("click", () => endRemoteControl(device.id, end));
+  banner.append(heading, reason, since, end);
+  return banner;
+}
+
+async function endRemoteControl(deviceId, button) {
+  if (!window.confirm("Take this phone back from the remote user?")) return;
+  button.disabled = true;
+  try {
+    await deviceService.endRemoteControl(deviceId);
+    notice("Remote control ended. The phone is back under local control.");
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    deviceRenderSignature = null;
+    await loadDevices();
+  }
+}
+
+function renderRemoteControlHistory() {
+  const list = $("remote-history");
+  if (!list) return;
+  const items = remoteControlHistory.slice(0, 20).map((record) => {
+    const item = document.createElement("article");
+    item.className = "job-item";
+    const what = document.createElement("strong");
+    what.textContent =
+      record.event === "started"
+        ? "Remote takeover started"
+        : `Remote takeover ended (${record.ended_by})`;
+    const who = document.createElement("span");
+    who.textContent = `User: ${record.user_id} · session ${record.session_id}`;
+    const device = document.createElement("span");
+    device.textContent = `Device: ${record.device_id}`;
+    const when = document.createElement("span");
+    when.textContent = localTime(record.at);
+    const reason = document.createElement("span");
+    reason.className = "job-result";
+    reason.textContent = `Reason: ${record.reason}`;
+    item.append(what, who, device, when, reason);
+    if (record.interrupted_job) {
+      const job = document.createElement("span");
+      job.className = "job-error";
+      job.textContent = `Interrupted job ${record.interrupted_job.id} (${record.interrupted_job.workflow}, step ${record.interrupted_job.step_index + 1})`;
+      item.append(job);
+    }
+    if (record.event === "ended") {
+      const inputs = document.createElement("span");
+      inputs.textContent = `Inputs: ${record.inputs}`;
+      item.append(inputs);
+    }
+    return item;
+  });
+  $("remote-history-state").textContent = items.length
+    ? `Latest ${items.length} remote control events.`
+    : "No remote control sessions yet.";
+  list.replaceChildren(...items);
 }
 
 function friendlyOperationalError(message) {
+  // Shown in full: it names who took over and why.
+  if (/^interrupted by remote takeover/i.test(message)) return message;
   const value = message.toLowerCase();
   if (/calibrat/.test(value))
     return deviceUi("camera.calibrationRequired", "Calibration required");
@@ -3827,6 +3917,15 @@ function deviceRenderSnapshot(catalog, cameras, withdrawDetails, jobs) {
       bluetooth_address: device.bluetooth_address,
       ready_for_work: device.ready_for_work,
       workflow_assignment: device.workflow_assignment,
+      remote_control: device.remote_control
+        ? {
+            session_id: device.remote_control.session_id,
+            user_id: device.remote_control.user_id,
+            reason: device.remote_control.reason,
+            started_at: device.remote_control.started_at,
+            waiting_for_job: device.remote_control.waiting_for_job,
+          }
+        : null,
     })),
 
     enrollment: catalog.enrollment
@@ -3958,11 +4057,17 @@ async function loadDevices() {
       ),
       jobService.list().catch(() => ({ jobs: jobCatalog })),
     ]);
+    const remoteResult = await deviceService
+      .remoteControl()
+      .catch(() => ({ history: remoteControlHistory }));
     const nextCameras = Object.fromEntries(cameraEntries);
     deviceWithdrawDetails = Object.fromEntries(
       withdrawEntries.filter(([, value]) => value),
     );
     jobCatalog = Array.isArray(jobResult.jobs) ? jobResult.jobs : jobCatalog;
+    remoteControlHistory = Array.isArray(remoteResult.history)
+      ? remoteResult.history
+      : remoteControlHistory;
     const nextSignature = JSON.stringify(
       deviceRenderSnapshot(
         nextCatalog,
@@ -4539,6 +4644,11 @@ function render() {
   );
 
   $("enable").hidden = dashboardMode === "operate" && active();
+  if (state?.control_status === "remote") {
+    $("mode").textContent = "Remote control";
+    $("control-help").textContent =
+      "A remote user controls this phone. Use End Remote Control on its card to take it back.";
+  }
 
   $("enable").disabled =
     busy ||

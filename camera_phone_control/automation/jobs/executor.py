@@ -214,6 +214,20 @@ class BackgroundJobExecutor:
                     outputs=snapshot.get("outputs", {}),
                 )
 
+            elif snapshot.get("remote_takeover") and (
+                status == "cancelled"
+                # Started after the takeover: the remote lock refused it before
+                # any input was sent.
+                or str(snapshot.get("message", "")).startswith("Device busy")
+            ):
+
+                takeover = snapshot["remote_takeover"]
+                self.scheduler.interrupt_job(
+                    job.job_id,
+                    "Interrupted by remote takeover: user {user_id}, session "
+                    "{session_id}, at {at}. Reason: {reason}".format(**takeover),
+                )
+
             elif status == "cancelled":
 
                 self.scheduler.finish_cancelled(

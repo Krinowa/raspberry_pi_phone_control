@@ -35,6 +35,7 @@ from diagnostic_logging import (
 )
 
 import agent_frames
+import remote_control
 from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration, CalibrationStorage
 from camera import Camera
@@ -54,10 +55,17 @@ from automation.screen.camera import CalibratedPreviewCache
 from automation.screen.stability import ScreenStabilityError
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
-from automation.jobs.storage import DeviceWorkflowAssignmentStore
+from automation.jobs.storage import (
+    DEFAULT_DATA_DIRECTORY as JOB_DATA_DIRECTORY,
+    DeviceWorkflowAssignmentStore,
+)
 from automation.integrations.withdraw_v2.balance import balance_check_workflow
 from automation.integrations.withdraw_v2.manager import register_withdraw
-from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
+from hardware.pi_api_client import (
+    PiApiClient,
+    PiApiError,
+    validate_text as validate_pi_text,
+)
 from hardware.device_config import DEFAULT_DEVICE_ID
 from hardware.raspberry_pi_input import PiControlTarget, RaspberryPiInputBridge
 
@@ -371,8 +379,8 @@ class ControlState:
             "takeover_requested"
             if self.pending
             else (
-                "automation"
-                if owner == "automation"
+                owner
+                if owner in {"automation", "remote"}
                 else "manual" if self.owner else "free"
             )
         )
@@ -433,6 +441,7 @@ def create_app(
     screenshot_store=None,
     auth_store=None,
     agent_secret=None,
+    remote_history=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -554,6 +563,10 @@ def create_app(
             g.preview_request_started = time.monotonic()
             with request_metrics["lock"]:
                 request_metrics["active"] += 1
+        if request.blueprint == "agent_v1":
+            # The RemoteViewer agent sends no Origin or control token; the
+            # blueprint itself requires the Bearer secret on every request.
+            return None
         # Reject cross-site fetches/embeds, including camera requests. No CORS enabled.
         if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
             return (
@@ -1104,6 +1117,9 @@ def create_app(
                     continue
                 item["workflow_assignment"] = workflow_assignment_details(item["id"])
                 item["ready_for_work"] = assignment_store.ready_for_work(item["id"])
+                item["remote_control"] = app.extensions["remote_control"].holder(
+                    item["id"]
+                )
         return jsonify(result)
 
     @app.put("/api/devices/<device_id>/work-readiness")
@@ -1933,21 +1949,6 @@ def create_app(
         finally:
             state.action_lock.release()
 
-    def agent_known_device(device_id):
-        with state.lock:
-            if device_id in state.pi_devices:
-                return True
-        return device_id in camera_manager.all_configs()
-
-    # RemoteViewer agent: read-only frames, refused unless a secret is configured.
-    app.register_blueprint(
-        agent_frames.make_blueprint(camera_manager, agent_secret, agent_known_device)
-    )
-    LOG.info(
-        "RemoteViewer frame endpoint %s",
-        "enabled" if agent_secret else f"disabled ({agent_frames.SECRET_FILE_ENV} not set)",
-    )
-
     register_workflows(
         app,
         state,
@@ -2019,7 +2020,126 @@ def create_app(
         ensure_registered_device=app.extensions["ensure_registered_device"],
         start_workers=start_withdraw_workers,
     )
+    register_remote_agent(app, state, camera_manager, agent_secret, remote_history)
     return app
+
+
+def register_remote_agent(app, state, camera_manager, agent_secret, history):
+    """RemoteViewer agent: camera frames and remote takeover of a phone.
+
+    Everything under /agent/v1 is refused unless a secret is configured.
+    """
+    workflow_service = app.extensions["workflow_service"]
+    scheduler = app.extensions["job_scheduler"]
+    readiness = app.extensions["device_eligibility"]
+    calibration_storage = state.calibration_storage
+
+    def known_device(device_id):
+        with state.lock:
+            if device_id in state.pi_devices:
+                return True
+        return device_id in camera_manager.all_configs()
+
+    def controllable_device(device_id):
+        """A phone the input backend really addresses by this id.
+
+        Pi: an enrolled Pi phone. Appium: only the one bound phone, so two ids
+        can never name the same physical phone.
+        """
+        if state.pi_bridge is None:
+            return device_id == (workflow_service.device_id or DEFAULT_DEVICE_ID)
+        with state.lock:
+            initialized = state.pi_catalog_initialized
+        if not initialized:
+            readiness._refresh_pi_catalog()
+        with state.lock:
+            return device_id in state.pi_devices
+
+    def local_operator(device_id):
+        with state.lock:
+            selected = state.pi_bridge is None or state.pi_bridge.device_id == device_id
+            if selected and (state.owner is not None or state.pending):
+                return True
+        identity = readiness.lock_identity(device_id)
+        return identity is not None and state.device_locks.owner(identity) == "manual"
+
+    def running_job(device_id):
+        return next(
+            (
+                job
+                for job in scheduler.list_jobs()
+                if job.device_id == device_id and job.status == "RUNNING"
+            ),
+            None,
+        )
+
+    def open_input(device_id):
+        """The workflow input bridge for device_id and its saved calibration."""
+        with state.lock:
+            if state.pi_bridge is not None:
+                target = RaspberryPiInputBridge(
+                    PiApiClient(state.pi_bridge.client.base_url, device_id=device_id)
+                ).target
+                backend = "raspberry_pi"
+                selected = state.pi_bridge.device_id == device_id
+            else:
+                if state.device is None:
+                    raise remote_control.Refused(409, "device_unavailable")
+                target, backend, selected = state.device, "appium", True
+            calibration = state.calibration if selected else None
+        if calibration is None and calibration_storage is not None:
+            camera = camera_manager.get_camera(device_id)
+            status = camera.status()
+            if status.get("ready"):
+                calibration = calibration_storage.load(camera, status, target)
+        context = AutomationContext(
+            target,
+            state.android,
+            threading.Event(),
+            LOG,
+            SimpleNamespace(),
+            input_backend=backend,
+        )
+        return context.input, calibration
+
+    remote = remote_control.RemoteControl(
+        workflow_service,
+        state.device_locks,
+        history
+        or remote_control.RemoteHistory(
+            JOB_DATA_DIRECTORY / "remote_control_history.jsonl"
+        ),
+        local_operator=local_operator,
+        running_job=running_job,
+        lock_identity=readiness.lock_identity,
+        open_input=open_input,
+    )
+    app.extensions["remote_control"] = remote
+
+    blueprint = agent_frames.make_blueprint(camera_manager, agent_secret, known_device)
+    remote_control.register_routes(blueprint, remote, controllable_device)
+    app.register_blueprint(blueprint)
+    LOG.info(
+        "RemoteViewer agent endpoints %s",
+        (
+            "enabled"
+            if agent_secret
+            else f"disabled ({agent_frames.SECRET_FILE_ENV} not set)"
+        ),
+    )
+
+    @app.get("/api/remote-control")
+    def remote_control_status():
+        return jsonify(active=remote.active(), history=remote.history.recent())
+
+    @app.post("/api/devices/<device_id>/remote-control/end")
+    @local_dashboard_access
+    def end_remote_control(device_id):
+        if request.get_json(silent=True) != {}:
+            raise ValueError("End remote control expects an empty JSON object.")
+        if not remote.end_by_operator(device_id):
+            return jsonify(ok=False, error="Remote control is not active."), 409
+        return jsonify(ok=True)
 
 
 def main():

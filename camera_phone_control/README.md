@@ -741,7 +741,8 @@ Manual Control; enable it again only after checking the reported condition.
 `GET /agent/v1/devices/<device_id>/frames` gives the RemoteViewer device agent,
 running on this same PC, a read-only stream of uncompressed camera frames. It
 follows section 2 of RemoteViewer's `docs/pi-interface.md`. It carries pictures
-only; there is no remote tap, text or takeover. The code is in `agent_frames.py`.
+only. The code is in `agent_frames.py`. Remote control of a phone is a separate
+set of addresses, described in the next section.
 
 **Secret file.** The agent and this app share one secret of at least 32 random
 characters, kept in a file that only the operator's Windows user can read.
@@ -785,6 +786,46 @@ Frames come from the same capture loop as the dashboard preview, so a phone
 that is not the one selected in the dashboard is captured at the lower
 monitoring frame rate.
 
+## RemoteViewer remote control
+
+Four more addresses let the RemoteViewer agent operate a phone through the
+existing input code (Pi or Appium). They follow sections 3 and 4 of
+RemoteViewer's `docs/pi-interface.md`; the code is in `remote_control.py`.
+They use the same secret file, port and device ids as the frame endpoint, and
+the agent's requests need no dashboard control token.
+
+| Address | Purpose |
+|---|---|
+| `POST /agent/v1/devices/<id>/takeover` | Take the phone. `200` with `interrupted_job` (or `null`); `409` with `local_operator`, `held_by_remote`, `critical_step` or `job_running`. |
+| `POST /agent/v1/devices/<id>/takeover/renew` | Keep the lease. `409` once the session no longer holds the phone. |
+| `DELETE /agent/v1/devices/<id>/takeover?session_id=…` | Release. Always `200`. |
+| `POST /agent/v1/devices/<id>/input` | One tap, swipe, text, key, `home`, `back` or `wake`. `403` unless the session holds the phone; `200` after the input was carried out. |
+
+**Lease.** Without a renew for 6 seconds the phone is released automatically.
+
+**Running jobs.** With `allow_during_job` the job stops at its next input and
+is recorded as `INTERRUPTED`, naming the user, session, reason and time. Its
+phone is then marked *Needs Attention*, so it is retried only after the
+operator verifies the phone, as for any other interrupted job. No new job
+starts on a phone under remote control.
+
+**Critical steps.** A workflow step ticked *Critical* in the workflow editor is
+never interrupted: a takeover during it answers `409 critical_step`, whatever
+`allow_during_job` says. Tick the step that confirms a payment.
+
+**Coordinates** are fractions of the camera picture served by the frame
+endpoint. Taps and swipes use the phone's saved calibration; a point outside
+the phone is ignored. Taps and swipes are refused (`409 not_calibrated`) until
+the phone is calibrated. Text is passed to the phone as data, never through a
+shell. The Pi accepts printable ASCII text only; other text, and the `escape`
+key, answer `422 unsupported_input` without sending anything.
+
+**Dashboard.** A phone under remote control shows who holds it, why and since
+when, with an *End Remote Control* button that takes it back (the agent's next
+renew then gets `409`). Job History lists remote sessions and how each ended.
+The audit is kept in `automation/job_data/remote_control_history.jsonl`; typed text is
+never written there.
+
 ## Tests
 
 From `camera_phone_control` with the virtual environment active:
@@ -795,6 +836,7 @@ python -m unittest discover -s tests -p 'test_record_first.py' -v
 python -m unittest discover -s tests -p 'test_automation.py' -v
 python -m unittest discover -s tests -p 'test_takeover.py' -v
 python -m pytest tests/test_agent_frames.py -v
+python -m pytest tests/test_remote_control.py tests/test_remote_control_app.py -v
 node --check static/app.js
 node --check static/workflows.js
 node --test tests/test_workflow_ui.js
