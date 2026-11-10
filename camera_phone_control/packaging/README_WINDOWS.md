@@ -16,9 +16,11 @@ downloads, or a separately installed FFmpeg.
   The live `automation/workflow_data` directory is deliberately excluded.
 - OCR models are prepared into `build\paddlex`, never taken from a developer's
   `%USERPROFILE%\.paddlex` cache.
-- A reviewed Windows x64 `ffmpeg.exe` should be placed at
+- A reviewed, self-contained Windows x64 `ffmpeg.exe` must be placed at
   `packaging\vendor\ffmpeg.exe` for production builds. Record its origin,
-  license, version and SHA-256 digest. The build never downloads it.
+  license, version and SHA-256 digest. It must expose the DirectShow (`dshow`)
+  input device. The build never downloads it and fails if it is absent, is not
+  x64, cannot run without companion DLLs, or lacks DirectShow.
 
 Do not add `.env`, credentials, OTPs, bearer tokens, `automation/job_data`,
 Withdraw journals, calibration, logs, receipts, or developer Paddle caches to
@@ -54,25 +56,56 @@ The command creates the PyInstaller `onedir` application at:
 dist\PhoneController\PhoneController.exe
 ```
 
+The release build needs internet access the first time it populates the
+dedicated `build\paddlex` cache (and when installing pinned Python packages).
+The resulting frozen application does not need internet access for these OCR
+profiles. A release can instead start from a reviewed, pre-populated cache, but
+the same model validator still runs before packaging.
+
 The build command creates a Python 3.13.13 virtual environment, installs the pinned
-build inputs, validates curated workflow seeds, downloads all three OCR models
+build inputs, validates curated workflow seeds, downloads all five OCR models
 into the dedicated build cache, validates their model/configuration files, and
 then creates a PyInstaller `onedir` application. It embeds PaddleOCR,
 PaddlePaddle, PaddleX, OpenCV, NumPy, certifi, Flask templates/static files, and
 only the curated workflow seed directory.
 
-To include local Windows tooling, place approved copies of these files in
+Supply the required FFmpeg executable and any optional local Android tools in
 `packaging\vendor` before building:
 
-- `ffmpeg.exe` (recommended for stable DirectShow camera enumeration)
+- `ffmpeg.exe` (required for stable DirectShow camera enumeration)
 - `adb.exe`, `AdbWinApi.dll`, `AdbWinUsbApi.dll` (local Android control)
 
-The application resolves bundled FFmpeg through its frozen resource directory
-before PATH. If it is absent, source/development PATH lookup and integer camera
-sources still work. The normal Raspberry Pi input path does not require these
-tools.
+The build installs FFmpeg at `_internal\tools\ffmpeg.exe`. A frozen application
+uses that exact file and never falls back to a global FFmpeg or PATH. Source
+development retains PATH lookup. DirectShow alternative monikers remain the
+authoritative join to stable Windows PnP camera identities; packaging does not
+add an arbitrary numeric-index fallback.
 
-Before creating a production installer, inspect `build\PhoneController` and the
+The embedded Paddle models and runtime selection are:
+
+| OCR language | `CAMERA_OCR_LANGUAGE` | Recognition model |
+| --- | --- | --- |
+| English | `en` / `english` (default) | `en_PP-OCRv5_mobile_rec` |
+| Simplified Chinese | `ch`, `zh-CN` | `PP-OCRv5_mobile_rec` |
+| Traditional Chinese | `chinese_cht`, `zh-HK`, `zh-TW` | `PP-OCRv5_mobile_rec` |
+| Japanese | `japan`, `ja` | `PP-OCRv5_mobile_rec` |
+| Malay | `ms`, `malay` | `latin_PP-OCRv5_mobile_rec` |
+
+All profiles reuse `PP-OCRv5_mobile_det` and the optional
+`PP-LCNet_x1_0_textline_ori` model. Unsupported languages fail explicitly; they
+do not trigger a runtime model download. The package does not include Tesseract
+or traineddata, and this build process does not alter the existing optional
+Tesseract code path.
+
+FFmpeg redistribution obligations depend on the exact approved build and its
+enabled codecs. Release engineering must retain its license/notices and satisfy
+the supplier's LGPL/GPL source-offer or corresponding-source requirements as
+applicable. Legal review, the recorded download URL, version and SHA-256 are
+release prerequisites; do not substitute an unreviewed binary.
+
+After PyInstaller completes, the build validates the bundled FFmpeg and all five
+model directories and rejects embedded `.env` or `tesseract.exe` files. Before
+creating a production installer, inspect `build\PhoneController` and the
 PyInstaller warning file, then test the frozen EXE on a clean Windows machine
 with the build user's Paddle caches unavailable. Confirm OCR performs inference
 without internet access and spawned OCR workers do not recursively launch the

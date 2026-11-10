@@ -97,10 +97,13 @@ For a standalone copy, Python 3.10+ is required. Create an environment with
 
 ### Camera OCR setup
 
-Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector and its
-English-specific PP-OCRv5 mobile recognizer on the CPU. The document-orientation
+Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector on the CPU.
+English uses `en_PP-OCRv5_mobile_rec`; set `CAMERA_OCR_LANGUAGE=zh-HK` (or
+`chinese_cht`) for Chinese with `PP-OCRv5_mobile_rec`, or
+`CAMERA_OCR_LANGUAGE=ms` for Malay with `latin_PP-OCRv5_mobile_rec`. English is
+the default, and unsupported languages fail explicitly. The document-orientation
 and document-unwarping models are disabled; text line orientation is also
-disabled by default. Paddle and its models are created exactly once in a
+disabled by default. Paddle and its selected models are created exactly once in a
 persistent spawned worker process, then reused for the life of the server. A
 background warmup starts the worker before Flask begins serving so model
 initialization normally finishes before the first workflow OCR request. This

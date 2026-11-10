@@ -19,6 +19,8 @@ model_root = Path(
 model_names = (
     "PP-OCRv5_mobile_det",
     "en_PP-OCRv5_mobile_rec",
+    "PP-OCRv5_mobile_rec",
+    "latin_PP-OCRv5_mobile_rec",
     "PP-LCNet_x1_0_textline_ori",
 )
 required_model_files = (
@@ -54,6 +56,18 @@ if build_version and version_marker.is_file():
 binaries = []
 hiddenimports = []
 
+vendor = APP_ROOT / "packaging" / "vendor"
+ffmpeg = vendor / "ffmpeg.exe"
+subprocess.run(
+    [
+        sys.executable,
+        str(APP_ROOT / "packaging" / "validate_ffmpeg.py"),
+        str(ffmpeg),
+    ],
+    check=True,
+)
+binaries.append((str(ffmpeg), "tools"))
+
 # websocket-client is given certifi.where() explicitly for WSS verification.
 # Bundle certifi's cacert.pem so that path also exists in the installed onedir app.
 datas += collect_data_files("certifi")
@@ -73,11 +87,10 @@ for package in ("paddle", "paddleocr", "paddlex", "cv2", "numpy"):
     binaries += package_binaries
     hiddenimports += package_hidden
 
-# These tools are optional because Raspberry Pi control is the application
-# default. If supplied before building, stable Windows camera enumeration and
-# local Android tooling remain available without installing anything globally.
-vendor = APP_ROOT / "packaging" / "vendor"
-for filename in ("ffmpeg.exe", "adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
+# Local Android tooling remains optional because Raspberry Pi control is the
+# application default. FFmpeg is required above for stable DirectShow identity
+# enumeration and is never resolved from a global installation in releases.
+for filename in ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
     source = vendor / filename
     if source.is_file():
         binaries.append((str(source), "tools"))

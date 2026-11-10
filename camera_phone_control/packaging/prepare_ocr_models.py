@@ -9,7 +9,15 @@ from pathlib import Path
 MODEL_NAMES = (
     "PP-OCRv5_mobile_det",
     "en_PP-OCRv5_mobile_rec",
+    "PP-OCRv5_mobile_rec",
+    "latin_PP-OCRv5_mobile_rec",
     "PP-LCNet_x1_0_textline_ori",
+)
+
+MODEL_PREPARATION_PROFILES = (
+    ("en", "en_PP-OCRv5_mobile_rec"),
+    ("chinese_cht", "PP-OCRv5_mobile_rec"),
+    ("ms", "latin_PP-OCRv5_mobile_rec"),
 )
 
 REQUIRED_MODEL_FILES = (
@@ -68,17 +76,18 @@ def main(argv=None):
         # optional model too. Runtime behavior still follows the existing setting.
         from paddleocr import PaddleOCR
 
-        PaddleOCR(
-            lang="en",
-            ocr_version="PP-OCRv5",
-            device="cpu",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=True,
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
-            textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
-        )
+        for language, recognition_model in MODEL_PREPARATION_PROFILES:
+            PaddleOCR(
+                lang=language,
+                ocr_version="PP-OCRv5",
+                device="cpu",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=True,
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name=recognition_model,
+                textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
+            )
     model_root = cache_root / "official_models"
     _validate(model_root)
     print(f"OCR models ready: {model_root}")

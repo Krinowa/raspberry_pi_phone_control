@@ -33,6 +33,42 @@ from ..workflows.timing import measure_timing, record_timing
 
 LOG = logging.getLogger("camera_ocr")
 
+OCR_LANGUAGE_PROFILES = {
+    "en": ("en", "en_PP-OCRv5_mobile_rec"),
+    "ch": ("ch", "PP-OCRv5_mobile_rec"),
+    "chinese_cht": ("chinese_cht", "PP-OCRv5_mobile_rec"),
+    "japan": ("japan", "PP-OCRv5_mobile_rec"),
+    "ms": ("ms", "latin_PP-OCRv5_mobile_rec"),
+}
+OCR_LANGUAGE_ALIASES = {
+    "english": "en",
+    "zh": "ch",
+    "zh-cn": "ch",
+    "zh-hans": "ch",
+    "zh-hk": "chinese_cht",
+    "zh-tw": "chinese_cht",
+    "zh-hant": "chinese_cht",
+    "traditional-chinese": "chinese_cht",
+    "ja": "japan",
+    "jp": "japan",
+    "malay": "ms",
+}
+
+
+def _ocr_language_profile(language):
+    value = str(language or "").strip().casefold().replace("_", "-")
+    value = OCR_LANGUAGE_ALIASES.get(value, value)
+    if value == "chinese-cht":
+        value = "chinese_cht"
+    profile = OCR_LANGUAGE_PROFILES.get(value)
+    if profile is None:
+        supported = "en, ch, chinese_cht/zh-HK, japan, and ms"
+        raise TextDetectionUnavailable(
+            f"Packaged Camera OCR does not support language {language!r}; "
+            f"supported languages are {supported}."
+        )
+    return value, profile[0], profile[1]
+
 
 def _process_cpu_times():
     if resource is not None:
@@ -60,30 +96,26 @@ def _build_paddle_engine(
             "Install the camera OCR dependencies and restart the server."
         ) from exc
 
+    _, paddle_language, recognition_model = _ocr_language_profile(language)
     options = dict(
         device="cpu",
+        lang=paddle_language,
+        ocr_version="PP-OCRv5",
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=textline_orientation,
         cpu_threads=cpu_threads,
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_recognition_model_name=recognition_model,
+        textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
     )
     if recognition_batch_size is not None:
         options["text_recognition_batch_size"] = recognition_batch_size
-    if language == "en":
-        options.update(
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
-        )
-    else:
-        options.update(lang=language, ocr_version="PP-OCRv5")
     packaged_models = os.environ.get("PHONE_CONTROLLER_OCR_MODELS_DIR", "").strip()
     if packaged_models:
         model_root = Path(packaged_models)
         detection = model_root / "PP-OCRv5_mobile_det"
-        recognition_name = (
-            "en_PP-OCRv5_mobile_rec" if language == "en" else "PP-OCRv5_mobile_rec"
-        )
-        recognition = model_root / recognition_name
+        recognition = model_root / recognition_model
         missing = [
             path.name
             for path in (detection, recognition)
@@ -746,13 +778,14 @@ class CameraOCRScreenStateProvider:
         self,
         external_screen,
         *,
-        language="en",
+        language=None,
         timeout=30.0,
         worker_pool_size=2,
         _shared_worker=None,
     ):
         self.external_screen = external_screen
-        self.language = language
+        requested_language = language or os.environ.get("CAMERA_OCR_LANGUAGE", "en")
+        self.language = _ocr_language_profile(requested_language)[0]
         self.timeout = float(timeout)
         if self.timeout <= 0:
             raise ValueError("Camera OCR timeout must be positive.")

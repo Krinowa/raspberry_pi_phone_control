@@ -1315,8 +1315,7 @@ class CameraManager:
                     identities + self._configured_identity_placeholders(identities)
                     if self.identity_discovery
                     else [
-                        {"runtime_source": source}
-                        for source in range(first, last + 1)
+                        {"runtime_source": source} for source in range(first, last + 1)
                     ]
                 )
                 for item in candidates:
