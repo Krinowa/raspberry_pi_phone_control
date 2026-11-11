@@ -2,6 +2,7 @@
 """PyInstaller onedir definition for the Windows Phone Controller client."""
 
 import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,22 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
 APP_ROOT = Path(SPECPATH).parent
+protected_stage_value = os.environ.get("PHONE_CONTROLLER_PROTECTED_STAGE", "").strip()
+protected_manifest_value = os.environ.get(
+    "PHONE_CONTROLLER_PROTECTED_MANIFEST", ""
+).strip()
+if not protected_stage_value or not protected_manifest_value:
+    raise SystemExit(
+        "Protected build inputs are required. Run packaging\\build_windows.bat; "
+        "ordinary source/bytecode packaging is disabled."
+    )
+protected_stage = Path(protected_stage_value).resolve()
+protected_manifest_path = Path(protected_manifest_value).resolve()
+if not protected_manifest_path.is_file():
+    raise SystemExit(f"Protected build manifest is missing: {protected_manifest_path}")
+protected_manifest = json.loads(protected_manifest_path.read_text(encoding="utf-8"))
+if Path(protected_manifest.get("stage", "")).resolve() != protected_stage:
+    raise SystemExit("Protected build manifest does not match the configured stage.")
 model_root = Path(
     os.environ.get(
         "PHONE_CONTROLLER_BUILD_MODEL_ROOT",
@@ -54,7 +71,14 @@ datas = [
 if build_version and version_marker.is_file():
     datas.append((str(version_marker), "."))
 binaries = []
-hiddenimports = []
+hiddenimports = list(protected_manifest["hiddenimports"])
+
+for module, relative in protected_manifest["extensions"].items():
+    extension = protected_stage / relative
+    if not extension.is_file():
+        raise SystemExit(f"Required protected extension is missing: {extension}")
+    destination = str(Path(relative).parent)
+    binaries.append((str(extension), destination if destination != "." else "."))
 
 vendor = APP_ROOT / "packaging" / "vendor"
 ffmpeg = vendor / "ffmpeg.exe"
@@ -101,17 +125,32 @@ app_icon = Path(
 version_file = Path(os.environ.get("PHONE_CONTROLLER_BUILD_VERSION_FILE", ""))
 
 a = Analysis(
-    [str(APP_ROOT / "windows_launcher.py")],
-    pathex=[str(APP_ROOT)],
+    [str(protected_stage / "windows_launcher.py")],
+    pathex=[str(protected_stage)],
     binaries=binaries,
     datas=datas,
     hiddenimports=sorted(set(hiddenimports)),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(APP_ROOT / "packaging" / "pyi_rth_phone_controller.py")],
-    excludes=["tkinter", "matplotlib.tests", "numpy.tests"],
+    excludes=[
+        "tkinter",
+        "matplotlib.tests",
+        "numpy.tests",
+        *protected_manifest.get("excluded_modules", []),
+    ],
     noarchive=False,
 )
+
+compiled_modules = set(protected_manifest["compiled_modules"])
+pure_proprietary = sorted(
+    name for name, *_ in a.pure if name in compiled_modules
+)
+if pure_proprietary:
+    raise SystemExit(
+        "Protected modules unexpectedly fell back to Python bytecode: "
+        + ", ".join(pure_proprietary)
+    )
 pyz = PYZ(a.pure)
 
 exe = EXE(

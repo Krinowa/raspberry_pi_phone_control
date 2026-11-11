@@ -262,14 +262,44 @@ def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--shutdown", action="store_true")
+    parser.add_argument(
+        "--package-smoke-test", action="store_true", help=argparse.SUPPRESS
+    )
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
     return args
 
 
+def _run_package_smoke_test():
+    """Exercise the frozen import graph and core Flask UI/API without a server."""
+    paths = RuntimePaths.create()
+    logging_runtime = _configure_logging(paths.logs)
+    app = camera_manager = None
+    try:
+        _prepare_environment(paths)
+        app, camera_manager = _create_application(paths)
+        client = app.test_client()
+        checks = (
+            client.get("/", follow_redirects=True),
+            client.get("/api/status"),
+            client.get("/static/app.js"),
+        )
+        if any(response.status_code >= 500 for response in checks):
+            return 1
+        if checks[2].status_code != 200:
+            return 1
+        return 0
+    finally:
+        if app is not None and camera_manager is not None:
+            _close_application(app, camera_manager)
+        logging_runtime.stop()
+
+
 def main(argv=None):
     args = _parse_args(argv)
+    if args.package_smoke_test:
+        return _run_package_smoke_test()
     if args.shutdown:
         signalled = _signal_shutdown()
         if signalled:

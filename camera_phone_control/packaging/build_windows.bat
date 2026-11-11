@@ -42,6 +42,11 @@ set "PHONE_CONTROLLER_BUILD_MODEL_ROOT=%PHONE_CONTROLLER_BUILD_CACHE%\official_m
 if not defined APP_VERSION set "APP_VERSION=development"
 set "PHONE_CONTROLLER_BUILD_VERSION=%APP_VERSION%"
 
+set "PHONE_CONTROLLER_PROTECTED_STAGE=%CD%\build\protected"
+python packaging\build_protected_modules.py --stage "%PHONE_CONTROLLER_PROTECTED_STAGE%" --temp "%CD%\build\protected-temp"
+if errorlevel 1 exit /b 1
+set "PHONE_CONTROLLER_PROTECTED_MANIFEST=%PHONE_CONTROLLER_PROTECTED_STAGE%\protected-manifest.json"
+
 python -m PyInstaller --noconfirm --clean packaging\phone_controller.spec
 if errorlevel 1 exit /b 1
 python packaging\validate_windows_bundle.py dist\PhoneController
