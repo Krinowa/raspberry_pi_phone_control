@@ -91,11 +91,21 @@ imports. The allowlist is recorded in the generated protected manifest.
 
 `phone_controller.spec` requires that manifest and stage; invoking it without
 them fails instead of reverting to ordinary source packaging. It also rejects
-any compiled-module name that appears in PyInstaller's pure-Python table. The
-post-build validator checks every required `.pyd`, inspects the executable and
-nested PYZ archive with PyInstaller's archive viewer, rejects proprietary
-source/bytecode or generated C/C++ files, and runs a frozen Flask UI/API smoke
-test using an isolated temporary data directory.
+any compiled-module name that appears in PyInstaller's pure-Python table or PYZ
+table. Protected modules are deliberately excluded from ModuleGraph and added
+only as native binaries; do not add them to `hiddenimports`, because that can
+resolve the original source tree and create a second bytecode copy.
+
+Each build starts by deleting only the generated protected staging directory,
+PyInstaller work directory, onedir output, isolated PyInstaller cache and stale
+`PhoneControllerSetup.exe`. Paddle's model cache is retained. A random build ID
+and SHA-256 for every `.pyd` bind the manifest, packaged attestation and final
+onedir output together, preventing an old executable from passing validation.
+
+The post-build validator checks every required `.pyd` and its digest, directly
+opens the executable CArchive and nested PYZ archive with PyInstaller's archive
+reader, rejects proprietary source/bytecode or generated C/C++ files, and runs
+a frozen Flask UI/API smoke test using an isolated temporary data directory.
 
 The Cython stage improves the effort required to recover Python implementation
 details; it is not encryption or DRM. Native extensions can still be

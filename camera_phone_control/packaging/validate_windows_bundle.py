@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import re
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -31,38 +30,44 @@ def _validate_installer_definition():
         )
 
 
-def _archive_listing(executable):
-    command = [
-        sys.executable,
-        "-m",
-        "PyInstaller.utils.cliutils.archive_viewer",
-        "--recursive",
-        "--brief",
-        str(executable),
-    ]
+def _normalize_archive_name(name):
+    value = str(name).replace("\\", "/")
+    for suffix in (".pyc", ".pyo", ".py"):
+        if value.casefold().endswith(suffix):
+            value = value[: -len(suffix)]
+            break
+    return value.strip("/").replace("/", ".")
+
+
+def _archive_modules(executable):
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("PyInstaller archive inspection timed out.") from exc
-    if completed.returncode != 0:
+        from PyInstaller.archive.readers import CArchiveReader
+    except ImportError as exc:
         raise RuntimeError(
-            "PyInstaller archive inspection failed: "
-            + (completed.stderr.strip() or completed.stdout.strip())
-        )
-    return completed.stdout
+            "PyInstaller is required for protected archive inspection."
+        ) from exc
+    try:
+        archive = CArchiveReader(str(executable))
+    except Exception as exc:
+        raise RuntimeError(f"Could not inspect PyInstaller executable: {exc}") from exc
 
-
-def _archive_contains_module(listing, module):
-    return (
-        re.search(rf"(?m)(?:^|[\s'\"]){re.escape(module)}(?:$|[\s'\"])", listing)
-        is not None
-    )
+    exe_modules = set()
+    pyz_modules = set()
+    for name, entry in archive.toc.items():
+        typecode = entry[-1]
+        if typecode in {"m", "M", "s"}:
+            exe_modules.add(_normalize_archive_name(name))
+        if typecode == "z":
+            try:
+                nested = archive.open_embedded_archive(name)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not inspect nested PyInstaller archive {name!r}: {exc}"
+                ) from exc
+            pyz_modules.update(_normalize_archive_name(item) for item in nested.toc)
+    if not pyz_modules:
+        raise RuntimeError("No nested PYZ archive was found in PhoneController.exe.")
+    return exe_modules, pyz_modules
 
 
 def _validate_protected_modules(distribution, resources, manifest_path):
@@ -71,9 +76,29 @@ def _validate_protected_modules(distribution, resources, manifest_path):
         raise RuntimeError(f"Protected build manifest is missing: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     extensions = manifest.get("extensions") or {}
+    extension_hashes = manifest.get("extension_sha256") or {}
     compiled_modules = manifest.get("compiled_modules") or []
-    if set(extensions) != set(compiled_modules):
+    if set(extensions) != set(compiled_modules) or set(extension_hashes) != set(
+        compiled_modules
+    ):
         raise RuntimeError("Protected manifest extension set is incomplete.")
+
+    attestation_path = resources / "protected-attestation.json"
+    if not attestation_path.is_file():
+        raise RuntimeError("Protected build attestation is missing from the bundle.")
+    attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    for field in (
+        "build_id",
+        "compiled_modules",
+        "bootstrap_modules",
+        "excluded_modules",
+        "extensions",
+        "extension_sha256",
+    ):
+        if attestation.get(field) != manifest.get(field):
+            raise RuntimeError(
+                f"Protected bundle attestation does not match this build: {field}."
+            )
 
     missing_extensions = [
         module
@@ -84,6 +109,17 @@ def _validate_protected_modules(distribution, resources, manifest_path):
         raise RuntimeError(
             "Required protected native extensions are missing: "
             + ", ".join(missing_extensions)
+        )
+    mismatched_extensions = [
+        module
+        for module, relative in extensions.items()
+        if hashlib.sha256((resources / relative).read_bytes()).hexdigest()
+        != extension_hashes[module]
+    ]
+    if mismatched_extensions:
+        raise RuntimeError(
+            "Protected native extension hashes do not match this build: "
+            + ", ".join(mismatched_extensions)
         )
 
     forbidden_files = []
@@ -101,16 +137,19 @@ def _validate_protected_modules(distribution, resources, manifest_path):
             + ", ".join(str(path) for path in forbidden_files)
         )
 
-    listing = _archive_listing(distribution / "PhoneController.exe")
-    archived = [
-        module
-        for module in compiled_modules + manifest.get("excluded_modules", [])
-        if _archive_contains_module(listing, module)
-    ]
-    if archived:
+    exe_modules, pyz_modules = _archive_modules(distribution / "PhoneController.exe")
+    protected_names = set(compiled_modules) | set(manifest.get("excluded_modules", []))
+    archived_in_exe = sorted(protected_names & exe_modules)
+    archived_in_pyz = sorted(protected_names & pyz_modules)
+    if archived_in_exe or archived_in_pyz:
+        locations = []
+        if archived_in_exe:
+            locations.append("EXE: " + ", ".join(archived_in_exe))
+        if archived_in_pyz:
+            locations.append("PYZ: " + ", ".join(archived_in_pyz))
         raise RuntimeError(
             "Proprietary modules remain recoverable from PyInstaller archives: "
-            + ", ".join(archived)
+            + "; ".join(locations)
         )
     return manifest
 
@@ -153,7 +192,15 @@ def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
     )
     if not manifest_path:
         raise RuntimeError("PHONE_CONTROLLER_PROTECTED_MANIFEST is required.")
-    _validate_protected_modules(distribution, resources, manifest_path)
+    protected_manifest = _validate_protected_modules(
+        distribution, resources, manifest_path
+    )
+    print(
+        "Protected archive verified: "
+        f"build_id={protected_manifest['build_id']} "
+        f"native_modules={len(protected_manifest['compiled_modules'])} "
+        "protected_exe_bytecode=0 protected_pyz_bytecode=0"
+    )
     forbidden = tuple(distribution.rglob(".env")) + tuple(
         distribution.rglob("tesseract.exe")
     )

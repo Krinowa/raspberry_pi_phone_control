@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import importlib.machinery
 import json
 import os
 import shutil
 import sys
+import uuid
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -132,10 +134,14 @@ def build_plan():
     compiled_sources = sorted(source_set - bootstrap_set)
     compiled_modules = [module_name(path) for path in compiled_sources]
     bootstrap_modules = [module_name(path) for path in bootstrap_sources]
-    hiddenimports = set(compiled_modules) | set(bootstrap_modules)
+    hiddenimports = set(bootstrap_modules)
     for path in source_set:
         hiddenimports.update(imported_modules(path, module_name(path)))
     hiddenimports.discard("__future__")
+    # Native modules are added as explicit binaries. Asking ModuleGraph to find
+    # them as hidden imports can make it resolve the original source tree and
+    # place a second bytecode copy in PYZ.
+    hiddenimports.difference_update(compiled_modules)
     return {
         "format": 1,
         "app_root": str(APP_ROOT),
@@ -234,9 +240,26 @@ def compile_plan(plan, stage: Path, temp: Path):
             + ", ".join(missing)
         )
     plan["extensions"] = extensions_by_module
+    plan["extension_sha256"] = {
+        module: hashlib.sha256((stage / relative).read_bytes()).hexdigest()
+        for module, relative in extensions_by_module.items()
+    }
+    plan["build_id"] = uuid.uuid4().hex
     plan["stage"] = str(stage)
     manifest = stage / "protected-manifest.json"
     manifest.write_text(json.dumps(plan, indent=2, sort_keys=True), encoding="utf-8")
+    attestation = {
+        "format": plan["format"],
+        "build_id": plan["build_id"],
+        "compiled_modules": plan["compiled_modules"],
+        "bootstrap_modules": plan["bootstrap_modules"],
+        "excluded_modules": plan["excluded_modules"],
+        "extensions": plan["extensions"],
+        "extension_sha256": plan["extension_sha256"],
+    }
+    (stage / "protected-attestation.json").write_text(
+        json.dumps(attestation, indent=2, sort_keys=True), encoding="utf-8"
+    )
     return manifest
 
 

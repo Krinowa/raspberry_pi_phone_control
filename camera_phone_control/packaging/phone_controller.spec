@@ -3,6 +3,7 @@
 
 import os
 import json
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,9 @@ if not protected_manifest_path.is_file():
 protected_manifest = json.loads(protected_manifest_path.read_text(encoding="utf-8"))
 if Path(protected_manifest.get("stage", "")).resolve() != protected_stage:
     raise SystemExit("Protected build manifest does not match the configured stage.")
+compiled_modules = set(protected_manifest["compiled_modules"])
+excluded_proprietary_modules = set(protected_manifest.get("excluded_modules", []))
+protected_analysis_excludes = compiled_modules | excluded_proprietary_modules
 model_root = Path(
     os.environ.get(
         "PHONE_CONTROLLER_BUILD_MODEL_ROOT",
@@ -68,15 +72,26 @@ datas = [
     (str(workflow_seeds), "automation/workflow_data"),
     (str(APP_ROOT / "packaging" / "defaults"), "packaging/defaults"),
 ]
+protected_attestation = protected_stage / "protected-attestation.json"
+if not protected_attestation.is_file():
+    raise SystemExit(f"Protected build attestation is missing: {protected_attestation}")
+datas.append((str(protected_attestation), "."))
 if build_version and version_marker.is_file():
     datas.append((str(version_marker), "."))
 binaries = []
-hiddenimports = list(protected_manifest["hiddenimports"])
+hiddenimports = [
+    name
+    for name in protected_manifest["hiddenimports"]
+    if name not in protected_analysis_excludes
+]
 
 for module, relative in protected_manifest["extensions"].items():
     extension = protected_stage / relative
     if not extension.is_file():
         raise SystemExit(f"Required protected extension is missing: {extension}")
+    digest = hashlib.sha256(extension.read_bytes()).hexdigest()
+    if digest != protected_manifest["extension_sha256"].get(module):
+        raise SystemExit(f"Protected extension hash mismatch: {module}")
     destination = str(Path(relative).parent)
     binaries.append((str(extension), destination if destination != "." else "."))
 
@@ -137,14 +152,13 @@ a = Analysis(
         "tkinter",
         "matplotlib.tests",
         "numpy.tests",
-        *protected_manifest.get("excluded_modules", []),
+        *sorted(protected_analysis_excludes),
     ],
     noarchive=False,
 )
 
-compiled_modules = set(protected_manifest["compiled_modules"])
 pure_proprietary = sorted(
-    name for name, *_ in a.pure if name in compiled_modules
+    name for name, *_ in a.pure if name in protected_analysis_excludes
 )
 if pure_proprietary:
     raise SystemExit(
@@ -152,6 +166,20 @@ if pure_proprietary:
         + ", ".join(pure_proprietary)
     )
 pyz = PYZ(a.pure)
+pyz_names = {
+    entry if isinstance(entry, str) else entry[0]
+    for entry in pyz.toc
+}
+pyz_proprietary = sorted(protected_analysis_excludes & pyz_names)
+if pyz_proprietary:
+    raise SystemExit(
+        "Protected modules unexpectedly entered the PYZ archive: "
+        + ", ".join(pyz_proprietary)
+    )
+print(
+    "Protected PyInstaller analysis verified: "
+    f"native_modules={len(compiled_modules)} pure_fallbacks=0 pyz_fallbacks=0"
+)
 
 exe = EXE(
     pyz,

@@ -16,6 +16,10 @@ if errorlevel 1 exit /b 1
 python -c "import struct,sys; assert sys.version_info[:3] == (3, 13, 13) and struct.calcsize('P') == 8, 'CPython 3.13.13 x64 is required'"
 if errorlevel 1 exit /b 1
 
+python packaging\clean_protected_build.py
+if errorlevel 1 exit /b 1
+set "PYINSTALLER_CONFIG_DIR=%CD%\build\pyinstaller-cache"
+
 if not exist "packaging\vendor\ffmpeg.exe" (
   echo ERROR: packaging\vendor\ffmpeg.exe is required for production packaging.
   echo Supply an approved self-contained Windows x64 FFmpeg build with DirectShow support.
