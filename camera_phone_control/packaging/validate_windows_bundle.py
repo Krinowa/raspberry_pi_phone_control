@@ -220,11 +220,38 @@ def _validate_smoke_report(report_path, compiled_modules):
         for item in report.get("endpoints", [])
         if isinstance(item, dict)
     }
-    expected_endpoints = {"/": 200, "/api/status": 200, "/static/app.js": 200}
+    expected_endpoints = {
+        "/": 200,
+        "/api/status": 200,
+        "/static/app.js": 200,
+        "/static/i18n.js": 200,
+        "/static/style.css": 200,
+    }
     if endpoint_statuses != expected_endpoints:
         raise RuntimeError(
             "Frozen Flask endpoint checks were incomplete or unsuccessful: "
             f"{endpoint_statuses!r}."
+        )
+    expected_remoteviewer_routes = {
+        ("/agent/v1/devices/<device_id>/frames", "GET"),
+        ("/agent/v1/devices/<device_id>/takeover", "POST"),
+        ("/agent/v1/devices/<device_id>/takeover/renew", "POST"),
+        ("/agent/v1/devices/<device_id>/takeover", "DELETE"),
+        ("/agent/v1/devices/<device_id>/input", "POST"),
+        ("/agent/v1/devices/<device_id>/screen", "GET"),
+        ("/agent/v1/devices/<device_id>/screen", "PUT"),
+        ("/api/remote-control", "GET"),
+        ("/api/devices/<device_id>/remote-control/end", "POST"),
+    }
+    reported_routes = {
+        (item.get("route"), item.get("method"))
+        for item in report.get("remoteviewer_routes", [])
+        if isinstance(item, dict)
+    }
+    if reported_routes != expected_remoteviewer_routes:
+        raise RuntimeError(
+            "Frozen RemoteViewer route checks were incomplete: "
+            f"{sorted(reported_routes)!r}."
         )
     return report
 
@@ -309,8 +336,27 @@ def _run_frozen_smoke_test(executable, compiled_modules):
         print(
             "Frozen application smoke test verified: "
             f"native_modules={len(report['compiled_imports'])} "
-            "multiprocessing_exit_code=0 endpoints=/,/api/status,/static/app.js"
+            "multiprocessing_exit_code=0 "
+            "endpoints=/,/api/status,/static/app.js,/static/i18n.js,/static/style.css "
+            "remoteviewer_routes=9"
         )
+
+
+def _forbidden_bundle_inputs(distribution):
+    distribution = Path(distribution)
+    forbidden = tuple(distribution.rglob(".env")) + tuple(
+        distribution.rglob("tesseract.exe")
+    )
+    forbidden += tuple(
+        path
+        for path in distribution.rglob("*")
+        if path.is_file()
+        and (
+            path.suffix.casefold() in {".key", ".p12", ".pfx", ".secret"}
+            or path.name.casefold() in {"id_rsa", "id_ed25519"}
+        )
+    )
+    return forbidden
 
 
 def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
@@ -337,18 +383,7 @@ def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
         f"native_modules={len(protected_manifest['compiled_modules'])} "
         "protected_exe_bytecode=0 protected_pyz_bytecode=0"
     )
-    forbidden = tuple(distribution.rglob(".env")) + tuple(
-        distribution.rglob("tesseract.exe")
-    )
-    forbidden += tuple(
-        path
-        for path in distribution.rglob("*")
-        if path.is_file()
-        and (
-            path.suffix.casefold() in {".key", ".p12", ".pfx"}
-            or path.name.casefold() in {"id_rsa", "id_ed25519"}
-        )
-    )
+    forbidden = _forbidden_bundle_inputs(distribution)
     if forbidden:
         raise RuntimeError(
             "Forbidden secret/Tesseract packaging input found: "

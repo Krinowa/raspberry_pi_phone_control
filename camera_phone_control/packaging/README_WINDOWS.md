@@ -214,6 +214,17 @@ set `PHONE_DEVELOPER_MODE_KEY` to a non-empty value in
 Restart Phone Controller after provisioning or rotating the key. Never add this
 external `.env` to the PyInstaller bundle or installer inputs.
 
+RemoteViewer is also commissioned through that external installed-client `.env`:
+
+```text
+REMOTEVIEWER_PI_SECRET_FILE=C:\full\path\to\pi.secret
+```
+
+Use an absolute path to a separately provisioned secret file with restricted
+Windows ACLs. The secret file and its contents are never bundled. Source runs may
+instead use `camera_phone_control\.env`; the installed application reads
+`%LOCALAPPDATA%\Phone Controller\config\.env`.
+
 ## Signing
 
 Do not store certificates, private keys or signing passwords in this repository.

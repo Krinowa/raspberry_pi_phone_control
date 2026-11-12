@@ -274,26 +274,31 @@ def _warm_ocr(app):
 
 def _close_application(app, camera_manager):
     try:
-        manager = app.extensions.get("withdraw_manager")
-        if manager is not None:
-            manager.close()
+        remote = app.extensions.get("remote_control")
+        if remote is not None:
+            remote.close()
     finally:
         try:
-            executor = app.extensions.get("job_executor")
-            if executor is not None:
-                executor.close()
+            manager = app.extensions.get("withdraw_manager")
+            if manager is not None:
+                manager.close()
         finally:
             try:
-                provider = app.extensions.get("workflow_screen_state_provider")
-                close_provider = getattr(provider, "close", None)
-                if close_provider is not None:
-                    close_provider()
+                executor = app.extensions.get("job_executor")
+                if executor is not None:
+                    executor.close()
             finally:
-                state = app.extensions.get("control_state")
-                if state is not None:
-                    with state.lock:
-                        state.disable()
-                camera_manager.release_all()
+                try:
+                    provider = app.extensions.get("workflow_screen_state_provider")
+                    close_provider = getattr(provider, "close", None)
+                    if close_provider is not None:
+                        close_provider()
+                finally:
+                    state = app.extensions.get("control_state")
+                    if state is not None:
+                        with state.lock:
+                            state.disable()
+                    camera_manager.release_all()
 
 
 def _watch_for_shutdown(event_handle, server):
@@ -407,14 +412,46 @@ def _run_package_smoke_test():
 
         report["phase"] = "flask_create_app"
         app, camera_manager = _create_application(paths, package_smoke=True)
+        required_routes = {
+            ("/agent/v1/devices/<device_id>/frames", "GET"),
+            ("/agent/v1/devices/<device_id>/takeover", "POST"),
+            ("/agent/v1/devices/<device_id>/takeover/renew", "POST"),
+            ("/agent/v1/devices/<device_id>/takeover", "DELETE"),
+            ("/agent/v1/devices/<device_id>/input", "POST"),
+            ("/agent/v1/devices/<device_id>/screen", "GET"),
+            ("/agent/v1/devices/<device_id>/screen", "PUT"),
+            ("/api/remote-control", "GET"),
+            ("/api/devices/<device_id>/remote-control/end", "POST"),
+        }
+        registered_routes = {
+            (rule.rule, method)
+            for rule in app.url_map.iter_rules()
+            for method in rule.methods - {"HEAD", "OPTIONS"}
+        }
+        missing_routes = sorted(required_routes - registered_routes)
+        report["remoteviewer_routes"] = [
+            {"route": route, "method": method}
+            for route, method in sorted(required_routes)
+        ]
+        if missing_routes:
+            raise RuntimeError(
+                "RemoteViewer routes are missing from the frozen Flask app: "
+                f"{missing_routes!r}."
+            )
         client = app.test_client()
         checks = (
-            ("/", {"follow_redirects": True}),
-            ("/api/status", {"headers": {"X-Control-Client": "package-smoke"}}),
-            ("/static/app.js", {}),
+            ("/", {"follow_redirects": True}, b'id="remote-history"'),
+            (
+                "/api/status",
+                {"headers": {"X-Control-Client": "package-smoke"}},
+                None,
+            ),
+            ("/static/app.js", {}, b"/api/remote-control"),
+            ("/static/i18n.js", {}, b'"remote.heading"'),
+            ("/static/style.css", {}, b".remote-control-banner"),
         )
         report["phase"] = "flask_endpoints"
-        for endpoint, request_options in checks:
+        for endpoint, request_options, required_marker in checks:
             report["current_endpoint"] = endpoint
             response = client.get(endpoint, **request_options)
             try:
@@ -430,6 +467,10 @@ def _run_package_smoke_test():
                 if response.status_code != 200:
                     raise RuntimeError(
                         f"Smoke endpoint {endpoint} returned HTTP {response.status_code}."
+                    )
+                if required_marker is not None and required_marker not in response.data:
+                    raise RuntimeError(
+                        f"Smoke endpoint {endpoint} is missing its RemoteViewer asset marker."
                     )
             finally:
                 response.close()

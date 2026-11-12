@@ -55,10 +55,7 @@ from automation.screen.camera import CalibratedPreviewCache
 from automation.screen.stability import ScreenStabilityError
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
-from automation.jobs.storage import (
-    DEFAULT_DATA_DIRECTORY as JOB_DATA_DIRECTORY,
-    DeviceWorkflowAssignmentStore,
-)
+from automation.jobs.storage import DeviceWorkflowAssignmentStore
 from automation.integrations.withdraw_v2.balance import balance_check_workflow
 from automation.integrations.withdraw_v2.manager import register_withdraw
 from hardware.pi_api_client import (
@@ -2153,7 +2150,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         state.device_locks,
         history
         or remote_control.RemoteHistory(
-            JOB_DATA_DIRECTORY / "remote_control_history.jsonl"
+            app.extensions["job_store"].path.parent / "remote_control_history.jsonl"
         ),
         local_operator=local_operator,
         running_job=running_job,
