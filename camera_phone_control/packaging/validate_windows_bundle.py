@@ -154,26 +154,162 @@ def _validate_protected_modules(distribution, resources, manifest_path):
     return manifest
 
 
-def _run_frozen_smoke_test(executable):
+def _read_diagnostic(path):
+    path = Path(path)
+    if not path.is_file():
+        return "<not created>"
+    try:
+        value = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
+    return value if value else "<empty>"
+
+
+def _smoke_failure_details(
+    *, command, cwd, exit_code, stdout, stderr, diagnostic_paths
+):
+    def output_text(value):
+        if value is None or value == "":
+            return "<empty>"
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    sections = [
+        "Frozen application UI/API smoke-test diagnostics:",
+        f"command: {subprocess.list2cmdline([os.fspath(item) for item in command])}",
+        f"cwd: {cwd}",
+        f"exit code: {exit_code}",
+        "captured stdout:\n" + output_text(stdout),
+        "captured stderr:\n" + output_text(stderr),
+    ]
+    for label, path in diagnostic_paths:
+        sections.append(f"{label} ({path}):\n{_read_diagnostic(path)}")
+    return "\n\n".join(sections)
+
+
+def _validate_smoke_report(report_path, compiled_modules):
+    if not report_path.is_file():
+        raise RuntimeError("Frozen application did not create its smoke-test report.")
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Frozen smoke-test report is invalid: {exc}") from exc
+
+    if report.get("exit_code") != 0 or report.get("phase") != "complete":
+        raise RuntimeError(
+            "Frozen smoke-test report did not record successful completion."
+        )
+    imported = {
+        item.get("module")
+        for item in report.get("compiled_imports", [])
+        if isinstance(item, dict)
+    }
+    expected = set(compiled_modules)
+    if imported != expected:
+        missing = sorted(expected - imported)
+        unexpected = sorted(imported - expected)
+        raise RuntimeError(
+            "Frozen smoke test did not import the exact protected module set: "
+            f"missing={missing!r} unexpected={unexpected!r}."
+        )
+    if report.get("multiprocessing_exit_code") != 0:
+        raise RuntimeError("Frozen multiprocessing smoke check did not succeed.")
+    endpoint_statuses = {
+        item.get("endpoint"): item.get("status_code")
+        for item in report.get("endpoints", [])
+        if isinstance(item, dict)
+    }
+    expected_endpoints = {"/": 200, "/api/status": 200, "/static/app.js": 200}
+    if endpoint_statuses != expected_endpoints:
+        raise RuntimeError(
+            "Frozen Flask endpoint checks were incomplete or unsuccessful: "
+            f"{endpoint_statuses!r}."
+        )
+    return report
+
+
+def _run_frozen_smoke_test(executable, compiled_modules):
     with tempfile.TemporaryDirectory(prefix="phone-controller-package-smoke-") as data:
+        data_root = Path(data)
+        report_path = data_root / "frozen-smoke-report.json"
+        early_report_path = data_root / "frozen-smoke-early-traceback.txt"
+        stdout_path = data_root / "frozen-smoke-stdout.txt"
+        stderr_path = data_root / "frozen-smoke-stderr.txt"
+        command = [str(executable), "--package-smoke-test"]
+        diagnostic_paths = (
+            ("launcher smoke report", report_path),
+            ("early unhandled traceback", early_report_path),
+            ("redirected stdout", stdout_path),
+            ("redirected stderr", stderr_path),
+            ("persistent application log", data_root / "logs" / "phone-controller.log"),
+            ("startup error log", data_root / "logs" / "startup-error.log"),
+        )
         environment = os.environ.copy()
         environment["PHONE_CONTROLLER_DATA_DIR"] = data
         environment["PHONE_CONTROLLER_PACKAGE_SMOKE_TEST"] = "1"
+        environment["PHONE_CONTROLLER_PACKAGE_SMOKE_REPORT"] = os.fspath(report_path)
+        environment["PHONE_CONTROLLER_PACKAGE_SMOKE_EARLY_REPORT"] = os.fspath(
+            early_report_path
+        )
+        environment["PHONE_CONTROLLER_PACKAGE_SMOKE_STDOUT"] = os.fspath(stdout_path)
+        environment["PHONE_CONTROLLER_PACKAGE_SMOKE_STDERR"] = os.fspath(stderr_path)
+        environment["PYTHONUNBUFFERED"] = "1"
         try:
             completed = subprocess.run(
-                [str(executable), "--package-smoke-test"],
+                command,
+                cwd=executable.parent,
                 env=environment,
                 timeout=120,
                 check=False,
+                capture_output=True,
+                text=True,
+                errors="replace",
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
-                "Frozen application UI/API smoke test timed out."
+                "Frozen application UI/API smoke test timed out.\n\n"
+                + _smoke_failure_details(
+                    command=command,
+                    cwd=executable.parent,
+                    exit_code="<timed out after 120 seconds>",
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                    diagnostic_paths=diagnostic_paths,
+                )
             ) from exc
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Frozen application UI/API smoke test failed with exit code "
-            f"{completed.returncode}."
+        try:
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "Frozen application UI/API smoke test failed.\n\n"
+                    + _smoke_failure_details(
+                        command=command,
+                        cwd=executable.parent,
+                        exit_code=completed.returncode,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                        diagnostic_paths=diagnostic_paths,
+                    )
+                )
+            report = _validate_smoke_report(report_path, compiled_modules)
+        except RuntimeError as exc:
+            if "Frozen application UI/API smoke test failed" in str(exc):
+                raise
+            raise RuntimeError(
+                f"{exc}\n\n"
+                + _smoke_failure_details(
+                    command=command,
+                    cwd=executable.parent,
+                    exit_code=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    diagnostic_paths=diagnostic_paths,
+                )
+            ) from exc
+        print(
+            "Frozen application smoke test verified: "
+            f"native_modules={len(report['compiled_imports'])} "
+            "multiprocessing_exit_code=0 endpoints=/,/api/status,/static/app.js"
         )
 
 
@@ -220,7 +356,7 @@ def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
         )
     _validate_installer_definition()
     if run_smoke_test:
-        _run_frozen_smoke_test(executable)
+        _run_frozen_smoke_test(executable, protected_manifest["compiled_modules"])
     return distribution
 
 

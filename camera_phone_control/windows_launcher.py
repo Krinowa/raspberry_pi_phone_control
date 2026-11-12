@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib
+import importlib.machinery
+import json
 import logging
 import multiprocessing
 import os
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import webbrowser
@@ -273,27 +277,151 @@ def _parse_args(argv=None):
 
 def _run_package_smoke_test():
     """Exercise the frozen import graph and core Flask UI/API without a server."""
-    paths = RuntimePaths.create()
-    logging_runtime = _configure_logging(paths.logs)
+    report_path_value = os.environ.get(
+        "PHONE_CONTROLLER_PACKAGE_SMOKE_REPORT", ""
+    ).strip()
+    report_path = Path(report_path_value) if report_path_value else None
+    report = {
+        "command": sys.argv,
+        "executable": sys.executable,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "resource_root": os.fspath(getattr(sys, "_MEIPASS", "")),
+        "phase": "starting",
+        "compiled_imports": [],
+        "endpoints": [],
+        "errors": [],
+    }
+
+    def save_report():
+        if report_path is None:
+            return
+        try:
+            report_path.write_text(
+                json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        except Exception:
+            if sys.stderr is not None:
+                traceback.print_exc(file=sys.stderr)
+
+    paths = None
+    logging_runtime = None
     app = camera_manager = None
+    exit_code = 1
     try:
+        report["phase"] = "runtime_paths"
+        paths = RuntimePaths.create()
+        report["data_root"] = os.fspath(paths.data)
+        report["ocr_models"] = os.fspath(paths.ocr_models)
+        logging_runtime = _configure_logging(paths.logs)
+
+        report["phase"] = "environment"
         _prepare_environment(paths)
+
+        report["phase"] = "compiled_imports"
+        attestation_path = paths.resources / "protected-attestation.json"
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        for name in attestation["compiled_modules"]:
+            module = importlib.import_module(name)
+            origin = Path(module.__file__).resolve()
+            if not any(
+                origin.name.endswith(suffix)
+                for suffix in importlib.machinery.EXTENSION_SUFFIXES
+            ):
+                raise RuntimeError(
+                    f"Protected module {name} did not load as a native extension: "
+                    f"{origin}"
+                )
+            if paths.resources.resolve() not in origin.parents:
+                raise RuntimeError(
+                    f"Protected module {name} loaded outside frozen resources: {origin}"
+                )
+            report["compiled_imports"].append(
+                {"module": name, "origin": os.fspath(origin)}
+            )
+
+        report["phase"] = "multiprocessing"
+        from automation.screen.camera_ocr import _process_cpu_times
+
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=_process_cpu_times, name="package-smoke-compiled-child"
+        )
+        process.start()
+        process.join(30)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            raise RuntimeError("Compiled multiprocessing child did not exit.")
+        if process.exitcode != 0:
+            raise RuntimeError(
+                "Compiled multiprocessing child failed with exit code "
+                f"{process.exitcode}."
+            )
+        report["multiprocessing_exit_code"] = process.exitcode
+
+        report["phase"] = "flask_create_app"
         app, camera_manager = _create_application(paths)
         client = app.test_client()
         checks = (
-            client.get("/", follow_redirects=True),
-            client.get("/api/status"),
-            client.get("/static/app.js"),
+            ("/", {"follow_redirects": True}),
+            ("/api/status", {"headers": {"X-Control-Client": "package-smoke"}}),
+            ("/static/app.js", {}),
         )
-        if any(response.status_code >= 500 for response in checks):
-            return 1
-        if checks[2].status_code != 200:
-            return 1
-        return 0
+        report["phase"] = "flask_endpoints"
+        for endpoint, request_options in checks:
+            report["current_endpoint"] = endpoint
+            response = client.get(endpoint, **request_options)
+            result = {
+                "endpoint": endpoint,
+                "status_code": response.status_code,
+                "content_type": response.content_type,
+                "content_length": len(response.data),
+            }
+            if response.status_code != 200:
+                result["response_excerpt"] = response.get_data(as_text=True)[:2000]
+            report["endpoints"].append(result)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Smoke endpoint {endpoint} returned HTTP {response.status_code}."
+                )
+        report.pop("current_endpoint", None)
+        report["phase"] = "checks_complete"
+        exit_code = 0
+    except BaseException as exc:
+        report["errors"].append(
+            {
+                "phase": report["phase"],
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+        if sys.stderr is not None:
+            traceback.print_exc(file=sys.stderr)
     finally:
-        if app is not None and camera_manager is not None:
-            _close_application(app, camera_manager)
-        logging_runtime.stop()
+        report["phase_before_cleanup"] = report["phase"]
+        report["phase"] = "cleanup"
+        try:
+            if app is not None and camera_manager is not None:
+                _close_application(app, camera_manager)
+            if logging_runtime is not None:
+                logging_runtime.stop()
+        except BaseException as exc:
+            exit_code = 1
+            report["errors"].append(
+                {
+                    "phase": "cleanup",
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+            if sys.stderr is not None:
+                traceback.print_exc(file=sys.stderr)
+        report["phase"] = "complete" if exit_code == 0 else "failed"
+        report["exit_code"] = exit_code
+        save_report()
+    return exit_code
 
 
 def main(argv=None):
