@@ -2000,6 +2000,65 @@
     translateBoundContent();
   }
 
+  // Remote takeover by the RemoteViewer agent (remote_control.py).
+  Object.assign(en, {
+    "remote.heldBy": "Remote control by {user}",
+    "remote.reason": "Reason: {reason}",
+    "remote.since": "Since {time}",
+    "remote.sinceWaiting": "Since {time} · waiting for the job to stop",
+    "remote.end": "End Remote Control",
+    "remote.confirmEnd": "Take this phone back from the remote user?",
+    "remote.ended":
+      "Remote control ended. The phone is back under local control.",
+    "remote.mode": "Remote control",
+    "remote.help":
+      "A remote user controls this phone. Use End Remote Control on its card to take it back.",
+    "remote.heading": "Remote Control",
+    "remote.historyLoading": "Loading remote control history…",
+    "remote.historyStarted": "Remote takeover started",
+    "remote.historyCalibrated": "Phone screen recalibrated remotely",
+    "remote.historyEnded": "Remote takeover ended ({endedBy})",
+    "remote.endedBy.operator": "operator",
+    "remote.endedBy.remote": "remote user",
+    "remote.endedBy.leaseExpired": "lease expired",
+    "remote.endedBy.shutdown": "app stopped",
+    "remote.historyUser": "User: {user} · session {session}",
+    "remote.interruptedJob": "Interrupted job {id} ({workflow}, step {step})",
+    "remote.inputs": "Inputs: {count}",
+    "remote.historySummary": "Latest {count} remote control events.",
+    "remote.historyEmpty": "No remote control sessions yet.",
+    "backendError.remote_control_not_active": "Remote control is not active.",
+  });
+  Object.assign(zhHK, {
+    "remote.heldBy": "遠端控制中：{user}",
+    "remote.reason": "原因：{reason}",
+    "remote.since": "開始時間：{time}",
+    "remote.sinceWaiting": "開始時間：{time} · 正在等待工作停止",
+    "remote.end": "結束遠端控制",
+    "remote.confirmEnd": "要從遠端使用者收回這部手機嗎？",
+    "remote.ended": "已結束遠端控制，手機已交回本機控制。",
+    "remote.mode": "遠端控制",
+    "remote.help":
+      "遠端使用者正在控制這部手機。如要收回，請在手機卡片上按「結束遠端控制」。",
+    "remote.heading": "遠端控制",
+    "remote.historyLoading": "正在載入遠端控制紀錄…",
+    "remote.historyStarted": "遠端接管開始",
+    "remote.historyCalibrated": "手機螢幕已遠端重新校準",
+    "remote.historyEnded": "遠端接管結束（{endedBy}）",
+    "remote.endedBy.operator": "操作員",
+    "remote.endedBy.remote": "遠端使用者",
+    "remote.endedBy.leaseExpired": "租約逾時",
+    "remote.endedBy.shutdown": "程式關閉",
+    "remote.historyUser": "使用者：{user} · 工作階段 {session}",
+    "remote.interruptedJob": "已中斷工作 {id}（{workflow}，第 {step} 步）",
+    "remote.inputs": "輸入次數：{count}",
+    "remote.historySummary": "最近 {count} 項遠端控制紀錄。",
+    "remote.historyEmpty": "暫時沒有遠端控制紀錄。",
+    "backendError.remote_control_not_active": "遠端控制未有啟動。",
+  });
+  for (const key of ["remote.heading", "remote.historyLoading"])
+    if (!staticTextKeys.has(en[key])) staticTextKeys.set(en[key], key);
+
   const api = {
     DEFAULT_LOCALE,
     STORAGE_KEY,

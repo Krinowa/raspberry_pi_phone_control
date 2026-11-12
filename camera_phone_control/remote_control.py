@@ -1,13 +1,15 @@
 """Remote takeover of a phone by the RemoteViewer device agent.
 
-Implements the four control addresses of RemoteViewer's docs/pi-interface.md
-(sections 3 and 4) on the existing ``/agent/v1`` blueprint, whose
+Implements the control addresses of RemoteViewer's docs/pi-interface.md
+(sections 3, 4 and 5) on the existing ``/agent/v1`` blueprint, whose
 ``before_request`` already enforces the Bearer secret:
 
     POST   /agent/v1/devices/<id>/takeover
     POST   /agent/v1/devices/<id>/takeover/renew
     DELETE /agent/v1/devices/<id>/takeover?session_id=...
     POST   /agent/v1/devices/<id>/input
+    GET    /agent/v1/devices/<id>/screen
+    PUT    /agent/v1/devices/<id>/screen
 
 The agent has already checked that the remote user may do this. This module
 enforces the device lock, the lease and the input order, and records who did
@@ -30,6 +32,7 @@ from pathlib import Path
 from flask import abort, jsonify, request
 
 from automation.input.base import UnsupportedOperation
+from calibration import Calibration
 from automation.workflows.service import RemoteTakeoverRefused
 from device_lock import DeviceBusy
 
@@ -227,6 +230,8 @@ class RemoteControl:
       running_job(device_id) -> Job|None  a job claimed and running there
       lock_identity(device_id) -> str|None
       open_input(device_id) -> (bridge, calibration|None)
+      read_screen(device_id) -> calibration|None   the device's calibration
+      save_screen(device_id, calibration, changed_by)  store it and use it now
     """
 
     def __init__(
@@ -239,6 +244,8 @@ class RemoteControl:
         running_job,
         lock_identity,
         open_input,
+        read_screen,
+        save_screen,
         lease_seconds=LEASE_SECONDS,
         input_wait_seconds=INPUT_WAIT_SECONDS,
     ):
@@ -249,6 +256,8 @@ class RemoteControl:
         self.running_job = running_job
         self.lock_identity = lock_identity
         self.open_input = open_input
+        self.read_screen = read_screen
+        self.save_screen = save_screen
         self.lease_seconds = lease_seconds
         self.input_wait_seconds = input_wait_seconds
         self.lock = threading.RLock()
@@ -455,15 +464,19 @@ class RemoteControl:
                 raise Refused(403, "not_holder")
             return session
 
+    def _wait_until_held(self, session):
+        """Wait until the stopped job has handed the device lock over."""
+        deadline = time.monotonic() + self.input_wait_seconds
+        while not session.has_lock.wait(0.05):
+            if session.ended.is_set():
+                raise Refused(403, "not_holder")
+            if time.monotonic() >= deadline:
+                raise Refused(409, "job_stopping")
+
     def input(self, device_id, data):
         session = self._require_holder(device_id, data["session_id"])
         with session.input_lock:
-            deadline = time.monotonic() + self.input_wait_seconds
-            while not session.has_lock.wait(0.05):
-                if session.ended.is_set():
-                    raise Refused(403, "not_holder")
-                if time.monotonic() >= deadline:
-                    raise Refused(409, "job_stopping")
+            self._wait_until_held(session)
             if session.channel is None:
                 try:
                     bridge, calibration = self.open_input(device_id)
@@ -522,9 +535,68 @@ class RemoteControl:
                 "" if performed else ": outside the phone, ignored",
             )
 
+    # -- screen position (calibration) ---------------------------------------
 
-def register_routes(blueprint, remote, known_device):
-    """Add the four control addresses to the authenticated agent blueprint."""
+    def screen(self, device_id):
+        """The device's calibration corners, or None when it is not calibrated."""
+        calibration = self.read_screen(device_id)
+        return calibration.corners.tolist() if calibration is not None else None
+
+    def set_screen(self, device_id, session_id, corners):
+        """Replace the device's calibration; only the takeover holder may.
+
+        The new corners are saved and used at once by the dashboard, the bot and
+        the next remote input, exactly like a dashboard calibration.
+        """
+        session = self._require_holder(device_id, session_id)
+        try:
+            calibration = Calibration(corners)
+        except (ValueError, TypeError):
+            raise Refused(400, "bad_corners") from None
+        # Serialised with input, and only once the bot has let go of the phone.
+        with session.input_lock:
+            self._wait_until_held(session)
+            with self.lock:
+                if self.sessions.get(device_id) is not session:
+                    raise Refused(403, "not_holder")
+            at = _now()
+            changed_by = {
+                "source": "remote",
+                "session_id": session.session_id,
+                "user_id": session.user_id,
+                "at": at,
+            }
+            self.save_screen(device_id, calibration, changed_by)
+            # The next input reloads the bridge with the new calibration.
+            session.channel = None
+        LOG.info(
+            "Calibration of %s changed remotely by %s (session %s)",
+            device_id,
+            session.user_id,
+            session.session_id,
+        )
+        self.history.append(
+            {
+                "event": "calibrated",
+                "at": at,
+                "device_id": device_id,
+                "session_id": session.session_id,
+                "user_id": session.user_id,
+                "reason": session.reason,
+                "corners": calibration.corners.tolist(),
+            }
+        )
+        return calibration.corners.tolist()
+
+
+def register_routes(blueprint, remote, known_device, viewable_device=None):
+    """Add the control addresses to the authenticated agent blueprint.
+
+    known_device: id -> bool, phones that can be controlled. viewable_device:
+    id -> bool, devices whose screen position may be read (defaults to
+    known_device); a viewable but uncontrollable device reports no corners.
+    """
+    viewable_device = viewable_device or known_device
 
     def body():
         data = request.get_json(silent=True)
@@ -591,3 +663,21 @@ def register_routes(blueprint, remote, known_device):
         validate_input(data)
         remote.input(device_id, data)
         return jsonify(ok=True)
+
+    @blueprint.get("/devices/<device_id>/screen")
+    def screen(device_id):
+        if not viewable_device(device_id):
+            abort(404)
+        if not known_device(device_id):
+            return jsonify(corners=None)
+        return jsonify(corners=remote.screen(device_id))
+
+    @blueprint.put("/devices/<device_id>/screen")
+    def set_screen(device_id):
+        require_device(device_id)
+        data = body()
+        if set(data) != {"session_id", "corners"}:
+            raise Refused(400, "bad_corners")
+        session_id = session_id_of(data)
+        corners = remote.set_screen(device_id, session_id, data["corners"])
+        return jsonify(corners=corners)

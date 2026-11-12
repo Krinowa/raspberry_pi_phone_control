@@ -76,7 +76,14 @@ def env(tmp_path, monkeypatch):
     bridge = FakeBridge()
     # Phone occupies the middle half of the camera picture.
     calibration = Calibration([[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]])
-    flags = SimpleNamespace(local=False, job=None, calibration=calibration)
+    flags = SimpleNamespace(
+        local=False, job=None, calibration=calibration, saved=[]
+    )
+
+    def save_screen(device_id, new, changed_by):
+        flags.saved.append((device_id, new.corners.tolist(), changed_by))
+        flags.calibration = new
+
     remote = remote_control.RemoteControl(
         service,
         locks,
@@ -85,6 +92,8 @@ def env(tmp_path, monkeypatch):
         running_job=lambda device_id: flags.job,
         lock_identity=lambda device_id: LOCK_IDENTITY,
         open_input=lambda device_id: (bridge, flags.calibration),
+        read_screen=lambda device_id: flags.calibration,
+        save_screen=save_screen,
         lease_seconds=0.6,
         input_wait_seconds=3.0,
     )
@@ -132,6 +141,19 @@ def renew(client, session="s1"):
     )
 
 
+MIDDLE = [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]]
+# The phone moved: it now fills the left half of the picture.
+MOVED = [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]]
+
+
+def put_screen(client, corners, session="s1", headers=AUTH):
+    return client.put(
+        BASE + "/screen",
+        json={"session_id": session, "corners": corners},
+        headers=headers,
+    )
+
+
 def workflow(*steps):
     flow = new_workflow("remote test", purpose="balance_check")
     flow["steps"] = [
@@ -168,6 +190,8 @@ def test_missing_or_wrong_secret_is_401_on_all_four(env, headers):
         client.delete(BASE + "/takeover?session_id=s1", headers=headers)
     ).status_code == 401
     assert send(client, headers=headers, type="home").status_code == 401
+    assert client.get(BASE + "/screen", headers=headers).status_code == 401
+    assert put_screen(client, MOVED, headers=headers).status_code == 401
 
 
 def test_unknown_device_is_404(env):
@@ -184,6 +208,12 @@ def test_unknown_device_is_404(env):
     assert (
         client.post(
             other + "/input", json={"session_id": "s1", "type": "home"}, headers=AUTH
+        )
+    ).status_code == 404
+    assert client.get(other + "/screen", headers=AUTH).status_code == 404
+    assert (
+        client.put(
+            other + "/screen", json={"session_id": "s1", "corners": MOVED}, headers=AUTH
         )
     ).status_code == 404
 
@@ -649,3 +679,90 @@ def test_remote_never_takes_the_phone_during_a_critical_manual_checkpoint(
     assert snapshot["status"] == "cancelled"
     assert snapshot["step_index"] == 3
     assert wait_for(lambda: env.locks.owner(LOCK_IDENTITY) == "remote")
+
+
+# -- screen position (section 5) --------------------------------------------
+
+
+def test_screen_returns_the_calibration_corners(env):
+    response = env.client.get(BASE + "/screen", headers=AUTH)
+    assert response.status_code == 200
+    assert response.get_json() == {"corners": MIDDLE}
+
+
+def test_screen_is_null_when_not_calibrated(env):
+    env.flags.calibration = None
+    response = env.client.get(BASE + "/screen", headers=AUTH)
+    assert response.status_code == 200
+    assert response.get_json() == {"corners": None}
+
+
+def test_changing_the_screen_needs_the_takeover(env):
+    assert put_screen(env.client, MOVED).status_code == 403
+    assert takeover(env.client).status_code == 200
+    assert put_screen(env.client, MOVED, session="s2").status_code == 403
+    assert env.flags.saved == []
+
+
+@pytest.mark.parametrize(
+    "corners",
+    [
+        MIDDLE[:3],  # three points
+        [[0.25, 0.25], [0.75, 0.25], [0.75, 1.2], [0.25, 0.75]],  # outside 0..1
+        [[0.25, 0.25], [0.75, 0.75], [0.75, 0.25], [0.25, 0.75]],  # crossing
+        [[0.25, 0.25], [0.75, 0.25], [0.4, 0.4], [0.25, 0.75]],  # not convex
+        [[0.5, 0.5], [0.55, 0.5], [0.55, 0.55], [0.5, 0.55]],  # area 0.0025
+        [[True, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]],
+        "corners",
+        None,
+    ],
+)
+def test_bad_corners_are_400_and_change_nothing(env, corners):
+    assert takeover(env.client).status_code == 200
+    response = put_screen(env.client, corners)
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "bad_corners"}
+    assert env.flags.saved == []
+    assert env.client.get(BASE + "/screen", headers=AUTH).get_json() == {
+        "corners": MIDDLE
+    }
+
+
+def test_new_corners_are_saved_used_at_once_and_recorded(env):
+    assert takeover(env.client).status_code == 200
+    assert send(env.client, type="tap", x=0.5, y=0.5).status_code == 200
+    response = put_screen(env.client, MOVED)
+    assert response.status_code == 200
+    assert response.get_json() == {"corners": MOVED}
+    assert env.client.get(BASE + "/screen", headers=AUTH).get_json() == {
+        "corners": MOVED
+    }
+    # The same picture point now lands elsewhere on the phone.
+    assert send(env.client, type="tap", x=0.25, y=0.5).status_code == 200
+    assert env.bridge.calls == [("tap", 0.5, 0.5), ("tap", 0.5, 0.5)]
+    assert send(env.client, type="tap", x=0.5, y=0.5).status_code == 200
+    assert env.bridge.calls[-1] == ("tap", 1.0, 0.5)
+
+    [(device_id, corners, changed_by)] = env.flags.saved
+    assert (device_id, corners) == ("phone_A", MOVED)
+    assert changed_by["source"] == "remote"
+    assert (changed_by["session_id"], changed_by["user_id"]) == ("s1", "alice")
+    record = env.remote.history.recent()[0]
+    assert record["event"] == "calibrated"
+    assert (record["session_id"], record["user_id"]) == ("s1", "alice")
+    assert record["corners"] == MOVED
+
+
+def test_screen_change_waits_until_the_stopped_job_lets_go(env):
+    run_id = start_run(
+        env,
+        {"type": "wait", "seconds": 0},
+        {"type": "wait", "seconds": 30},
+    )
+    assert wait_for(lambda: step_number(env, run_id) == 2)
+    assert takeover(env.client, allow=True).status_code == 200
+    assert put_screen(env.client, MOVED).status_code == 200
+    # Saved only after the bot had stopped and handed over the phone.
+    assert env.service.snapshot(run_id)["status"] == "cancelled"
+    assert env.locks.owner(LOCK_IDENTITY) == "remote"
+    assert len(env.flags.saved) == 1

@@ -269,7 +269,8 @@ class CalibrationStorage:
             self._cache[path] = (cache_key, calibration)
             return calibration
 
-    def save(self, calibration, camera, camera_info, device):
+    def save(self, calibration, camera, camera_info, device, changed_by=None):
+        """changed_by: optional dict naming who made the change (kept as is)."""
         path = self.path_for(device)
         data = {
             "version": 1,
@@ -277,6 +278,7 @@ class CalibrationStorage:
             "device": self._device_details(device),
             "corners": calibration.corners.tolist(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "changed_by": changed_by or {"source": "dashboard"},
         }
         with self.lock:
             # If persistence fails, a prior in-memory value must not mask that

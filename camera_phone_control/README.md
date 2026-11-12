@@ -826,6 +826,30 @@ renew then gets `409`). Job History lists remote sessions and how each ended.
 The audit is kept in `automation/job_data/remote_control_history.jsonl`; typed text is
 never written there.
 
+**Swipe duration on the Pi.** A swipe that starts and ends at the same point is
+a long press. Appium holds it for `duration_ms`; the Pi API takes geometry only,
+so the Pi's HID server decides how long it is held.
+
+## RemoteViewer screen position
+
+Section 5 of the same contract: viewers crop the camera picture to the phone
+screen with this app's calibration, and a remote user holding the takeover can
+correct it. There is one calibration per device, the same one the dashboard
+saves (`automation/camera_data/calibration*.json`).
+
+| Address | Purpose |
+|---|---|
+| `GET /agent/v1/devices/<id>/screen` | `{"corners": [[x, y], …]}`: top-left, top-right, bottom-right, bottom-left of the phone screen, in fractions of the frame picture; `{"corners": null}` when not calibrated. |
+| `PUT /agent/v1/devices/<id>/screen` | `{"session_id", "corners"}`. `403` unless the session holds the takeover; `400 {"error": "bad_corners"}` unless the corners pass the dashboard's checks (four points in 0–1, convex, area at least 0.005). `200` returns the stored corners. |
+
+A remote change is saved and used at once, exactly like a dashboard
+calibration: the dashboard, the bot and the next remote input all use it. It
+waits until a stopped job has handed over the phone. The calibration file
+records who made the last change (`changed_by`: `dashboard`, or `remote` with
+the session and user), and Job History lists remote recalibrations. If the
+camera or phone is not ready the change is refused with `409
+device_unavailable`.
+
 ## Tests
 
 From `camera_phone_control` with the virtual environment active:

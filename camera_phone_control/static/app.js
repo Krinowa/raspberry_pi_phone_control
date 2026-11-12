@@ -1568,6 +1568,15 @@ function deviceCardRenderSignature(
       bluetooth_address: device.bluetooth_address,
       ready_for_work: device.ready_for_work,
       workflow_assignment: device.workflow_assignment,
+      remote_control: device.remote_control
+        ? {
+            session_id: device.remote_control.session_id,
+            user_id: device.remote_control.user_id,
+            reason: device.remote_control.reason,
+            started_at: device.remote_control.started_at,
+            waiting_for_job: device.remote_control.waiting_for_job,
+          }
+        : null,
     },
     default_device: deviceCatalog?.default_device,
     selected: device.id === deviceCatalog?.selected_device,
@@ -2759,35 +2768,72 @@ function remoteControlBanner(device) {
   banner.className = "remote-control-banner";
   banner.setAttribute("role", "status");
   const heading = document.createElement("strong");
-  heading.textContent = `Remote control by ${remote.user_id}`;
+  deviceUiText(
+    heading,
+    "remote.heldBy",
+    `Remote control by ${remote.user_id}`,
+    { user: remote.user_id },
+  );
   const reason = document.createElement("span");
-  reason.textContent = `Reason: ${remote.reason}`;
+  deviceUiText(reason, "remote.reason", `Reason: ${remote.reason}`, {
+    reason: remote.reason,
+  });
   const since = document.createElement("span");
-  since.textContent = remote.waiting_for_job
-    ? `Since ${localTime(remote.started_at)} · waiting for the job to stop`
-    : `Since ${localTime(remote.started_at)}`;
+  const started = localTime(remote.started_at);
+  if (remote.waiting_for_job)
+    deviceUiText(
+      since,
+      "remote.sinceWaiting",
+      `Since ${started} · waiting for the job to stop`,
+      { time: started },
+    );
+  else
+    deviceUiText(since, "remote.since", `Since ${started}`, { time: started });
   const end = document.createElement("button");
   end.type = "button";
   end.className = "stop";
-  end.textContent = "End Remote Control";
+  deviceUiText(end, "remote.end", "End Remote Control");
   end.addEventListener("click", () => endRemoteControl(device.id, end));
   banner.append(heading, reason, since, end);
   return banner;
 }
 
 async function endRemoteControl(deviceId, button) {
-  if (!window.confirm("Take this phone back from the remote user?")) return;
+  if (
+    !window.confirm(
+      deviceUi(
+        "remote.confirmEnd",
+        "Take this phone back from the remote user?",
+      ),
+    )
+  )
+    return;
   button.disabled = true;
   try {
     await deviceService.endRemoteControl(deviceId);
-    notice("Remote control ended. The phone is back under local control.");
+    const device = deviceCatalog?.devices?.find((item) => item.id === deviceId);
+    if (device) device.remote_control = null;
+    notice(
+      deviceUi(
+        "remote.ended",
+        "Remote control ended. The phone is back under local control.",
+      ),
+    );
   } catch (error) {
     notice(error.message, true);
   } finally {
     deviceRenderSignature = null;
+    renderDevices();
     await loadDevices();
   }
 }
+
+const REMOTE_ENDED_BY = {
+  operator: ["remote.endedBy.operator", "operator"],
+  remote: ["remote.endedBy.remote", "remote user"],
+  lease_expired: ["remote.endedBy.leaseExpired", "lease expired"],
+  shutdown: ["remote.endedBy.shutdown", "app stopped"],
+};
 
 function renderRemoteControlHistory() {
   const list = $("remote-history");
@@ -2796,36 +2842,84 @@ function renderRemoteControlHistory() {
     const item = document.createElement("article");
     item.className = "job-item";
     const what = document.createElement("strong");
-    what.textContent =
-      record.event === "started"
-        ? "Remote takeover started"
-        : `Remote takeover ended (${record.ended_by})`;
+    if (record.event === "started")
+      deviceUiText(what, "remote.historyStarted", "Remote takeover started");
+    else if (record.event === "calibrated")
+      deviceUiText(
+        what,
+        "remote.historyCalibrated",
+        "Phone screen recalibrated remotely",
+      );
+    else {
+      const [key, fallback] = REMOTE_ENDED_BY[record.ended_by] || [
+        null,
+        record.ended_by,
+      ];
+      const endedBy = key ? deviceUi(key, fallback) : fallback;
+      deviceUiText(
+        what,
+        "remote.historyEnded",
+        `Remote takeover ended (${endedBy})`,
+        { endedBy },
+      );
+    }
     const who = document.createElement("span");
-    who.textContent = `User: ${record.user_id} · session ${record.session_id}`;
+    deviceUiText(
+      who,
+      "remote.historyUser",
+      `User: ${record.user_id} · session ${record.session_id}`,
+      { user: record.user_id, session: record.session_id },
+    );
     const device = document.createElement("span");
-    device.textContent = `Device: ${record.device_id}`;
+    deviceUiText(device, "jobs.device", `Device: ${record.device_id}`, {
+      deviceId: record.device_id,
+    });
     const when = document.createElement("span");
     when.textContent = localTime(record.at);
     const reason = document.createElement("span");
     reason.className = "job-result";
-    reason.textContent = `Reason: ${record.reason}`;
+    deviceUiText(reason, "remote.reason", `Reason: ${record.reason}`, {
+      reason: record.reason,
+    });
     item.append(what, who, device, when, reason);
     if (record.interrupted_job) {
       const job = document.createElement("span");
       job.className = "job-error";
-      job.textContent = `Interrupted job ${record.interrupted_job.id} (${record.interrupted_job.workflow}, step ${record.interrupted_job.step_index + 1})`;
+      const interrupted = record.interrupted_job;
+      deviceUiText(
+        job,
+        "remote.interruptedJob",
+        `Interrupted job ${interrupted.id} (${interrupted.workflow}, step ${interrupted.step_index + 1})`,
+        {
+          id: interrupted.id,
+          workflow: interrupted.workflow,
+          step: interrupted.step_index + 1,
+        },
+      );
       item.append(job);
     }
     if (record.event === "ended") {
       const inputs = document.createElement("span");
-      inputs.textContent = `Inputs: ${record.inputs}`;
+      deviceUiText(inputs, "remote.inputs", `Inputs: ${record.inputs}`, {
+        count: record.inputs,
+      });
       item.append(inputs);
     }
     return item;
   });
-  $("remote-history-state").textContent = items.length
-    ? `Latest ${items.length} remote control events.`
-    : "No remote control sessions yet.";
+  if (items.length)
+    deviceUiText(
+      $("remote-history-state"),
+      "remote.historySummary",
+      `Latest ${items.length} remote control events.`,
+      { count: items.length },
+    );
+  else
+    deviceUiText(
+      $("remote-history-state"),
+      "remote.historyEmpty",
+      "No remote control sessions yet.",
+    );
   list.replaceChildren(...items);
 }
 
@@ -4645,9 +4739,12 @@ function render() {
 
   $("enable").hidden = dashboardMode === "operate" && active();
   if (state?.control_status === "remote") {
-    $("mode").textContent = "Remote control";
-    $("control-help").textContent =
-      "A remote user controls this phone. Use End Remote Control on its card to take it back.";
+    deviceUiText($("mode"), "remote.mode", "Remote control");
+    deviceUiText(
+      $("control-help"),
+      "remote.help",
+      "A remote user controls this phone. Use End Remote Control on its card to take it back.",
+    );
   }
 
   $("enable").disabled =

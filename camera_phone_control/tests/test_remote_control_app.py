@@ -252,3 +252,49 @@ def test_only_enrolled_phones_can_be_controlled(dashboard, monkeypatch):
         dashboard.client.post(BASE + "/takeover", json=body, headers=AUTH).status_code
         == 200
     )
+
+
+def test_remote_recalibration_is_the_dashboard_calibration(dashboard, tmp_path):
+    import json
+
+    client = dashboard.client
+    body = {
+        "session_id": "s1",
+        "user_id": "tester",
+        "reason": "camera moved",
+        "allow_during_job": False,
+    }
+    assert client.get(BASE + "/screen", headers=AUTH).get_json() == {"corners": None}
+    corners = [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]]
+    put = {"session_id": "s1", "corners": corners}
+    assert client.put(BASE + "/screen", json=put, headers=AUTH).status_code == 403
+    assert client.post(BASE + "/takeover", json=body, headers=AUTH).status_code == 200
+
+    response = client.put(BASE + "/screen", json=put, headers=AUTH)
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json() == {"corners": corners}
+    assert client.get(BASE + "/screen", headers=AUTH).get_json() == {
+        "corners": corners
+    }
+    # The dashboard uses it at once and the file records who changed it.
+    state = dashboard.app.extensions["control_state"]
+    assert state.calibration.corners.tolist() == corners
+    saved = json.loads((tmp_path / "calibration.json").read_text())
+    assert saved["corners"] == corners
+    assert saved["changed_by"]["source"] == "remote"
+    assert saved["changed_by"]["user_id"] == "tester"
+    assert saved["changed_by"]["session_id"] == "s1"
+
+    # Remote taps now map through it without any other setup.
+    response = client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "tap", "x": 0.5, "y": 0.5},
+        headers=AUTH,
+    )
+    assert response.status_code == 200, response.get_json()
+    assert FakePi.sent == [("phone_A", "tap", 0.5, 0.5)]
+
+    bad = {"session_id": "s1", "corners": corners[:3]}
+    response = client.put(BASE + "/screen", json=bad, headers=AUTH)
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "bad_corners"}

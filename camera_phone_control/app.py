@@ -352,6 +352,37 @@ class ControlState:
             raise DeviceError(self.message)
         return camera
 
+    def apply_calibration(self, calibration, camera_info, changed_by=None):
+        """Save corners for the selected phone and use them at once.
+
+        Caller holds self.lock and has checked the phone and camera are ready.
+        """
+        signature = (self.device, camera_info["width"], camera_info["height"])
+        if self.calibration_storage is not None:
+            try:
+                self.calibration_storage.save(
+                    calibration,
+                    self.camera,
+                    camera_info,
+                    self.device,
+                    changed_by,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                LOG.error("Could not save camera calibration: %s", exc)
+                raise ValueError(
+                    "Calibration could not be saved to local storage."
+                ) from exc
+        self.calibration = calibration
+        self.signature = signature
+        if self.calibration_storage is not None:
+            self.calibration_restore_key = (
+                signature,
+                getattr(self.camera, "configured_source", self.camera.source),
+                self.camera.rotate,
+            )
+        self.message = "Calibration saved. You can enable Manual Control."
+        LOG.info("Four-corner calibration saved for %s", self.device.serial)
+
     @contextmanager
     def input_control(self, client, frame_id):
         if self.device is None:
@@ -1707,38 +1738,7 @@ def create_app(
             camera_info = state.require_ready()
             state.require_frame(data.get("frame_id"))
             calibration = Calibration(data.get("corners"))
-            signature = (
-                state.device,
-                camera_info["width"],
-                camera_info["height"],
-            )
-            if state.calibration_storage is not None:
-                try:
-                    state.calibration_storage.save(
-                        calibration,
-                        state.camera,
-                        camera_info,
-                        state.device,
-                    )
-                except (OSError, TypeError, ValueError) as exc:
-                    LOG.error("Could not save camera calibration: %s", exc)
-                    raise ValueError(
-                        "Calibration could not be saved to local storage."
-                    ) from exc
-            state.calibration = calibration
-            state.signature = signature
-            if state.calibration_storage is not None:
-                state.calibration_restore_key = (
-                    signature,
-                    getattr(
-                        state.camera,
-                        "configured_source",
-                        state.camera.source,
-                    ),
-                    state.camera.rotate,
-                )
-            state.message = "Calibration saved. You can enable Manual Control."
-            LOG.info("Four-corner calibration saved for %s", state.device.serial)
+            state.apply_calibration(calibration, camera_info)
             return jsonify(calibrated=True, corners=calibration.corners.tolist())
 
     @app.post("/api/key")
@@ -2073,25 +2073,71 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
             None,
         )
 
-    def open_input(device_id):
-        """The workflow input bridge for device_id and its saved calibration."""
+    def input_target(device_id):
+        """(target, backend, selected): the phone device_id addresses.
+
+        selected: it is the phone the dashboard shows, whose calibration lives
+        in `state`. Caller holds state.lock.
+        """
+        if state.pi_bridge is not None:
+            target = RaspberryPiInputBridge(
+                PiApiClient(state.pi_bridge.client.base_url, device_id=device_id)
+            ).target
+            return target, "raspberry_pi", state.pi_bridge.device_id == device_id
+        if state.device is None:
+            raise remote_control.Refused(409, "device_unavailable")
+        return state.device, "appium", True
+
+    def device_calibration(device_id):
+        """(target, backend, calibration|None) for device_id."""
         with state.lock:
-            if state.pi_bridge is not None:
-                target = RaspberryPiInputBridge(
-                    PiApiClient(state.pi_bridge.client.base_url, device_id=device_id)
-                ).target
-                backend = "raspberry_pi"
-                selected = state.pi_bridge.device_id == device_id
-            else:
-                if state.device is None:
-                    raise remote_control.Refused(409, "device_unavailable")
-                target, backend, selected = state.device, "appium", True
+            target, backend, selected = input_target(device_id)
             calibration = state.calibration if selected else None
         if calibration is None and calibration_storage is not None:
             camera = camera_manager.get_camera(device_id)
             status = camera.status()
             if status.get("ready"):
                 calibration = calibration_storage.load(camera, status, target)
+        return target, backend, calibration
+
+    def read_screen(device_id):
+        try:
+            return device_calibration(device_id)[2]
+        except remote_control.Refused:
+            return None  # no phone to calibrate: viewers show the whole picture
+
+    def save_screen(device_id, calibration, changed_by):
+        """Store corners for device_id and use them at once, as the dashboard does."""
+        with state.lock:
+            target, _, selected = input_target(device_id)
+            if selected:
+                state.disable("Calibration changed remotely. Input disabled.")
+                state.calibration = None
+                state.calibration_restore_key = None
+                try:
+                    camera_info = state.require_ready()
+                except DeviceError:
+                    raise remote_control.Refused(409, "device_unavailable") from None
+                try:
+                    state.apply_calibration(calibration, camera_info, changed_by)
+                except ValueError:
+                    raise remote_control.Refused(500, "save_failed") from None
+                return
+        # Not the dashboard's phone: its saved file is what the bot, remote
+        # input and a later dashboard selection all load.
+        camera = camera_manager.get_camera(device_id)
+        status = camera.status()
+        if calibration_storage is None or not status.get("ready"):
+            raise remote_control.Refused(409, "device_unavailable")
+        try:
+            calibration_storage.save(calibration, camera, status, target, changed_by)
+        except (OSError, TypeError, ValueError) as exc:
+            LOG.error("Could not save camera calibration: %s", exc)
+            raise remote_control.Refused(500, "save_failed") from None
+
+    def open_input(device_id):
+        """The workflow input bridge for device_id and its saved calibration."""
+        target, backend, calibration = device_calibration(device_id)
         context = AutomationContext(
             target,
             state.android,
@@ -2113,11 +2159,15 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         running_job=running_job,
         lock_identity=readiness.lock_identity,
         open_input=open_input,
+        read_screen=read_screen,
+        save_screen=save_screen,
     )
     app.extensions["remote_control"] = remote
 
     blueprint = agent_frames.make_blueprint(camera_manager, agent_secret, known_device)
-    remote_control.register_routes(blueprint, remote, controllable_device)
+    remote_control.register_routes(
+        blueprint, remote, controllable_device, viewable_device=known_device
+    )
     app.register_blueprint(blueprint)
     LOG.info(
         "RemoteViewer agent endpoints %s",
@@ -2138,7 +2188,17 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         if request.get_json(silent=True) != {}:
             raise ValueError("End remote control expects an empty JSON object.")
         if not remote.end_by_operator(device_id):
-            return jsonify(ok=False, error="Remote control is not active."), 409
+            return (
+                jsonify(
+                    ok=False,
+                    **error_fields(
+                        "Remote control is not active.",
+                        "remote_control_not_active",
+                        {"device_id": device_id},
+                    ),
+                ),
+                409,
+            )
         return jsonify(ok=True)
 
 
