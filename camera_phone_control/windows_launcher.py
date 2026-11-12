@@ -164,7 +164,41 @@ def _prepare_environment(paths):
     register_sensitive_environment()
 
 
-def _create_application(paths):
+class _PackageSmokeCamera:
+    """Thread-free camera used only by the frozen packaging smoke test."""
+
+    source = None
+    configured_source = None
+    rotate = 0
+    fps = 0
+
+    def __init__(self):
+        self.closed = False
+
+    def status(self):
+        return {
+            "ready": False,
+            "index": None,
+            "source": None,
+            "width": None,
+            "height": None,
+            "error": "Synthetic camera is unavailable during package validation.",
+        }
+
+    def frame(self):
+        return None
+
+    def observation(self):
+        return None
+
+    def validate_frame(self, frame_id):
+        raise ValueError("Synthetic camera has no frames.")
+
+    def close(self):
+        self.closed = True
+
+
+def _create_application(paths, *, package_smoke=False):
     from app import create_app
     from automation.jobs.storage import (
         AccountBindingStore,
@@ -178,13 +212,24 @@ def _create_application(paths):
     from camera_manager import CameraConfigStorage, CameraManager
     from device_lock import DeviceLocks
 
-    camera_manager = CameraManager(
-        storage=CameraConfigStorage(paths.camera / "cameras.json"),
-        default_source=0,
-        default_rotation=0,
-        width=1280,
-        height=720,
-    )
+    manager_options = {
+        "storage": CameraConfigStorage(paths.camera / "cameras.json"),
+        "default_source": 0,
+        "default_rotation": 0,
+        "width": 1280,
+        "height": 720,
+    }
+    if package_smoke:
+        # Application creation normally activates the configured physical
+        # camera. A packaging check needs the complete Flask/import graph, not
+        # USB hardware, and a blocked DirectShow read cannot be shut down on a
+        # deterministic validation deadline.
+        manager_options.update(
+            default_camera=_PackageSmokeCamera(),
+            shared_camera=True,
+            identity_discovery=False,
+        )
+    camera_manager = CameraManager(**manager_options)
     try:
         camera = camera_manager.activate("phone_A")
         app = create_app(
@@ -200,7 +245,8 @@ def _create_application(paths):
             ocr_settings_storage=OCRSettingsStorage(paths.camera / "ocr_settings.json"),
             screenshot_store=WorkflowScreenshotStore(paths.receipts),
             device_locks=DeviceLocks(paths.locks),
-            start_job_executor=True,
+            start_job_executor=not package_smoke,
+            start_withdraw_workers=not package_smoke,
         )
     except Exception:
         camera_manager.release_all()
@@ -360,7 +406,7 @@ def _run_package_smoke_test():
         report["multiprocessing_exit_code"] = process.exitcode
 
         report["phase"] = "flask_create_app"
-        app, camera_manager = _create_application(paths)
+        app, camera_manager = _create_application(paths, package_smoke=True)
         client = app.test_client()
         checks = (
             ("/", {"follow_redirects": True}),
@@ -371,19 +417,22 @@ def _run_package_smoke_test():
         for endpoint, request_options in checks:
             report["current_endpoint"] = endpoint
             response = client.get(endpoint, **request_options)
-            result = {
-                "endpoint": endpoint,
-                "status_code": response.status_code,
-                "content_type": response.content_type,
-                "content_length": len(response.data),
-            }
-            if response.status_code != 200:
-                result["response_excerpt"] = response.get_data(as_text=True)[:2000]
-            report["endpoints"].append(result)
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Smoke endpoint {endpoint} returned HTTP {response.status_code}."
-                )
+            try:
+                result = {
+                    "endpoint": endpoint,
+                    "status_code": response.status_code,
+                    "content_type": response.content_type,
+                    "content_length": len(response.data),
+                }
+                if response.status_code != 200:
+                    result["response_excerpt"] = response.get_data(as_text=True)[:2000]
+                report["endpoints"].append(result)
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Smoke endpoint {endpoint} returned HTTP {response.status_code}."
+                    )
+            finally:
+                response.close()
         report.pop("current_endpoint", None)
         report["phase"] = "checks_complete"
         exit_code = 0
