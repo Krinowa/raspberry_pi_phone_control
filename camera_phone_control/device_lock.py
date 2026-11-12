@@ -5,6 +5,7 @@ import hashlib
 import os
 import stat
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,6 +14,13 @@ if os.name == "nt":
     import msvcrt
 else:
     import fcntl
+
+
+# On Windows a lock covers a byte range and also blocks reading it, so the lock
+# byte must not overlap the owner name stored at the start of the file: anyone
+# who finds the device busy reads that name. Windows allows locking past the
+# end of a file, so the lock lives far beyond any content.
+_WINDOWS_LOCK_OFFSET = 1 << 30
 
 
 class DeviceBusy(RuntimeError):
@@ -58,9 +66,7 @@ class DeviceLocks:
     def _try_lock(fd):
         if os.name == "nt":
             try:
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"\0")
-                os.lseek(fd, 0, os.SEEK_SET)
+                os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 return True
             except OSError as exc:
@@ -78,10 +84,10 @@ class DeviceLocks:
     @staticmethod
     def _lock_blocking(fd):
         if os.name == "nt":
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            # LK_LOCK retries only once a second and gives up after ten tries,
+            # so brief contention on a guard would stall or fail. Poll instead.
+            while not DeviceLocks._try_lock(fd):
+                time.sleep(0.005)
         else:
             fcntl.flock(fd, fcntl.LOCK_EX)
 
