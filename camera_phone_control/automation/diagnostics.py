@@ -4,17 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import threading
 from collections import deque
 from datetime import datetime, timezone
 
-_SECRET_FIELD = re.compile(
-    r"(?i)\b(password|passwd|token|secret|totp|authorization|credential|api[_ -]?key|control[_ -]?token)"
-    r"([\"']?\s*[:=]\s*)([\"']?)([^\s,;&\"']+)\3"
-)
-_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
-_LONG_NUMBER = re.compile(r"(?<!\d)\d{12,19}(?!\d)")
+from diagnostic_logging import sanitize_diagnostic_fields, sanitize_text
 
 
 class RecentLogHandler(logging.Handler):
@@ -32,32 +26,31 @@ class RecentLogHandler(logging.Handler):
                 self._secrets.add(value)
 
     def redact(self, value):
-        message = str(value)
-        message = _BEARER.sub("Bearer <redacted>", message)
-        message = _SECRET_FIELD.sub(
-            lambda match: (
-                f"{match.group(1)}{match.group(2)}{match.group(3)}"
-                f"<redacted>{match.group(3)}"
-            ),
-            message,
-        )
-        message = message.replace("<redacted> <redacted>", "<redacted>")
-        message = _LONG_NUMBER.sub("<redacted-number>", message)
         with self._lock:
             secrets = tuple(self._secrets)
-        for secret in secrets:
-            message = message.replace(secret, "<redacted>")
-        return message
+        return sanitize_text(value, secrets=secrets)
 
     def emit(self, record):
         try:
+            message = record.getMessage()
+            fields = getattr(record, "diagnostic_fields", {})
+            if fields:
+                with self._lock:
+                    secrets = tuple(self._secrets)
+                fields = sanitize_diagnostic_fields(fields, secrets=secrets)
+                context = " ".join(
+                    f"{key}={value}"
+                    for key, value in fields.items()
+                    if value is not None
+                )
+                message = f"{context} {message}".strip()
             entry = {
                 "timestamp": datetime.fromtimestamp(
                     record.created, timezone.utc
                 ).isoformat(timespec="seconds"),
                 "level": record.levelname,
                 "logger": record.name,
-                "message": self.redact(record.getMessage()),
+                "message": self.redact(message),
             }
             with self._lock:
                 self._entries.append(entry)

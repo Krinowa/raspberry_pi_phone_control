@@ -5,12 +5,13 @@ import logging
 import signal
 import threading
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from android_control import AndroidControl, DeviceError
 from device_lock import DeviceBusy, DeviceLocks
 from hardware.pi_api_client import PiApiError
+from diagnostic_logging import configure_development_logging
 from .context import AutomationContext, Cancelled
 from .backends import select_device, backend_names
 from .input.base import UnsupportedOperation
@@ -41,6 +42,8 @@ class RunState:
     step_id: str | None = None
     step_count: int = 0
     checkpoint_message: str | None = None
+    error_code: str | None = None
+    error_params: dict = field(default_factory=dict)
 
     @property
     def exit_code(self):
@@ -60,6 +63,9 @@ class Runner:
         self.logger = logger or LOG
         self.state = None
         self._run_lock = threading.Lock()
+        # Optional callable set by the owner; when it returns True the run stops
+        # at its next cancellation check, exactly like a local takeover.
+        self.remote_stop = None
 
     def run(self, script_name, serial=None, *, cancel_event=None, device_id=None):
         if not self._run_lock.acquire(blocking=False):
@@ -120,6 +126,7 @@ class Runner:
             if script is None:
                 state.status = "failed"
                 state.message = "Unknown script. Use --list to see available scripts."
+                state.error_code = "workflow_not_found"
                 return state
 
             if cancel_event.is_set():
@@ -150,7 +157,8 @@ class Runner:
                     cancel_event,
                     self.logger,
                     state,
-                    lambda: ownership.takeover_requested(),
+                    lambda: ownership.takeover_requested()
+                    or (self.remote_stop is not None and self.remote_stop()),
                 )
 
                 def manual_checkpoint(message):
@@ -200,10 +208,14 @@ class Runner:
         except DeviceBusy as exc:
             state.status = "failed"
             state.message = f"Device busy ({exc.owner}). No further input sent."
+            state.error_code = "device_busy"
+            state.error_params = {"owner": exc.owner}
         except PiApiError as exc:
             state.status = "failed"
             # PiApiClient messages exclude payloads and describe uncertain input.
             state.message = str(exc)
+            state.error_code = getattr(exc, "error_code", None)
+            state.error_params = getattr(exc, "error_params", {})
         except DeviceError as exc:
             state.status = "failed"
             # Discovery happens before scripts receive any input. Runtime exceptions
@@ -216,9 +228,11 @@ class Runner:
                     "phone geometry. An input may have occurred; it will not be retried."
                 )
             )
+            state.error_code = "device_command_failed"
         except (UnsupportedOperation, ScreenStabilityError, ScreenStateError) as exc:
             state.status = "failed"
             state.message = str(exc)
+            state.error_code = "workflow_failed"
         except (Exception, SystemExit):
             state.status = "failed"
             state.message = (
@@ -226,6 +240,7 @@ class Runner:
                 if stage == "locking"
                 else "Script failed. Check the script implementation at the reported step; no retry attempted."
             )
+            state.error_code = "workflow_failed"
         finally:
             if acquired:
                 self.logger.info(
@@ -267,7 +282,7 @@ def main(argv=None):
     if not args.script:
         parser.error("a script name is required (or use --list)")
 
-    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+    configure_development_logging()
     cancel_event = threading.Event()
     previous = signal.signal(signal.SIGINT, lambda signum, frame: cancel_event.set())
 

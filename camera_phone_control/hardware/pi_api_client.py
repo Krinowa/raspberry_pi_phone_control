@@ -2,14 +2,17 @@
 
 import http.client
 import json
+import logging
 import math
 import os
 import re
 import socket
 import time
+import uuid
 from urllib.parse import quote, urlsplit
 
 from automation.coordinates import unit
+from diagnostic_logging import EVENT_DEDUPLICATOR, log_event
 from .device_config import (
     DEFAULT_DEVICE_ID,
     DEFAULT_PI_BASE_URL,
@@ -21,14 +24,24 @@ MAX_RESPONSE_BYTES = 65536
 
 # Only log "slow" requests above this threshold.
 SLOW_REQUEST_SECONDS = float(os.environ.get("PI_API_SLOW_REQUEST_SECONDS", "0.5"))
+LOG = logging.getLogger("pi_api")
 
 
 class PiApiError(RuntimeError):
     """Safe-to-display Pi error: never includes typed text or response bodies."""
 
-    def __init__(self, message, *, http_status=None):
+    def __init__(
+        self,
+        message,
+        *,
+        http_status=None,
+        error_code=None,
+        error_params=None,
+    ):
         super().__init__(message)
         self.http_status = http_status
+        self.error_code = error_code
+        self.error_params = dict(error_params or {})
 
 
 def timeout_value(value, name):
@@ -130,6 +143,8 @@ class PiApiClient:
         self.last_command_id = None
         self.last_action_status = None
         self.last_action_http_status = None
+        self._failure_started_at = None
+        self._failure_dedup_identities = set()
 
     def _retain_action_metadata(
         self,
@@ -179,6 +194,8 @@ class PiApiClient:
         )
 
         started = time.monotonic()
+        request_id = uuid.uuid4().hex
+        safe_endpoint = urlsplit(path).path or "/"
         phase = "connect"
 
         try:
@@ -193,7 +210,14 @@ class PiApiClient:
 
             # After TCP connect, use the longer read timeout.
             if connection.sock is None:
-                raise PiApiError(f"Pi API {path} connected without a socket." + suffix)
+                raise PiApiError(
+                    f"Pi API {path} connected without a socket." + suffix,
+                    error_code="pi_api_no_socket",
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
+                )
 
             connection.sock.settimeout(self.read_timeout)
 
@@ -250,18 +274,28 @@ class PiApiClient:
 
             if not 200 <= response.status < 300:
                 total_elapsed = time.monotonic() - started
-
-                print(
-                    f"[pi-api] HTTP ERROR "
-                    f"{method} {path} "
-                    f"status={response.status} "
-                    f"elapsed={total_elapsed:.3f}s",
-                    flush=True,
+                log_event(
+                    LOG,
+                    logging.ERROR if physical_action else logging.WARNING,
+                    "pi",
+                    "pi_http_error",
+                    device_id=self.device_id,
+                    pi_request_id=request_id,
+                    endpoint=safe_endpoint,
+                    http_status=response.status,
+                    error_code="pi_api_http_error",
+                    duration_ms=round(total_elapsed * 1000),
                 )
 
                 raise PiApiError(
                     f"Pi API {path} returned " f"HTTP {response.status}." + suffix,
                     http_status=response.status,
+                    error_code="pi_api_http_error",
+                    error_params={
+                        "path": path,
+                        "status": response.status,
+                        "input_may_have_occurred": physical_action,
+                    },
                 )
 
             # -----------------------------------------------------------------
@@ -282,22 +316,25 @@ class PiApiClient:
             # Timing diagnostics
             # -----------------------------------------------------------------
 
+            # Slow success diagnostics stay at DEBUG to avoid poll noise.
             if total_elapsed >= SLOW_REQUEST_SECONDS:
-                print(
-                    f"[pi-api] SLOW "
-                    f"{method} {path} "
-                    f"status={response.status} "
-                    f"total={total_elapsed:.3f}s "
-                    f"connect={connect_elapsed:.3f}s "
-                    f"response_wait={response_wait:.3f}s "
-                    f"body={body_elapsed:.3f}s "
-                    f"connect_timeout={self.connect_timeout:.3f}s "
-                    f"read_timeout={self.read_timeout:.3f}s",
-                    flush=True,
+                log_event(
+                    LOG,
+                    logging.DEBUG,
+                    "pi",
+                    "pi_request_slow",
+                    device_id=self.device_id,
+                    pi_request_id=request_id,
+                    endpoint=safe_endpoint,
+                    duration_ms=round(total_elapsed * 1000),
                 )
 
             if len(raw) > MAX_RESPONSE_BYTES:
-                raise PiApiError("Pi API response exceeded " "the size limit." + suffix)
+                raise PiApiError(
+                    "Pi API response exceeded " "the size limit." + suffix,
+                    error_code="pi_api_response_too_large",
+                    error_params={"input_may_have_occurred": physical_action},
+                )
 
             # -----------------------------------------------------------------
             # Parse JSON
@@ -310,14 +347,24 @@ class PiApiClient:
                 UnicodeError,
             ):
                 raise PiApiError(
-                    f"Pi API {path} returned " "invalid JSON." + suffix
+                    f"Pi API {path} returned " "invalid JSON." + suffix,
+                    error_code="pi_api_invalid_json",
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
                 ) from None
 
             if not isinstance(result, dict) or type(result.get("ok")) is not bool:
                 raise PiApiError(
                     f"Pi API {path} returned "
                     "an invalid response "
-                    "(expected boolean ok)." + suffix
+                    "(expected boolean ok)." + suffix,
+                    error_code="pi_api_invalid_response",
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
                 )
 
             # -----------------------------------------------------------------
@@ -339,7 +386,18 @@ class PiApiClient:
                 if isinstance(error, str) and "connect" in error.lower():
                     detail = " Check the Bluetooth " "HID connection to " "the phone."
 
-                raise PiApiError(f"Pi rejected {path}." + detail + suffix)
+                raise PiApiError(
+                    f"Pi rejected {path}." + detail + suffix,
+                    error_code=(
+                        "pi_api_rejected_hid"
+                        if "Bluetooth" in detail
+                        else "pi_api_rejected"
+                    ),
+                    error_params={
+                        "path": path,
+                        "input_may_have_occurred": physical_action,
+                    },
+                )
 
             # -----------------------------------------------------------------
             # Retain async metadata
@@ -351,6 +409,23 @@ class PiApiClient:
                     response.status,
                 )
 
+            if self._failure_started_at is not None:
+                downtime = time.monotonic() - self._failure_started_at
+                self._failure_started_at = None
+                for event, identity in self._failure_dedup_identities:
+                    EVENT_DEDUPLICATOR.clear("pi", event, identity)
+                self._failure_dedup_identities.clear()
+                log_event(
+                    LOG,
+                    logging.INFO,
+                    "pi",
+                    "pi_recovered",
+                    device_id=self.device_id,
+                    endpoint=safe_endpoint,
+                    duration_ms=round(downtime * 1000),
+                    outcome="recovered",
+                )
+
             return result
 
         except (
@@ -359,22 +434,57 @@ class PiApiClient:
         ):
             elapsed = time.monotonic() - started
 
-            print(
-                f"[pi-api] TIMEOUT "
-                f"{method} {path} "
-                f"phase={phase} "
-                f"elapsed={elapsed:.3f}s "
-                f"connect_timeout="
-                f"{self.connect_timeout:.3f}s "
-                f"read_timeout="
-                f"{self.read_timeout:.3f}s",
-                flush=True,
-            )
+            self._failure_started_at = self._failure_started_at or time.monotonic()
+            failure_identity = (self.device_id, safe_endpoint)
+            self._failure_dedup_identities.add(("pi_request_timeout", failure_identity))
+            if EVENT_DEDUPLICATOR.should_log(
+                "pi", "pi_request_timeout", failure_identity
+            ):
+                log_event(
+                    LOG,
+                    logging.ERROR if physical_action else logging.WARNING,
+                    "pi",
+                    "pi_request_timeout",
+                    device_id=self.device_id,
+                    pi_request_id=request_id,
+                    endpoint=safe_endpoint,
+                    phase=phase,
+                    error_code="pi_api_timeout",
+                    exception_type="TimeoutError",
+                    duration_ms=round(elapsed * 1000),
+                )
 
-            raise PiApiError(f"Pi API {path} timed out." + suffix) from None
+            raise PiApiError(
+                f"Pi API {path} timed out." + suffix,
+                error_code="pi_api_timeout",
+                error_params={
+                    "path": path,
+                    "input_may_have_occurred": physical_action,
+                },
+            ) from None
 
-        except PiApiError:
-            # Preserve already-sanitized Pi API errors.
+        except PiApiError as exc:
+            # Preserve already-sanitized Pi API errors and classify failures
+            # raised after a successful transport response.
+            code = getattr(exc, "error_code", None)
+            if code not in {"pi_api_http_error", "pi_api_timeout"}:
+                event = (
+                    "hid_command_failed"
+                    if code == "pi_api_rejected_hid"
+                    else "pi_invalid_response"
+                )
+                log_event(
+                    LOG,
+                    logging.ERROR if physical_action else logging.WARNING,
+                    "hid" if event == "hid_command_failed" else "pi",
+                    event,
+                    device_id=self.device_id,
+                    pi_request_id=request_id,
+                    endpoint=safe_endpoint,
+                    error_code=code or "pi_api_error",
+                    exception_type=type(exc).__name__,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                )
             raise
 
         except (
@@ -383,21 +493,38 @@ class PiApiClient:
         ) as exc:
             elapsed = time.monotonic() - started
 
-            print(
-                f"[pi-api] ERROR "
-                f"{method} {path} "
-                f"phase={phase} "
-                f"elapsed={elapsed:.3f}s "
-                f"type={type(exc).__name__} "
-                f"error={exc}",
-                flush=True,
+            self._failure_started_at = self._failure_started_at or time.monotonic()
+            failure_identity = (
+                self.device_id,
+                safe_endpoint,
+                type(exc).__name__,
             )
+            self._failure_dedup_identities.add(("pi_unreachable", failure_identity))
+            if EVENT_DEDUPLICATOR.should_log("pi", "pi_unreachable", failure_identity):
+                log_event(
+                    LOG,
+                    logging.ERROR if physical_action else logging.WARNING,
+                    "pi",
+                    "pi_unreachable",
+                    device_id=self.device_id,
+                    pi_request_id=request_id,
+                    endpoint=safe_endpoint,
+                    phase=phase,
+                    error_code="pi_api_unreachable",
+                    exception_type=type(exc).__name__,
+                    duration_ms=round(elapsed * 1000),
+                )
 
             raise PiApiError(
                 f"Cannot reach Pi API "
                 f"for {path}. "
                 "Check the Pi address "
-                "and private Wi-Fi." + suffix
+                "and private Wi-Fi." + suffix,
+                error_code="pi_api_unreachable",
+                error_params={
+                    "path": path,
+                    "input_may_have_occurred": physical_action,
+                },
             ) from None
 
         finally:
@@ -416,7 +543,11 @@ class PiApiClient:
         )
 
         if type(result.get("connected")) is not bool:
-            raise PiApiError("Pi /status response " "is missing boolean connected.")
+            raise PiApiError(
+                "Pi /status response " "is missing boolean connected.",
+                error_code="pi_api_invalid_status",
+                error_params={"path": self._device_path("status")},
+            )
 
         return result
 

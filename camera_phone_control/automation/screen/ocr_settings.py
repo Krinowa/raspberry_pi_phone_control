@@ -176,7 +176,8 @@ class OCRSettingsStorage:
                 suffix=".tmp",
             )
             try:
-                os.fchmod(fd, 0o600)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as stream:
                     json.dump(
                         {"worker_pool_size": worker_pool_size},

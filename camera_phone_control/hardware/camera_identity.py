@@ -5,10 +5,17 @@ from __future__ import annotations
 import ctypes
 import glob
 import json
+import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from diagnostic_logging import EVENT_DEDUPLICATOR, log_event
+
+LOG = logging.getLogger("camera-identity")
 
 
 class CameraIdentityError(RuntimeError):
@@ -154,19 +161,54 @@ def _windows_pnp_devices():
         "-Command",
         "Get-PnpDevice -PresentOnly | Where-Object {$_.Class -in @('Camera','Image')} | Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress",
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     if completed.returncode:
         raise CameraIdentityError("Windows camera identity discovery failed.")
     raw = json.loads(completed.stdout or "[]")
     return raw if isinstance(raw, list) else [raw]
 
 
-def _windows_directshow_names():
-    """Use ffmpeg's DirectShow enumeration when available for runtime order."""
+def resolve_ffmpeg_executable(*, environment=None, frozen_root=None, which=None):
+    """Prefer the vetted frozen FFmpeg tool, preserving PATH fallback for source use."""
+    environment = os.environ if environment is None else environment
+    configured_tools = environment.get("PHONE_CONTROLLER_TOOLS_DIR")
+    roots = []
+    if configured_tools:
+        roots.append(Path(configured_tools))
+    bundle_root = frozen_root
+    if bundle_root is None:
+        bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        frozen_tools = Path(bundle_root) / "tools"
+        roots.append(frozen_tools)
+    else:
+        frozen_tools = None
+    for root in roots:
+        candidate = root / "ffmpeg.exe"
+        if candidate.is_file():
+            return str(candidate)
+    if frozen_tools is not None:
+        # Production builds are required to contain this exact resource. Do not
+        # silently change camera enumeration behavior by consulting global PATH
+        # if a frozen installation is damaged or incomplete.
+        return str(frozen_tools / "ffmpeg.exe")
+    return (which or shutil.which)("ffmpeg") or "ffmpeg"
+
+
+def _windows_directshow_devices(*, include_status=False):
+    """Return DirectShow video devices and their PnP-capable moniker names."""
+    executable = resolve_ffmpeg_executable()
+    enumeration_error = None
     try:
         completed = subprocess.run(
             [
-                "ffmpeg",
+                executable,
                 "-hide_banner",
                 "-list_devices",
                 "true",
@@ -178,41 +220,198 @@ def _windows_directshow_names():
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+    except FileNotFoundError:
+        devices = []
+        enumeration_error = "ffmpeg_unavailable"
+        return (devices, enumeration_error, executable) if include_status else devices
+    except subprocess.TimeoutExpired:
+        devices = []
+        enumeration_error = "directshow_enumeration_timeout"
+        return (devices, enumeration_error, executable) if include_status else devices
     except (OSError, subprocess.SubprocessError):
-        return []
-    names = []
+        devices = []
+        enumeration_error = "directshow_enumeration_failed"
+        return (devices, enumeration_error, executable) if include_status else devices
+    devices = []
+    current = None
     for line in completed.stderr.splitlines():
         match = re.search(r'"([^"]+)"\s*\(video\)', line)
         if match:
-            names.append(match.group(1))
-    return names
+            current = {
+                "index": len(devices),
+                "name": match.group(1),
+                "alternative_name": None,
+            }
+            devices.append(current)
+            continue
+        if re.search(r'"[^"]+"\s*\(audio\)', line):
+            current = None
+            continue
+        alternative = re.search(r'Alternative name\s+"([^"]+)"', line)
+        if current is not None and alternative:
+            current["alternative_name"] = alternative.group(1)
+    if not devices:
+        enumeration_error = "directshow_no_video_devices"
+    return (devices, enumeration_error, executable) if include_status else devices
+
+
+def _windows_directshow_names():
+    """Compatibility wrapper exposing DirectShow names in runtime-index order."""
+    return [item["name"] for item in _windows_directshow_devices()]
+
+
+def _windows_identity_token(value):
+    """Normalize a PnP InstanceId or DirectShow moniker for safe comparison."""
+    normalized = re.sub(r"[\\\\/#]+", "#", str(value or "").strip().casefold())
+    return normalized.strip("#")
+
+
+def _windows_moniker_matches_instance(instance_id, alternative_name):
+    needle = _windows_identity_token(instance_id)
+    haystack = _windows_identity_token(alternative_name)
+    if not needle or not haystack:
+        return False
+    start = haystack.find(needle)
+    while start >= 0:
+        before_ok = start == 0 or haystack[start - 1] in "#_?"
+        end = start + len(needle)
+        after_ok = end == len(haystack) or haystack[end] == "#"
+        if before_ok and after_ok:
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _windows_mapping_failure_reason(
+    *,
+    directshow_devices,
+    directshow_error,
+    pnp_name_count,
+    friendly_candidates,
+    moniker_candidates,
+):
+    if not directshow_devices:
+        return directshow_error or "directshow_enumeration_empty"
+    if len(moniker_candidates) > 1:
+        return "pnp_moniker_ambiguous"
+    if len(friendly_candidates) == 0:
+        return "not_enumerated_by_directshow"
+    if pnp_name_count > 1:
+        return "duplicate_pnp_friendly_name"
+    if len(friendly_candidates) > 1:
+        return "duplicate_directshow_friendly_name"
+    return "pnp_moniker_not_matched"
 
 
 def discover_windows_devices():
     if sys.platform != "win32":
         return []
     pnp_devices = _windows_pnp_devices()
-    dshow_names = _windows_directshow_names()
-    name_counts = {name: dshow_names.count(name) for name in set(dshow_names)}
+    directshow_devices, directshow_error, directshow_executable = (
+        _windows_directshow_devices(include_status=True)
+    )
+    pnp_name_counts = {}
+    for item in pnp_devices:
+        if isinstance(item, dict) and item.get("FriendlyName"):
+            pnp_name_counts[item["FriendlyName"]] = (
+                pnp_name_counts.get(item["FriendlyName"], 0) + 1
+            )
     result = []
     for item in pnp_devices:
         name = item.get("FriendlyName") if isinstance(item, dict) else None
         instance_id = item.get("InstanceId") if isinstance(item, dict) else None
         if not name or not instance_id:
             continue
-        # A unique friendly name can join PnP identity to DirectShow order. If
-        # it is absent or duplicated, leave it unresolved instead of guessing.
-        runtime_source = dshow_names.index(name) if name_counts.get(name) == 1 else None
+        moniker_candidates = [
+            device["index"]
+            for device in directshow_devices
+            if _windows_moniker_matches_instance(
+                instance_id, device.get("alternative_name")
+            )
+        ]
+        friendly_candidates = [
+            device["index"]
+            for device in directshow_devices
+            if device.get("name") == name
+        ]
+        mapping_method = None
+        failure_reason = None
+        if len(moniker_candidates) == 1:
+            runtime_source = moniker_candidates[0]
+            mapping_method = "pnp_moniker"
+        elif (
+            not moniker_candidates
+            and pnp_name_counts.get(name) == 1
+            and len(friendly_candidates) == 1
+        ):
+            # Preserve the previous behavior only when the name is a proven
+            # one-to-one join on both sides. Duplicate names remain unresolved.
+            runtime_source = friendly_candidates[0]
+            mapping_method = "unique_friendly_name"
+        else:
+            runtime_source = None
+            failure_reason = _windows_mapping_failure_reason(
+                directshow_devices=directshow_devices,
+                directshow_error=directshow_error,
+                pnp_name_count=pnp_name_counts.get(name, 0),
+                friendly_candidates=friendly_candidates,
+                moniker_candidates=moniker_candidates,
+            )
+        runtime_candidates = moniker_candidates or friendly_candidates
+        stable_id = "dshow:" + instance_id
         result.append(
             _device(
-                "dshow:" + instance_id,
+                stable_id,
                 name,
                 "dshow",
                 runtime_source,
                 resolvable=runtime_source is not None,
+                mapping_method=mapping_method,
+                mapping_failure_reason=failure_reason,
+                runtime_index_candidates=runtime_candidates,
             )
         )
+        event = (
+            "windows_camera_identity_mapped"
+            if runtime_source is not None
+            else "windows_camera_identity_unresolved"
+        )
+        diagnostic_identity = (
+            stable_id,
+            repr(runtime_source),
+            failure_reason or mapping_method,
+            tuple(runtime_candidates),
+        )
+        if EVENT_DEDUPLICATOR.should_log("camera", event, diagnostic_identity):
+            log_event(
+                LOG,
+                logging.INFO if runtime_source is not None else logging.WARNING,
+                "camera",
+                event,
+                message=(
+                    "Windows camera identity mapped to DirectShow runtime order."
+                    if runtime_source is not None
+                    else "Windows camera identity could not be mapped safely."
+                ),
+                camera_id=stable_id,
+                camera_name=name,
+                runtime_source=runtime_source,
+                runtime_index_candidates=runtime_candidates,
+                mapping_method=mapping_method,
+                mapping_failure_reason=failure_reason,
+                pnp_identities=[
+                    value.get("InstanceId")
+                    for value in pnp_devices
+                    if isinstance(value, dict) and value.get("InstanceId")
+                ],
+                directshow_video_devices=directshow_devices,
+                directshow_enumeration_error=directshow_error,
+                directshow_executable=directshow_executable,
+                capture_backend="dshow",
+                msmf_runtime_mapping_used=False,
+            )
     return result
 
 

@@ -5,12 +5,16 @@ import base64
 import logging
 import os
 import secrets
+import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
+from dotenv import load_dotenv
 from flask import (
     Flask,
     Response,
@@ -23,7 +27,15 @@ from flask import (
     url_for,
 )
 from werkzeug.exceptions import HTTPException
+from diagnostic_logging import (
+    EVENT_DEDUPLICATOR,
+    configure_development_logging,
+    log_event,
+    register_secrets,
+)
 
+import agent_frames
+import remote_control
 from android_control import AndroidControl, DeviceError, validate_key
 from calibration import Calibration, CalibrationStorage
 from camera import Camera
@@ -36,19 +48,46 @@ from camera_manager import (
 from device_lock import DeviceBusy, DeviceLocks, NoAutomation
 from automation.backends import backend_names, select_device
 from automation.context import AutomationContext
+from automation.coordinates import normalized_to_device, unit
 from automation.diagnostics import install_recent_log_handler
+from automation.error_codes import exception_error_fields, error_fields
+from automation.screen.camera import CalibratedPreviewCache
+from automation.screen.stability import ScreenStabilityError
 from automation.workflows.api import register_workflows
 from automation.jobs.api import register_jobs
-from automation.jobs.storage import DeviceWorkflowAssignmentStore
+from automation.jobs.storage import (
+    DEFAULT_DATA_DIRECTORY as JOB_DATA_DIRECTORY,
+    DeviceWorkflowAssignmentStore,
+)
 from automation.integrations.withdraw_v2.balance import balance_check_workflow
 from automation.integrations.withdraw_v2.manager import register_withdraw
-from hardware.pi_api_client import PiApiError, validate_text as validate_pi_text
+from hardware.pi_api_client import (
+    PiApiClient,
+    PiApiError,
+    validate_text as validate_pi_text,
+)
 from hardware.device_config import DEFAULT_DEVICE_ID
-from hardware.raspberry_pi_input import RaspberryPiInputBridge
+from hardware.raspberry_pi_input import PiControlTarget, RaspberryPiInputBridge
 
 LOG = logging.getLogger("dashboard")
 LEASE_SECONDS = 6
-DEVELOPER_MODE_KEY = "ocean"
+DEVELOPER_MODE_KEY_ENV = "PHONE_DEVELOPER_MODE_KEY"
+
+
+def load_source_environment():
+    """Load the checkout-local .env; the Windows launcher loads its external one."""
+    if not getattr(sys, "frozen", False):
+        load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
+
+
+def configured_developer_mode_key(environment=None):
+    """Return the configured developer key, or None to disable the feature."""
+    environment = os.environ if environment is None else environment
+    value = environment.get(DEVELOPER_MODE_KEY_ENV)
+    return value if isinstance(value, str) and value else None
+
+
+load_source_environment()
 
 
 def local_dashboard_access(view):
@@ -313,6 +352,37 @@ class ControlState:
             raise DeviceError(self.message)
         return camera
 
+    def apply_calibration(self, calibration, camera_info, changed_by=None):
+        """Save corners for the selected phone and use them at once.
+
+        Caller holds self.lock and has checked the phone and camera are ready.
+        """
+        signature = (self.device, camera_info["width"], camera_info["height"])
+        if self.calibration_storage is not None:
+            try:
+                self.calibration_storage.save(
+                    calibration,
+                    self.camera,
+                    camera_info,
+                    self.device,
+                    changed_by,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                LOG.error("Could not save camera calibration: %s", exc)
+                raise ValueError(
+                    "Calibration could not be saved to local storage."
+                ) from exc
+        self.calibration = calibration
+        self.signature = signature
+        if self.calibration_storage is not None:
+            self.calibration_restore_key = (
+                signature,
+                getattr(self.camera, "configured_source", self.camera.source),
+                self.camera.rotate,
+            )
+        self.message = "Calibration saved. You can enable Manual Control."
+        LOG.info("Four-corner calibration saved for %s", self.device.serial)
+
     @contextmanager
     def input_control(self, client, frame_id):
         if self.device is None:
@@ -340,8 +410,8 @@ class ControlState:
             "takeover_requested"
             if self.pending
             else (
-                "automation"
-                if owner == "automation"
+                owner
+                if owner in {"automation", "remote"}
                 else "manual" if self.owner else "free"
             )
         )
@@ -349,6 +419,13 @@ class ControlState:
             self.disable(
                 "Automation running. Manual control disabled. Use Take Over to interrupt."
             )
+        message_error_code = None
+        message_error_params = {}
+        if self.pi_connection.get(
+            "error_code"
+        ) and self.message == self.pi_connection.get("message"):
+            message_error_code = self.pi_connection["error_code"]
+            message_error_params = self.pi_connection.get("error_params", {})
         return {
             "device": asdict(self.device) if self.device else None,
             "manual_backend": (
@@ -369,6 +446,8 @@ class ControlState:
             "pending_owned": self.pending and self.owner == client,
             "control_status": control_status,
             "message": self.message,
+            "message_error_code": message_error_code,
+            "message_error_params": message_error_params,
         }
 
 
@@ -390,7 +469,10 @@ def create_app(
     start_withdraw_workers=None,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
+    screenshot_store=None,
     auth_store=None,
+    agent_secret=None,
+    remote_history=None,
 ):
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
@@ -423,7 +505,16 @@ def create_app(
             shared_camera=not isinstance(camera, Camera),
         )
     camera = camera_manager.activate(selected_camera_device)
-    app = Flask(__name__)
+    resource_root = (
+        os.fspath(getattr(sys, "_MEIPASS"))
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+        else os.path.dirname(os.path.abspath(__file__))
+    )
+    app = Flask(
+        __name__,
+        static_folder=os.path.join(resource_root, "static"),
+        template_folder=os.path.join(resource_root, "templates"),
+    )
     session_secret = os.environ.get("PHONE_SESSION_SECRET") or secrets.token_hex(32)
     app.config.update(
         MAX_CONTENT_LENGTH=1024 * 1024,
@@ -456,6 +547,8 @@ def create_app(
         "route_total": 0.0,
     }
     app.extensions["preview_request_metrics"] = request_metrics
+    calibrated_preview_cache = CalibratedPreviewCache()
+    app.extensions["calibrated_preview_cache"] = calibrated_preview_cache
     token = secrets.token_urlsafe(32)
     if calibration_storage is None and all(
         hasattr(camera, field) for field in ("source", "rotate")
@@ -475,28 +568,73 @@ def create_app(
         device_workflow_store or DeviceWorkflowAssignmentStore()
     )
     app.config["CONTROL_TOKEN"] = token
-    diagnostics = install_recent_log_handler(secrets=(token, session_secret))
+    if agent_secret is None:
+        agent_secret = agent_frames.secret_from_environment()
+    developer_mode_key = configured_developer_mode_key()
+    app.config["DEVELOPER_MODE_CONFIGURED"] = developer_mode_key is not None
+    register_secrets(token, session_secret, developer_mode_key, agent_secret)
+    diagnostics = install_recent_log_handler(
+        secrets=tuple(
+            value
+            for value in (token, session_secret, developer_mode_key, agent_secret)
+            if value is not None
+        )
+    )
     app.extensions["recent_diagnostics"] = diagnostics
+
+    def developer_mode_enabled():
+        return bool(
+            developer_mode_key is not None and session.get("developer_mode") is True
+        )
 
     @app.before_request
     def protect_local_requests():
+        g.request_id = uuid.uuid4().hex
         if preview_debug:
             g.preview_request_started = time.monotonic()
             with request_metrics["lock"]:
                 request_metrics["active"] += 1
+        if request.blueprint == "agent_v1":
+            # The RemoteViewer agent sends no Origin or control token; the
+            # blueprint itself requires the Bearer secret on every request.
+            return None
         # Reject cross-site fetches/embeds, including camera requests. No CORS enabled.
         if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
-            return jsonify(error="Only same-origin local requests are accepted."), 403
+            return (
+                jsonify(
+                    error_fields(
+                        "Only same-origin local requests are accepted.",
+                        "same_origin_required",
+                    )
+                ),
+                403,
+            )
         if request.method != "GET":
             if not secrets.compare_digest(
                 request.headers.get("X-Control-Token", ""), token
             ):
-                return jsonify(error="Invalid control token. Reload this page."), 403
+                return (
+                    jsonify(
+                        error_fields(
+                            "Invalid control token. Reload this page.",
+                            "invalid_control_token",
+                        )
+                    ),
+                    403,
+                )
             if not request.is_json:
-                return jsonify(error="Expected a JSON request."), 415
+                return (
+                    jsonify(
+                        error_fields(
+                            "Expected a JSON request.", "json_request_required"
+                        )
+                    ),
+                    415,
+                )
 
     @app.after_request
     def local_headers(response):
+        response.headers["X-Request-Id"] = getattr(g, "request_id", "")
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -512,12 +650,18 @@ def create_app(
 
     @app.errorhandler(ValueError)
     def invalid_input(exc):
-        return jsonify(ok=False, error=str(exc)), 400
+        return jsonify(ok=False, **exception_error_fields(exc)), 400
 
     @app.errorhandler(CameraManagerError)
     def camera_error(exc):
         LOG.warning("Camera operation failed: %s", exc)
-        return jsonify(ok=False, error=str(exc)), 503
+        return (
+            jsonify(
+                ok=False,
+                **error_fields(str(exc), "camera_operation_failed"),
+            ),
+            503,
+        )
 
     @app.errorhandler(PiApiError)
     @app.errorhandler(DeviceError)
@@ -525,7 +669,13 @@ def create_app(
         with state.lock:
             state.disable(str(exc))
         LOG.warning("%s", exc)
-        return jsonify(error=str(exc)), (
+        fields = exception_error_fields(exc)
+        if isinstance(exc, DeviceError) and "error_code" not in fields:
+            fields.update(
+                error_code="device_command_failed",
+                error_params={},
+            )
+        return jsonify(**fields), (
             404 if getattr(exc, "http_status", None) == 404 else 409
         )
 
@@ -537,6 +687,8 @@ def create_app(
                     jsonify(
                         ok=False,
                         error="takeover_requested",
+                        error_code="device_busy",
+                        error_params={"owner": exc.owner},
                         owner=exc.owner,
                         pending=True,
                     ),
@@ -545,11 +697,41 @@ def create_app(
             state.disable(
                 "Device busy. Enable Manual Control again after it is released."
             )
-        return jsonify(ok=False, error="device_busy", owner=exc.owner), 409
+        return (
+            jsonify(
+                ok=False,
+                error="device_busy",
+                error_code="device_busy",
+                error_params={"owner": exc.owner},
+                owner=exc.owner,
+            ),
+            409,
+        )
 
     @app.errorhandler(NoAutomation)
     def no_automation(exc):
-        return jsonify(ok=False, error="no_automation", owner="free"), 409
+        route = request.url_rule.rule if request.url_rule is not None else request.path
+        if EVENT_DEDUPLICATOR.should_log("device", "device_not_ready", (route,)):
+            log_event(
+                LOG,
+                logging.WARNING,
+                "device",
+                "device_not_ready",
+                request_id=getattr(g, "request_id", None),
+                route=route,
+                error_code="device_not_ready",
+                exception_type=type(exc).__name__,
+            )
+        return (
+            jsonify(
+                ok=False,
+                error="no_automation",
+                error_code="device_not_ready",
+                error_params={},
+                owner="free",
+            ),
+            409,
+        )
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
@@ -557,9 +739,27 @@ def create_app(
 
     @app.errorhandler(Exception)
     def unexpected_error(exc):
-        LOG.exception("Unhandled dashboard request error")
+        log_event(
+            LOG,
+            logging.ERROR,
+            "api",
+            "api_request_failed",
+            request_id=getattr(g, "request_id", None),
+            route=(
+                request.url_rule.rule if request.url_rule is not None else request.path
+            ),
+            method=request.method,
+            error_code="dashboard_request_failed",
+            exception_type=type(exc).__name__,
+        )
         return (
-            jsonify(ok=False, error="The dashboard could not complete this request."),
+            jsonify(
+                ok=False,
+                **error_fields(
+                    "The dashboard could not complete this request.",
+                    "dashboard_request_failed",
+                ),
+            ),
             500,
         )
 
@@ -580,8 +780,12 @@ def create_app(
     @app.get("/")
     def index():
         supplied_key = request.args.get("key")
-        if isinstance(supplied_key, str) and secrets.compare_digest(
-            supplied_key, DEVELOPER_MODE_KEY
+        if (
+            developer_mode_key is not None
+            and isinstance(supplied_key, str)
+            and secrets.compare_digest(
+                supplied_key.encode("utf-8"), developer_mode_key.encode("utf-8")
+            )
         ):
             session["developer_mode"] = True
             return redirect(url_for("index"))
@@ -589,7 +793,7 @@ def create_app(
             "index.html",
             control_token=token,
             preview_debug=preview_debug,
-            developer_mode=session.get("developer_mode") is True,
+            developer_mode=developer_mode_enabled(),
         )
 
     @app.get("/api/status")
@@ -599,7 +803,7 @@ def create_app(
 
     @app.get("/api/diagnostics/logs")
     def diagnostics_logs():
-        if session.get("developer_mode") is not True:
+        if not developer_mode_enabled():
             return jsonify(error="Developer mode required."), 403
         query = request.args.get("query", "")
         if len(query) > 100:
@@ -611,6 +815,71 @@ def create_app(
         if not 1 <= limit <= 500:
             raise ValueError("Diagnostic log limit must be between 1 and 500.")
         return jsonify(logs=diagnostics.recent(limit=limit, query=query))
+
+    frontend_diagnostic_events = {
+        "frontend_api_network_failed",
+        "frontend_action_failed",
+        "frontend_preview_unavailable",
+        "frontend_preview_recovered",
+        "frontend_manual_assistance_failed",
+        "frontend_workflow_command_failed",
+        "frontend_recorder_command_uncertain",
+    }
+    frontend_diagnostic_fields = {
+        "device_id",
+        "job_id",
+        "operation",
+        "error_code",
+        "status",
+        "consecutive_failures",
+    }
+    frontend_diagnostic_rate = {"lock": threading.Lock(), "times": []}
+
+    @app.post("/api/diagnostics/frontend")
+    def frontend_diagnostic():
+        data = payload()
+        if set(data) != {"event", "params"}:
+            raise ValueError("Invalid frontend diagnostic fields.")
+        event = data.get("event")
+        params = data.get("params")
+        if event not in frontend_diagnostic_events or not isinstance(params, dict):
+            raise ValueError("Invalid frontend diagnostic event.")
+        if set(params) - frontend_diagnostic_fields or len(params) > 5:
+            raise ValueError("Invalid frontend diagnostic parameters.")
+        safe = {}
+        for key, value in params.items():
+            if isinstance(value, str):
+                if not 1 <= len(value) <= 120 or any(ord(char) < 32 for char in value):
+                    raise ValueError("Invalid frontend diagnostic parameter.")
+            elif not isinstance(value, (int, bool)):
+                raise ValueError("Invalid frontend diagnostic parameter.")
+            safe[key] = value
+        current = time.monotonic()
+        with frontend_diagnostic_rate["lock"]:
+            recent = [
+                stamp
+                for stamp in frontend_diagnostic_rate["times"]
+                if current - stamp < 60
+            ]
+            frontend_diagnostic_rate["times"] = recent
+            if len(recent) >= 30:
+                return jsonify(ok=True)
+            recent.append(current)
+        identity = tuple((key, safe[key]) for key in sorted(safe))
+        if EVENT_DEDUPLICATOR.should_log("frontend", event, identity):
+            log_event(
+                LOG,
+                (
+                    logging.INFO
+                    if event == "frontend_preview_recovered"
+                    else logging.WARNING
+                ),
+                "frontend",
+                event,
+                request_id=getattr(g, "request_id", None),
+                **safe,
+            )
+        return jsonify(ok=True)
 
     @app.get("/api/pi/status")
     def pi_status():
@@ -879,6 +1148,9 @@ def create_app(
                     continue
                 item["workflow_assignment"] = workflow_assignment_details(item["id"])
                 item["ready_for_work"] = assignment_store.ready_for_work(item["id"])
+                item["remote_control"] = app.extensions["remote_control"].holder(
+                    item["id"]
+                )
         return jsonify(result)
 
     @app.put("/api/devices/<device_id>/work-readiness")
@@ -982,23 +1254,26 @@ def create_app(
         data = payload()
         if set(data) != {"device_id"}:
             raise ValueError("Expected device_id only.")
+
         bridge, _, registered = registered_pi_devices()
+
         if data["device_id"] not in registered:
             raise ValueError("Select a registered phone returned by the Pi.")
+
         workflow_service = app.extensions.get("workflow_service")
         recorder = app.extensions.get("workflow_recorder")
+
         with state.lock:
-            if workflow_service is not None and workflow_service.has_active_run():
-                raise ValueError(
-                    "Wait for the active workflow to finish before switching phones."
-                )
             if recorder is not None and recorder.active:
                 raise ValueError(
                     "Stop or discard the recording before switching phones."
                 )
+
             selected = state.select_pi_device(data["device_id"])
+
             if workflow_service is not None:
                 workflow_service.device_id = selected
+
             return jsonify(ok=True, selected_device=selected)
 
     @app.get("/api/enrollment")
@@ -1120,31 +1395,44 @@ def create_app(
                 if requested_device is None:
                     return (
                         jsonify(
-                            error="Select a phone before requesting a camera frame."
+                            **error_fields(
+                                "Select a phone before requesting a camera frame.",
+                                "camera_device_required",
+                            )
                         ),
                         409,
                     )
                 camera_manager.config(requested_device)
                 active_camera = camera_manager.get_camera(requested_device)
-                if (
-                    getattr(active_camera, "device_id", requested_device)
-                    != requested_device
-                ):
-                    return (
-                        jsonify(error="Camera ownership changed; request a new frame."),
-                        409,
-                    )
+
                 if requested_device == selected:
                     state.camera = active_camera
                 camera_status = active_camera.status()
                 if not camera_status["ready"]:
-                    return jsonify(error=camera_status["error"]), 503
+                    return (
+                        jsonify(
+                            **error_fields(camera_status["error"], "camera_unavailable")
+                        ),
+                        503,
+                    )
                 latest = active_camera.frame()
                 if latest is None:
-                    return jsonify(error="Camera frame unavailable."), 503
+                    return (
+                        jsonify(
+                            **error_fields(
+                                "Camera frame unavailable.", "camera_frame_unavailable"
+                            )
+                        ),
+                        503,
+                    )
                 if not camera_manager.is_current(requested_device, active_camera):
                     return (
-                        jsonify(error="Camera selection changed; request a new frame."),
+                        jsonify(
+                            **error_fields(
+                                "Camera selection changed; request a new frame.",
+                                "camera_selection_changed",
+                            )
+                        ),
                         409,
                     )
         jpeg, number, _, _ = latest
@@ -1214,6 +1502,115 @@ def create_app(
             headers={
                 "X-Frame-Id": str(number),
                 "X-Camera-Device-Id": requested_device,
+            },
+        )
+
+    @app.get("/api/devices/<device_id>/camera/preview")
+    def calibrated_preview(device_id):
+        """Return this logical phone's calibrated view of its shared camera."""
+        with state.lock:
+            with camera_manager.lock:
+                selected = selected_camera_device_id()
+                camera_manager.config(device_id)
+                active_camera = camera_manager.get_camera(device_id)
+                camera_status = active_camera.status()
+                if not camera_status["ready"]:
+                    return (
+                        jsonify(
+                            **error_fields(camera_status["error"], "camera_unavailable")
+                        ),
+                        503,
+                    )
+                latest = active_camera.frame()
+                if latest is None:
+                    return (
+                        jsonify(
+                            **error_fields(
+                                "Camera frame unavailable.", "camera_frame_unavailable"
+                            )
+                        ),
+                        503,
+                    )
+                preview_frame = (
+                    latest[0],
+                    latest[1],
+                    camera_status["width"],
+                    camera_status["height"],
+                )
+
+                if state.pi_bridge is not None:
+                    serial = "pi-api:" + state.pi_bridge.client.base_url
+                    if device_id != DEFAULT_DEVICE_ID:
+                        serial += "#" + device_id
+                    preview_device = PiControlTarget(serial, device_id=device_id)
+                elif device_id == selected:
+                    if state.device is None:
+                        state.require_ready()
+                    preview_device = state.device
+                else:
+                    return (
+                        jsonify(
+                            **error_fields(
+                                "This logical phone is not available.",
+                                "device_unavailable",
+                                {"device_id": device_id},
+                            )
+                        ),
+                        404,
+                    )
+
+                if state.calibration_storage is None:
+                    calibration = None
+                else:
+                    calibration = state.calibration_storage.load(
+                        active_camera,
+                        camera_status,
+                        preview_device,
+                    )
+                if calibration is None:
+                    return (
+                        jsonify(
+                            **error_fields(
+                                "Calibration required for this phone.",
+                                "calibration_missing",
+                                {"device_id": device_id},
+                            )
+                        ),
+                        409,
+                    )
+
+        try:
+            jpeg, number, width, height, cache_hit = calibrated_preview_cache.encode(
+                device_id,
+                active_camera,
+                calibration,
+                preview_device,
+                preview_frame,
+            )
+        except ScreenStabilityError as exc:
+            return jsonify(**error_fields(str(exc), "camera_preview_failed")), 503
+
+        with camera_manager.lock:
+            if not camera_manager.is_current(device_id, active_camera):
+                return (
+                    jsonify(
+                        **error_fields(
+                            "Camera selection changed; request a new preview.",
+                            "camera_selection_changed",
+                        )
+                    ),
+                    409,
+                )
+        return Response(
+            jpeg,
+            mimetype="image/jpeg",
+            headers={
+                "X-Frame-Id": str(number),
+                "X-Camera-Device-Id": device_id,
+                "X-Preview-Coordinate-Space": "screen_normalized",
+                "X-Preview-Width": str(width),
+                "X-Preview-Height": str(height),
+                "X-Preview-Cache": "hit" if cache_hit else "miss",
             },
         )
 
@@ -1341,38 +1738,7 @@ def create_app(
             camera_info = state.require_ready()
             state.require_frame(data.get("frame_id"))
             calibration = Calibration(data.get("corners"))
-            signature = (
-                state.device,
-                camera_info["width"],
-                camera_info["height"],
-            )
-            if state.calibration_storage is not None:
-                try:
-                    state.calibration_storage.save(
-                        calibration,
-                        state.camera,
-                        camera_info,
-                        state.device,
-                    )
-                except (OSError, TypeError, ValueError) as exc:
-                    LOG.error("Could not save camera calibration: %s", exc)
-                    raise ValueError(
-                        "Calibration could not be saved to local storage."
-                    ) from exc
-            state.calibration = calibration
-            state.signature = signature
-            if state.calibration_storage is not None:
-                state.calibration_restore_key = (
-                    signature,
-                    getattr(
-                        state.camera,
-                        "configured_source",
-                        state.camera.source,
-                    ),
-                    state.camera.rotate,
-                )
-            state.message = "Calibration saved. You can enable Manual Control."
-            LOG.info("Four-corner calibration saved for %s", state.device.serial)
+            state.apply_calibration(calibration, camera_info)
             return jsonify(calibrated=True, corners=calibration.corners.tolist())
 
     @app.post("/api/key")
@@ -1480,15 +1846,28 @@ def create_app(
 
                 pixel, normalized = None, None
                 swipe_start, swipe_end, swipe_duration = None, None, None
+                coordinate_space = data.get("coordinate_space", "camera_normalized")
+                if coordinate_space not in {
+                    "camera_normalized",
+                    "screen_normalized",
+                }:
+                    raise ValueError("Unsupported coordinate_space.")
+
+                def action_point(value):
+                    if not isinstance(value, (list, tuple)) or len(value) != 2:
+                        raise ValueError("A normalized coordinate is required.")
+                    if coordinate_space == "screen_normalized":
+                        return [unit(value[0]), unit(value[1])]
+                    return state.calibration.map(value)
 
                 if name == "tap":
+                    normalized = action_point([data.get("x"), data.get("y")])
                     if state.pi_bridge is not None:
-                        normalized = state.calibration.map(
-                            [data.get("x"), data.get("y")]
-                        )
+                        pixel = None
                     else:
-                        pixel, normalized = state.calibration.pixel(
-                            [data.get("x"), data.get("y")],
+                        pixel = normalized_to_device(
+                            normalized[0],
+                            normalized[1],
                             state.device.width,
                             state.device.height,
                         )
@@ -1503,15 +1882,11 @@ def create_app(
                             "Swipe duration must be 50–60000 milliseconds."
                         )
                     if state.pi_bridge is not None:
-                        swipe_start = state.calibration.map(start)
-                        swipe_end = state.calibration.map(end)
+                        swipe_start = action_point(start)
+                        swipe_end = action_point(end)
                     else:
-                        _, swipe_start = state.calibration.pixel(
-                            start, state.device.width, state.device.height
-                        )
-                        _, swipe_end = state.calibration.pixel(
-                            end, state.device.width, state.device.height
-                        )
+                        swipe_start = action_point(start)
+                        swipe_end = action_point(end)
 
                 recorded = None
                 try:
@@ -1583,6 +1958,7 @@ def create_app(
         device_id=device_id,
         ocr_settings_storage=ocr_settings_storage,
         ocr_resource_provider=ocr_resource_provider,
+        screenshot_store=screenshot_store,
         admin_required=local_dashboard_access,
         require_admin=allow_local_dashboard,
     )
@@ -1644,7 +2020,186 @@ def create_app(
         ensure_registered_device=app.extensions["ensure_registered_device"],
         start_workers=start_withdraw_workers,
     )
+    register_remote_agent(app, state, camera_manager, agent_secret, remote_history)
     return app
+
+
+def register_remote_agent(app, state, camera_manager, agent_secret, history):
+    """RemoteViewer agent: camera frames and remote takeover of a phone.
+
+    Everything under /agent/v1 is refused unless a secret is configured.
+    """
+    workflow_service = app.extensions["workflow_service"]
+    scheduler = app.extensions["job_scheduler"]
+    readiness = app.extensions["device_eligibility"]
+    calibration_storage = state.calibration_storage
+
+    def known_device(device_id):
+        with state.lock:
+            if device_id in state.pi_devices:
+                return True
+        return device_id in camera_manager.all_configs()
+
+    def controllable_device(device_id):
+        """A phone the input backend really addresses by this id.
+
+        Pi: an enrolled Pi phone. Appium: only the one bound phone, so two ids
+        can never name the same physical phone.
+        """
+        if state.pi_bridge is None:
+            return device_id == (workflow_service.device_id or DEFAULT_DEVICE_ID)
+        with state.lock:
+            initialized = state.pi_catalog_initialized
+        if not initialized:
+            readiness._refresh_pi_catalog()
+        with state.lock:
+            return device_id in state.pi_devices
+
+    def local_operator(device_id):
+        with state.lock:
+            selected = state.pi_bridge is None or state.pi_bridge.device_id == device_id
+            if selected and (state.owner is not None or state.pending):
+                return True
+        identity = readiness.lock_identity(device_id)
+        return identity is not None and state.device_locks.owner(identity) == "manual"
+
+    def running_job(device_id):
+        return next(
+            (
+                job
+                for job in scheduler.list_jobs()
+                if job.device_id == device_id and job.status == "RUNNING"
+            ),
+            None,
+        )
+
+    def input_target(device_id):
+        """(target, backend, selected): the phone device_id addresses.
+
+        selected: it is the phone the dashboard shows, whose calibration lives
+        in `state`. Caller holds state.lock.
+        """
+        if state.pi_bridge is not None:
+            target = RaspberryPiInputBridge(
+                PiApiClient(state.pi_bridge.client.base_url, device_id=device_id)
+            ).target
+            return target, "raspberry_pi", state.pi_bridge.device_id == device_id
+        if state.device is None:
+            raise remote_control.Refused(409, "device_unavailable")
+        return state.device, "appium", True
+
+    def device_calibration(device_id):
+        """(target, backend, calibration|None) for device_id."""
+        with state.lock:
+            target, backend, selected = input_target(device_id)
+            calibration = state.calibration if selected else None
+        if calibration is None and calibration_storage is not None:
+            camera = camera_manager.get_camera(device_id)
+            status = camera.status()
+            if status.get("ready"):
+                calibration = calibration_storage.load(camera, status, target)
+        return target, backend, calibration
+
+    def read_screen(device_id):
+        try:
+            return device_calibration(device_id)[2]
+        except remote_control.Refused:
+            return None  # no phone to calibrate: viewers show the whole picture
+
+    def save_screen(device_id, calibration, changed_by):
+        """Store corners for device_id and use them at once, as the dashboard does."""
+        with state.lock:
+            target, _, selected = input_target(device_id)
+            if selected:
+                state.disable("Calibration changed remotely. Input disabled.")
+                state.calibration = None
+                state.calibration_restore_key = None
+                try:
+                    camera_info = state.require_ready()
+                except DeviceError:
+                    raise remote_control.Refused(409, "device_unavailable") from None
+                try:
+                    state.apply_calibration(calibration, camera_info, changed_by)
+                except ValueError:
+                    raise remote_control.Refused(500, "save_failed") from None
+                return
+        # Not the dashboard's phone: its saved file is what the bot, remote
+        # input and a later dashboard selection all load.
+        camera = camera_manager.get_camera(device_id)
+        status = camera.status()
+        if calibration_storage is None or not status.get("ready"):
+            raise remote_control.Refused(409, "device_unavailable")
+        try:
+            calibration_storage.save(calibration, camera, status, target, changed_by)
+        except (OSError, TypeError, ValueError) as exc:
+            LOG.error("Could not save camera calibration: %s", exc)
+            raise remote_control.Refused(500, "save_failed") from None
+
+    def open_input(device_id):
+        """The workflow input bridge for device_id and its saved calibration."""
+        target, backend, calibration = device_calibration(device_id)
+        context = AutomationContext(
+            target,
+            state.android,
+            threading.Event(),
+            LOG,
+            SimpleNamespace(),
+            input_backend=backend,
+        )
+        return context.input, calibration
+
+    remote = remote_control.RemoteControl(
+        workflow_service,
+        state.device_locks,
+        history
+        or remote_control.RemoteHistory(
+            JOB_DATA_DIRECTORY / "remote_control_history.jsonl"
+        ),
+        local_operator=local_operator,
+        running_job=running_job,
+        lock_identity=readiness.lock_identity,
+        open_input=open_input,
+        read_screen=read_screen,
+        save_screen=save_screen,
+    )
+    app.extensions["remote_control"] = remote
+
+    blueprint = agent_frames.make_blueprint(camera_manager, agent_secret, known_device)
+    remote_control.register_routes(
+        blueprint, remote, controllable_device, viewable_device=known_device
+    )
+    app.register_blueprint(blueprint)
+    LOG.info(
+        "RemoteViewer agent endpoints %s",
+        (
+            "enabled"
+            if agent_secret
+            else f"disabled ({agent_frames.SECRET_FILE_ENV} not set)"
+        ),
+    )
+
+    @app.get("/api/remote-control")
+    def remote_control_status():
+        return jsonify(active=remote.active(), history=remote.history.recent())
+
+    @app.post("/api/devices/<device_id>/remote-control/end")
+    @local_dashboard_access
+    def end_remote_control(device_id):
+        if request.get_json(silent=True) != {}:
+            raise ValueError("End remote control expects an empty JSON object.")
+        if not remote.end_by_operator(device_id):
+            return (
+                jsonify(
+                    ok=False,
+                    **error_fields(
+                        "Remote control is not active.",
+                        "remote_control_not_active",
+                        {"device_id": device_id},
+                    ),
+                ),
+                409,
+            )
+        return jsonify(ok=True)
 
 
 def main():
@@ -1699,12 +2254,7 @@ def main():
     ):
         parser.error("Invalid camera index, port, or frame size.")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(name)s] %(message)s",
-    )
-
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    configure_development_logging()
 
     # Use network stream if provided,
     # otherwise use local camera index.
@@ -1731,7 +2281,14 @@ def main():
             try:
                 start_ocr_worker()
             except Exception as exc:
-                LOG.warning("PaddleOCR worker warmup failed: %s", exc)
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "ocr",
+                    "ocr_worker_start_failed",
+                    error_code="ocr_worker_start_failed",
+                    exception_type=type(exc).__name__,
+                )
 
         threading.Thread(
             target=warm_ocr_worker,

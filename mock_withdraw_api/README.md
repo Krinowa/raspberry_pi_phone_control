@@ -43,10 +43,11 @@ The password for every account is `password123`.
 | `operator_c` |         103 | `2b`            |
 | `operator_d` |         104 | `9`             |
 
-The fixed TOTP secret is `JBSWY3DPEHPK3PXP`. The mock validates the current
-RFC 6238 code generated from that secret (with a one-step clock window). This is
-used instead of a constant `123456` because the production client generates a
-real TOTP before login.
+The fixed TOTP secret is `JBSWY3DPEHPK3PXP`. Register it in an authenticator for
+manual testing and enter the current six-digit code in **Login & Assign**. The
+mock validates that rotating RFC 6238 code with a one-step clock window; the
+production client sends the entered code and never stores the secret or code.
+Automated tests generate a current code from this mock-only seed secret.
 
 ## Seed data
 
@@ -121,7 +122,10 @@ Client actions on the session channel:
 Every reply is `action.result` on the same session channel and preserves
 `request_id`. Queue mutations emit `queue.changed` on each affected queue
 channel. One physical socket may authorize several session channels using
-different Bearer tokens.
+different Bearer tokens. Client actions are accepted only on the authorized
+private session channel, never a queue channel. Locks belong to the stable
+operator identity, so a fresh token for the same operator can reconcile and
+renew the same lock; a different operator cannot view or mutate it.
 
 ## Mock control endpoints
 
@@ -136,19 +140,26 @@ These are test-only and are not part of API v2:
   `"bank_name":"Mock Bank","account_number":"0000000001",`
   `"account_name":"Mock User"}`; ID, order ID, transaction ID, and timestamp
   are generated automatically
-- `POST /mock/withdrawals/reset` with `{}` — clears every pending, locked, and
-  historical withdrawal while preserving active mock sessions
+- `POST /mock/withdrawals/reset` with `{}` — clears every pending and historical
+  withdrawal while preserving active mock sessions. If any withdrawal is locked,
+  `{"confirm_locked":true}` is required as an additional safety acknowledgement.
 - `POST /mock/emit-queue-changed`
 - `POST /mock/disconnect`
 - `POST /mock/expire-session`
 - `POST /mock/advance-time` with `{"seconds":601}`
-- `POST /mock/lock-expire`
+- `POST /mock/lock-expire` with optional `{"withdraw_id":935402}`; omitting the
+  ID expires every live lock
+- `POST /mock/withdrawals/{id}/approve` with `{"operator_id":101}` — simulates
+  an exact external approval for approved-first reconciliation tests
 
 `/mock/state` includes sessions, socket IDs, subscriptions, channel authorizers,
 withdrawal states, lock owners/expiry, proofs, actions, results, and queue events.
 The mock UI exposes these as separate **Reset to Seed Data** and
 **Clear Withdrawals** controls. Clearing withdrawals remains empty across page
 refreshes; only reset or process startup restores the seed data.
+All `/mock` UI/debug/control routes reject non-loopback callers even if the mock
+is accidentally bound more broadly. Production-shaped `/api/admin-withdraw/v2`
+routes remain separate from these controls.
 
 ## Failure scenarios
 
@@ -187,6 +198,12 @@ timeout; after-apply writes approved history first.
   then can reconcile the exact ID and transaction through `my-approved`.
 - Reconnect: lock an item, call `/mock/disconnect`, and verify resubscription,
   `client-my-locked`, and no duplicate payment.
+- Fresh-token reconnect: log in again as the same operator after locking and
+  verify `client-my-locked` returns the exact same ID/transaction; another
+  operator must receive no ownership.
+- Approved-first: call `/mock/withdrawals/{id}/approve` for the owning operator,
+  reconnect, and verify the exact ID + `tx_id` appears in `my-approved` before
+  any lock recovery attempt.
 - Repeat: call `/mock/reset` before the next scenario.
 
 ## Tests

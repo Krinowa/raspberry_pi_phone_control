@@ -97,10 +97,13 @@ For a standalone copy, Python 3.10+ is required. Create an environment with
 
 ### Camera OCR setup
 
-Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector and its
-English-specific PP-OCRv5 mobile recognizer on the CPU. The document-orientation
+Camera text detection uses PaddleOCR's PP-OCRv5 mobile detector on the CPU.
+English uses `en_PP-OCRv5_mobile_rec`; set `CAMERA_OCR_LANGUAGE=zh-HK` (or
+`chinese_cht`) for Chinese with `PP-OCRv5_mobile_rec`, or
+`CAMERA_OCR_LANGUAGE=ms` for Malay with `latin_PP-OCRv5_mobile_rec`. English is
+the default, and unsupported languages fail explicitly. The document-orientation
 and document-unwarping models are disabled; text line orientation is also
-disabled by default. Paddle and its models are created exactly once in a
+disabled by default. Paddle and its selected models are created exactly once in a
 persistent spawned worker process, then reused for the life of the server. A
 background warmup starts the worker before Flask begins serving so model
 initialization normally finishes before the first workflow OCR request. This
@@ -616,6 +619,17 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
   Use manual checkpoints for authentication and final financial authorization.
   Coordinate taps cannot determine an app action's meaning.
 
+### Developer tools configuration
+
+Developer tools are disabled unless a non-empty `PHONE_DEVELOPER_MODE_KEY` is
+configured. Source execution loads the private `camera_phone_control/.env`
+file. Copy `.env.example` to `.env` and set the key there.
+
+Do not place the key in source code, frontend JavaScript, workflow data, or a
+URL saved in documentation or browser bookmarks. If the setting is absent or
+empty, developer authentication remains disabled. Restart the application after
+changing the private environment file.
+
 ## Account-routed external jobs
 
 External jobs use a persistent account binding rather than the dashboard's current
@@ -722,6 +736,120 @@ Keyboard text and key values are excluded from logging and responses. Camera
 images stay in memory and are not saved. General input errors disable the browser's
 Manual Control; enable it again only after checking the reported condition.
 
+## RemoteViewer frame endpoint
+
+`GET /agent/v1/devices/<device_id>/frames` gives the RemoteViewer device agent,
+running on this same PC, a read-only stream of uncompressed camera frames. It
+follows section 2 of RemoteViewer's `docs/pi-interface.md`. It carries pictures
+only. The code is in `agent_frames.py`. Remote control of a phone is a separate
+set of addresses, described in the next section.
+
+**Secret file.** The agent and this app share one secret of at least 32 random
+characters, kept in a file that only the operator's Windows user can read.
+Create it once, in the folder that holds `agent.exe`:
+
+```bat
+python -c "import secrets, pathlib; pathlib.Path('pi.secret').write_text(secrets.token_urlsafe(48))"
+icacls pi.secret /inheritance:r /grant:r "%USERNAME%:F"
+```
+
+Then tell this app where the file is, either in `camera_phone_control\.env` or as
+an environment variable set before starting the app:
+
+```text
+REMOTEVIEWER_PI_SECRET_FILE=C:\full\path\to\pi.secret
+```
+
+The file is read once at start, so restart the app after creating or changing
+it. The app refuses to start if the variable is set but the file is missing or
+the secret is shorter than 32 characters. If the variable is not set, the
+endpoint answers `401` to everything. Never put the secret itself in `.env`, in
+a command line or in Git (`*.secret` is ignored).
+
+**Port.** The endpoint is served by the dashboard's own server, on `127.0.0.1`
+only, at the port given with `--port` (default `8765`). The stream is not
+encrypted; do not forward or tunnel this port.
+
+**Device ids** are the dashboard's phone ids: `phone_A`, plus every phone
+enrolled on the Pi (the ids shown in the dashboard's phone list). An id that is
+neither enrolled nor has a camera assignment answers `404`.
+
+**Check it** on the Windows PC with the app running:
+
+```bat
+agent.exe check-frames -device phone_A -pi-secret-file pi.secret -pi http://127.0.0.1:8765
+```
+
+It must print `OK: the agent can use this endpoint`.
+
+Frames come from the same capture loop as the dashboard preview, so a phone
+that is not the one selected in the dashboard is captured at the lower
+monitoring frame rate.
+
+## RemoteViewer remote control
+
+Four more addresses let the RemoteViewer agent operate a phone through the
+existing input code (Pi or Appium). They follow sections 3 and 4 of
+RemoteViewer's `docs/pi-interface.md`; the code is in `remote_control.py`.
+They use the same secret file, port and device ids as the frame endpoint, and
+the agent's requests need no dashboard control token.
+
+| Address | Purpose |
+|---|---|
+| `POST /agent/v1/devices/<id>/takeover` | Take the phone. `200` with `interrupted_job` (or `null`); `409` with `local_operator`, `held_by_remote`, `critical_step` or `job_running`. |
+| `POST /agent/v1/devices/<id>/takeover/renew` | Keep the lease. `409` once the session no longer holds the phone. |
+| `DELETE /agent/v1/devices/<id>/takeover?session_id=…` | Release. Always `200`. |
+| `POST /agent/v1/devices/<id>/input` | One tap, swipe, text, key, `home`, `back` or `wake`. `403` unless the session holds the phone; `200` after the input was carried out. |
+
+**Lease.** Without a renew for 6 seconds the phone is released automatically.
+
+**Running jobs.** With `allow_during_job` the job stops at its next input and
+is recorded as `INTERRUPTED`, naming the user, session, reason and time. Its
+phone is then marked *Needs Attention*, so it is retried only after the
+operator verifies the phone, as for any other interrupted job. No new job
+starts on a phone under remote control.
+
+**Critical steps.** A workflow step ticked *Critical* in the workflow editor is
+never interrupted: a takeover during it answers `409 critical_step`, whatever
+`allow_during_job` says. Tick the step that confirms a payment.
+
+**Coordinates** are fractions of the camera picture served by the frame
+endpoint. Taps and swipes use the phone's saved calibration; a point outside
+the phone is ignored. Taps and swipes are refused (`409 not_calibrated`) until
+the phone is calibrated. Text is passed to the phone as data, never through a
+shell. The Pi accepts printable ASCII text only; other text, and the `escape`
+key, answer `422 unsupported_input` without sending anything.
+
+**Dashboard.** A phone under remote control shows who holds it, why and since
+when, with an *End Remote Control* button that takes it back (the agent's next
+renew then gets `409`). Job History lists remote sessions and how each ended.
+The audit is kept in `automation/job_data/remote_control_history.jsonl`; typed text is
+never written there.
+
+**Swipe duration on the Pi.** A swipe that starts and ends at the same point is
+a long press. Appium holds it for `duration_ms`; the Pi API takes geometry only,
+so the Pi's HID server decides how long it is held.
+
+## RemoteViewer screen position
+
+Section 5 of the same contract: viewers crop the camera picture to the phone
+screen with this app's calibration, and a remote user holding the takeover can
+correct it. There is one calibration per device, the same one the dashboard
+saves (`automation/camera_data/calibration*.json`).
+
+| Address | Purpose |
+|---|---|
+| `GET /agent/v1/devices/<id>/screen` | `{"corners": [[x, y], …]}`: top-left, top-right, bottom-right, bottom-left of the phone screen, in fractions of the frame picture; `{"corners": null}` when not calibrated. |
+| `PUT /agent/v1/devices/<id>/screen` | `{"session_id", "corners"}`. `403` unless the session holds the takeover; `400 {"error": "bad_corners"}` unless the corners pass the dashboard's checks (four points in 0–1, convex, area at least 0.005). `200` returns the stored corners. |
+
+A remote change is saved and used at once, exactly like a dashboard
+calibration: the dashboard, the bot and the next remote input all use it. It
+waits until a stopped job has handed over the phone. The calibration file
+records who made the last change (`changed_by`: `dashboard`, or `remote` with
+the session and user), and Job History lists remote recalibrations. If the
+camera or phone is not ready the change is refused with `409
+device_unavailable`.
+
 ## Tests
 
 From `camera_phone_control` with the virtual environment active:
@@ -731,6 +859,8 @@ python -m unittest discover -s tests -p 'test_workflows.py' -v
 python -m unittest discover -s tests -p 'test_record_first.py' -v
 python -m unittest discover -s tests -p 'test_automation.py' -v
 python -m unittest discover -s tests -p 'test_takeover.py' -v
+python -m pytest tests/test_agent_frames.py -v
+python -m pytest tests/test_remote_control.py tests/test_remote_control_app.py -v
 node --check static/app.js
 node --check static/workflows.js
 node --test tests/test_workflow_ui.js

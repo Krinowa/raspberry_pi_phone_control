@@ -4,11 +4,14 @@ from dataclasses import dataclass, field
 import json
 import logging
 import os
+import re
+import ssl
 import threading
 import time
 import uuid
 from urllib.parse import quote
 
+import certifi
 import websocket
 
 from .client import APIError, UncertainResult, response_data
@@ -22,6 +25,38 @@ ACTIONS = {
     "release": "release",
     "cancel": "cancel",
 }
+
+
+def _sanitized_realtime_reason(error):
+    """Return useful transport diagnostics without exposing credentials."""
+    reason = str(error).strip() or error.__class__.__name__
+    reason = re.sub(r"(?i)(/app/)[^?\s]+", r"\1<redacted>", reason)
+    reason = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer <redacted>", reason)
+    reason = re.sub(
+        r"(?i)\b(?:authorization|token|password|otp|secret|auth|cookie|set-cookie)\b"
+        r"\s*[:=]\s*[^\s,;]+",
+        "<redacted>",
+        reason,
+    )
+    return reason.replace("\r", " ").replace("\n", " ")[:500]
+
+
+def _safe_realtime_error(error):
+    """Wrap a sanitized transport failure for session/status propagation."""
+    reason = _sanitized_realtime_reason(error)
+    return APIError(
+        0,
+        f"Realtime connection failed: {error.__class__.__name__}: {reason}",
+    )
+
+
+def _safe_websocket_endpoint(identity):
+    """Describe the returned Pusher endpoint while redacting its public app key."""
+    if identity is None:
+        return "unconfigured"
+    host, port, _key, scheme = identity
+    websocket_scheme = "wss" if scheme == "https" else "ws"
+    return f"{websocket_scheme}://{host}:{port}/app/<redacted>"
 
 
 def _settings(realtime):
@@ -101,6 +136,7 @@ class SharedPusherTransport:
         self.ws = None
         self.thread = None
         self.connected = False
+        self.error = None
         self.socket_id = None
         self.subscribed = set()
         self.subscribing = set()
@@ -117,7 +153,21 @@ class SharedPusherTransport:
 
     def register(self, owner, client, realtime, on_queue_changed):
         identity, endpoint, session_channel, queue_channels = _settings(realtime)
+        host, port, key, scheme = identity
+        LOG.info(
+            "Withdraw realtime metadata device=%s host=%s port=%s scheme=%s "
+            "key_present=%s auth_endpoint_present=%s queue_channel_count=%s",
+            owner,
+            host,
+            port,
+            scheme,
+            bool(key),
+            bool(endpoint),
+            len(queue_channels),
+        )
         with self.lock:
+            if not self.sessions:
+                self.error = None
             if self.identity is not None and self.identity != identity:
                 raise APIError(
                     0,
@@ -162,15 +212,7 @@ class SharedPusherTransport:
                     daemon=True,
                 )
                 self.thread.start()
-            LOG.info(
-                "Registered Withdraw realtime logical session device=%s operator=%s",
-                owner,
-                (
-                    getattr(client, "profile", {}).get("id")
-                    if isinstance(getattr(client, "profile", None), dict)
-                    else "unknown"
-                ),
-            )
+            LOG.info("Registered Withdraw realtime logical session device=%s", owner)
             self.wake.set()
             return session
 
@@ -234,6 +276,12 @@ class SharedPusherTransport:
             session = self.sessions.get(owner)
             return session.state if session else "DISCONNECTED"
 
+    def session_error(self, owner):
+        with self.lock:
+            session = self.sessions.get(owner)
+            error = session.error if session and session.error else self.error
+            return str(error) if error else None
+
     def generation(self, owner):
         with self.lock:
             session = self.sessions.get(owner)
@@ -260,16 +308,39 @@ class SharedPusherTransport:
                         return
                 try:
                     if not self.physical_connected:
-                        self._open()
+                        try:
+                            self._open()
+                        except Exception as exc:
+                            safe_error = _safe_realtime_error(exc)
+                            with self.lock:
+                                safe_endpoint = _safe_websocket_endpoint(self.identity)
+                            LOG.warning(
+                                "Withdraw realtime connection failed "
+                                "endpoint=%s error=%s: %s",
+                                safe_endpoint,
+                                type(exc).__name__,
+                                _sanitized_realtime_reason(exc),
+                            )
+                            self._mark_disconnected(safe_error)
+                            if self.stop.is_set():
+                                break
+                            self.wake.wait(backoff)
+                            self.wake.clear()
+                            backoff = min(30, backoff * 2)
+                            continue
                         backoff = 1
                     self._sync_subscriptions()
                     self._read_once()
-                except Exception:
+                except Exception as exc:
+                    safe_error = _safe_realtime_error(exc)
                     if not self.stop.is_set():
                         LOG.warning(
-                            "Shared withdrawal realtime transport disconnected; reconnecting"
+                            "Shared withdrawal realtime transport disconnected "
+                            "error=%s: %s; reconnecting",
+                            type(exc).__name__,
+                            _sanitized_realtime_reason(exc),
                         )
-                    self._mark_disconnected()
+                    self._mark_disconnected(safe_error)
                     if self.stop.is_set():
                         break
                     self.wake.wait(backoff)
@@ -292,19 +363,26 @@ class SharedPusherTransport:
             f'{websocket_scheme}://{host}:{port}/app/{quote(key, safe="")}'
             "?protocol=7&client=phone-controller&version=1.0"
         )
+        safe_endpoint = _safe_websocket_endpoint(identity)
+        LOG.info("Withdraw realtime websocket URL structure %s", safe_endpoint)
         LOG.info(
-            "Withdraw realtime connecting to %s://%s:%s",
-            websocket_scheme,
-            host,
-            port,
+            "Withdraw realtime TCP/TLS/WebSocket open attempt endpoint=%s",
+            safe_endpoint,
         )
-        ws = self.connect_transport(
-            url,
-            timeout=10,
-            enable_multithread=True,
+        connect_options = {"timeout": 10, "enable_multithread": True}
+        if websocket_scheme == "wss":
+            connect_options["sslopt"] = {
+                "cert_reqs": ssl.CERT_REQUIRED,
+                "ca_certs": certifi.where(),
+            }
+        ws = self.connect_transport(url, **connect_options)
+        LOG.info(
+            "Withdraw realtime WebSocket open succeeded endpoint=%s",
+            safe_endpoint,
         )
         with self.lock:
             self.ws = ws
+        LOG.info("Withdraw realtime waiting for pusher:connection_established")
         first = self._receive()
         if first["event"] != "pusher:connection_established":
             raise APIError(0, "Pusher connection was not established.")
@@ -314,6 +392,7 @@ class SharedPusherTransport:
         timeout = first["data"].get("activity_timeout", 60)
         with self.lock:
             self.socket_id = socket_id
+            self.error = None
             self.activity_timeout = (
                 timeout
                 if isinstance(timeout, (int, float)) and 1 <= timeout <= 120
@@ -326,7 +405,7 @@ class SharedPusherTransport:
             self.channel_authorizers.clear()
             for session in self.sessions.values():
                 self._set_state_locked(session, "SUBSCRIBING")
-        LOG.info("Withdraw realtime connected socket_id=%s", socket_id)
+        LOG.info("Withdraw realtime received pusher:connection_established")
         ws.settimeout(1)
 
     def _sync_subscriptions(self):
@@ -356,8 +435,16 @@ class SharedPusherTransport:
                     continue
                 attempted = True
                 try:
+                    LOG.info(
+                        "Authorizing Withdraw realtime channel owner=%s",
+                        session.owner,
+                    )
                     auth = session.client.authorize(
                         session.endpoint, self.socket_id, channel
+                    )
+                    LOG.info(
+                        "Withdraw realtime channel authorization accepted " "owner=%s",
+                        session.owner,
                     )
                     self._send(
                         "pusher:subscribe",
@@ -376,8 +463,7 @@ class SharedPusherTransport:
                 # No healthy logical owner can authenticate this channel. Keep
                 # the physical socket alive for all unrelated sessions.
                 LOG.warning(
-                    "Withdraw channel authorization failed channel=%s code=%s",
-                    channel,
+                    "Withdraw channel authorization failed code=%s",
                     getattr(last_error, "code", 0),
                 )
         self.wake.clear()
@@ -446,7 +532,7 @@ class SharedPusherTransport:
                         ),
                     )
         elif event == "pusher_internal:subscription_succeeded":
-            LOG.info("Subscribed Withdraw realtime channel %s", channel)
+            LOG.info("Subscribed Withdraw realtime channel")
             with self.lock:
                 self.subscribing.discard(channel)
                 self.subscribed.add(channel)
@@ -483,10 +569,12 @@ class SharedPusherTransport:
         if entry:
             entry["event"].set()
 
-    def _mark_disconnected(self):
+    def _mark_disconnected(self, error=None):
         with self.lock:
             ws, self.ws = self.ws, None
             self.connected = False
+            if error is not None:
+                self.error = error
             self.socket_id = None
             self.subscribed.clear()
             self.subscribing.clear()
@@ -494,7 +582,11 @@ class SharedPusherTransport:
             self.channel_authorizers.clear()
             for session in self.sessions.values():
                 if session.state != "ERROR":
-                    self._set_state_locked(session, "WAITING_FOR_CONNECTION")
+                    self._set_state_locked(
+                        session,
+                        "WAITING_FOR_CONNECTION",
+                        error or session.error,
+                    )
                 for request_id in list(session.pending):
                     self._fail_request_locked(request_id)
         if ws:
@@ -604,6 +696,10 @@ class PusherSocket:
         return self.transport.session_state(self.device_id)
 
     @property
+    def error(self):
+        return self.transport.session_error(self.device_id)
+
+    @property
     def generation(self):
         return self.transport.generation(self.device_id)
 
@@ -613,7 +709,10 @@ class PusherSocket:
         )
         self.registered = True
         if not self.transport.wait_ready(self.device_id, 20):
-            raise UncertainResult()
+            raise APIError(
+                0,
+                self.error or "Realtime connection did not become ready in time.",
+            )
 
     def wait_ready(self, timeout=20):
         return self.transport.wait_ready(self.device_id, timeout)

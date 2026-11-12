@@ -14,6 +14,33 @@ from .validation import (
     validate_workflow,
 )
 
+VERIFY_VARIABLE_LABELS = {
+    "account_name": "Account Name",
+    "account_number": "Account Number",
+    "bank_name": "Bank Name",
+    "amount": "Amount",
+}
+
+
+def ensure_verify_variable(workflow, step):
+    if step.get("type") != "verify_text" or step.get("source") != "variable":
+        return
+    name = step.get("variable")
+    if name not in VERIFY_VARIABLE_LABELS or any(
+        definition.get("name") == name for definition in workflow["variables"]
+    ):
+        return
+    workflow["variables"].append(
+        {
+            "name": name,
+            "label": VERIFY_VARIABLE_LABELS[name],
+            "type": "text",
+            "required": True,
+            "default": None,
+            "ask_when_running": True,
+        }
+    )
+
 
 def iter_workflow_steps(steps):
     for step in steps:
@@ -257,6 +284,7 @@ class Recorder:
                 candidate["variables"].append(variable)
 
         self._recording_steps(candidate).append(step)
+        ensure_verify_variable(candidate, step)
         # A financial draft may be incomplete until Save; validate other fields now.
         check = deepcopy(candidate)
         check["financial"] = False
@@ -579,6 +607,7 @@ class Recorder:
                 "wait",
                 "wait_until_stable",
                 "wait_for_text",
+                "verify_text",
                 "if_text",
                 "capture_screen",
                 "ocr_value",
@@ -643,6 +672,16 @@ class Recorder:
                     "wait": {"seconds"},
                     "wait_until_stable": {"stable_ms", "timeout_seconds"},
                     "wait_for_text": {"text", "timeout_seconds", "roi"},
+                    "verify_text": {
+                        "label",
+                        "source",
+                        "text",
+                        "variable",
+                        "match_mode",
+                        "last_n",
+                        "timeout_seconds",
+                        "roi",
+                    },
                     "if_text": {"text", "timeout_seconds", "roi"},
                     "capture_screen": {"output_key"},
                     "ocr_value": {"roi", "parser", "output"},
@@ -651,9 +690,12 @@ class Recorder:
                 changes = data.get("fields")
                 if not isinstance(changes, dict) or set(changes) - allowed:
                     raise ValueError("Unsupported fields for this step.")
+                if old["type"] == "verify_text":
+                    for field in ("text", "variable", "last_n"):
+                        old.pop(field, None)
                 old.update(deepcopy(changes))
                 if (
-                    old["type"] in {"wait_for_text", "if_text"}
+                    old["type"] in {"wait_for_text", "if_text", "verify_text"}
                     and changes.get("roi", False) is None
                 ):
                     old.pop("roi", None)
@@ -841,6 +883,8 @@ class Recorder:
                 raise ValueError("Unknown review operation.")
 
         all_steps = list(iter_workflow_steps(candidate["steps"]))
+        for step in all_steps:
+            ensure_verify_variable(candidate, step)
         used = {s.get("variable") for s in all_steps}
 
         candidate["variables"] = [

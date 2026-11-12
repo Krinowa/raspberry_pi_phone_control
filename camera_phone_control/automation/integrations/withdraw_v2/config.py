@@ -48,7 +48,8 @@ class WithdrawCredentialStore:
             suffix=".tmp",
         )
         try:
-            os.fchmod(descriptor, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 json.dump(values, stream, allow_nan=False)
                 stream.write("\n")
@@ -178,8 +179,7 @@ def validate_configuration(data):
             "Balance freshness and pending-retry interval must be 1–300 seconds."
         )
     if api["enabled"] and not all(
-        api.get(key)
-        for key in ("base_url", "operator_id", "username", "credential_reference")
+        api.get(key) for key in ("base_url", "operator_id", "username")
     ):
         raise ValueError(
             "Enabled integration requires API host, operator ID, username and credential reference."

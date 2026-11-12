@@ -8,7 +8,6 @@ import math
 import multiprocessing
 import os
 from pathlib import Path
-import resource
 import threading
 import time
 import uuid
@@ -17,11 +16,69 @@ from collections import deque
 import cv2
 import numpy as np
 
+from diagnostic_logging import (
+    configure_child_logging,
+    current_logging_queue,
+    log_event,
+)
+
+try:
+    import resource
+except ImportError:  # Windows has no POSIX resource module.
+    resource = None
+
 from ..coordinates import normalized_roi
 from .state import ScreenStateError, TextDetectionUnavailable
 from ..workflows.timing import measure_timing, record_timing
 
 LOG = logging.getLogger("camera_ocr")
+
+OCR_LANGUAGE_PROFILES = {
+    "en": ("en", "en_PP-OCRv5_mobile_rec"),
+    "ch": ("ch", "PP-OCRv5_mobile_rec"),
+    "chinese_cht": ("chinese_cht", "PP-OCRv5_mobile_rec"),
+    "japan": ("japan", "PP-OCRv5_mobile_rec"),
+    "ms": ("ms", "latin_PP-OCRv5_mobile_rec"),
+}
+OCR_LANGUAGE_ALIASES = {
+    "english": "en",
+    "zh": "ch",
+    "zh-cn": "ch",
+    "zh-hans": "ch",
+    "zh-hk": "chinese_cht",
+    "zh-tw": "chinese_cht",
+    "zh-hant": "chinese_cht",
+    "traditional-chinese": "chinese_cht",
+    "ja": "japan",
+    "jp": "japan",
+    "malay": "ms",
+}
+
+
+def _ocr_language_profile(language):
+    value = str(language or "").strip().casefold().replace("_", "-")
+    value = OCR_LANGUAGE_ALIASES.get(value, value)
+    if value == "chinese-cht":
+        value = "chinese_cht"
+    profile = OCR_LANGUAGE_PROFILES.get(value)
+    if profile is None:
+        supported = "en, ch, chinese_cht/zh-HK, japan, and ms"
+        raise TextDetectionUnavailable(
+            f"Packaged Camera OCR does not support language {language!r}; "
+            f"supported languages are {supported}."
+        )
+    return value, profile[0], profile[1]
+
+
+def _process_cpu_times():
+    if resource is not None:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_utime, usage.ru_stime
+    try:
+        usage = __import__("psutil").Process().cpu_times()
+        return float(usage.user), float(usage.system)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return 0.0, 0.0
 
 
 def _build_paddle_engine(
@@ -39,22 +96,50 @@ def _build_paddle_engine(
             "Install the camera OCR dependencies and restart the server."
         ) from exc
 
+    _, paddle_language, recognition_model = _ocr_language_profile(language)
     options = dict(
         device="cpu",
+        lang=paddle_language,
+        ocr_version="PP-OCRv5",
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=textline_orientation,
         cpu_threads=cpu_threads,
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_recognition_model_name=recognition_model,
+        textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
     )
     if recognition_batch_size is not None:
         options["text_recognition_batch_size"] = recognition_batch_size
-    if language == "en":
+    packaged_models = os.environ.get("PHONE_CONTROLLER_OCR_MODELS_DIR", "").strip()
+    if packaged_models:
+        model_root = Path(packaged_models)
+        detection = model_root / "PP-OCRv5_mobile_det"
+        recognition = model_root / recognition_model
+        missing = [
+            path.name
+            for path in (detection, recognition)
+            if not all(
+                (path / filename).is_file()
+                for filename in ("inference.json", "inference.pdiparams")
+            )
+        ]
+        orientation = model_root / "PP-LCNet_x1_0_textline_ori"
+        if textline_orientation and not all(
+            (orientation / filename).is_file()
+            for filename in ("inference.json", "inference.pdiparams")
+        ):
+            missing.append(orientation.name)
+        if missing:
+            raise TextDetectionUnavailable(
+                "Packaged PaddleOCR models are missing: " + ", ".join(missing)
+            )
         options.update(
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+            text_detection_model_dir=str(detection),
+            text_recognition_model_dir=str(recognition),
         )
-    else:
-        options.update(lang=language, ocr_version="PP-OCRv5")
+        if textline_orientation:
+            options["textline_orientation_model_dir"] = str(orientation)
     return PaddleOCR(**options)
 
 
@@ -93,6 +178,7 @@ def _plain_result(result):
 
 def _paddle_worker(connection, config):
     """Persistent child entry point. The model is initialized exactly once."""
+    configure_child_logging(config.get("_diagnostic_log_queue"))
     worker_pid = os.getpid()
     try:
         started = time.monotonic()
@@ -127,7 +213,7 @@ def _paddle_worker(connection, config):
                 continue
             _, request_id, image = message
             try:
-                usage_before = resource.getrusage(resource.RUSAGE_SELF)
+                usage_before = _process_cpu_times()
                 try:
                     import psutil
 
@@ -137,7 +223,7 @@ def _paddle_worker(connection, config):
                 started = time.monotonic()
                 results = [_plain_result(item) for item in engine.predict(input=image)]
                 inference = time.monotonic() - started
-                usage_after = resource.getrusage(resource.RUSAGE_SELF)
+                usage_after = _process_cpu_times()
                 connection.send(
                     (
                         "result",
@@ -146,8 +232,8 @@ def _paddle_worker(connection, config):
                         inference,
                         worker_pid,
                         {
-                            "cpu_user": usage_after.ru_utime - usage_before.ru_utime,
-                            "cpu_system": usage_after.ru_stime - usage_before.ru_stime,
+                            "cpu_user": usage_after[0] - usage_before[0],
+                            "cpu_system": usage_after[1] - usage_before[1],
                             "native_threads": native_threads,
                             "input_width": image.shape[1],
                             "input_height": image.shape[0],
@@ -176,6 +262,9 @@ class _PaddleWorkerClient:
 
     def __init__(self, config, timeout, *, context=None, target=None):
         self.config = dict(config)
+        log_queue = current_logging_queue()
+        if log_queue is not None:
+            self.config["_diagnostic_log_queue"] = log_queue
         self.timeout = float(timeout)
         self.context = context or multiprocessing.get_context("spawn")
         self.target = target or _paddle_worker
@@ -209,6 +298,15 @@ class _PaddleWorkerClient:
                 ) from exc
             if not process.is_alive():
                 exitcode = process.exitcode
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "ocr",
+                    "ocr_worker_exited",
+                    worker_id=process.pid,
+                    exit_code=exitcode,
+                    error_code="ocr_worker_exited",
+                )
                 self._stop(force=True)
                 raise ScreenStateError(
                     f"PaddleOCR worker stopped unexpectedly (exit code {exitcode})."
@@ -246,6 +344,15 @@ class _PaddleWorkerClient:
             raise
         if message[0] == "startup_error":
             _, pid, error_type, detail = message
+            log_event(
+                LOG,
+                logging.ERROR,
+                "ocr",
+                "ocr_worker_start_failed",
+                worker_id=pid,
+                exception_type=error_type,
+                error_code="ocr_worker_start_failed",
+            )
             self._stop(force=True)
             raise TextDetectionUnavailable(
                 f"PaddleOCR worker {pid} could not initialize: "
@@ -257,16 +364,14 @@ class _PaddleWorkerClient:
                 "PaddleOCR worker returned an invalid startup response."
             )
         _, pid, self.initialization_seconds = message
-        LOG.info(
-            "PaddleOCR worker ready pid=%d main_pid=%d model_init=%.2fs "
-            "language=%s textline_orientation=%s cpu_threads=%d rec_batch=%s",
-            pid,
-            os.getpid(),
-            self.initialization_seconds,
-            self.config["language"],
-            self.config["textline_orientation"],
-            self.config["cpu_threads"],
-            self.config.get("recognition_batch_size"),
+        log_event(
+            LOG,
+            logging.INFO,
+            "ocr",
+            "ocr_worker_ready",
+            worker_id=pid,
+            duration_ms=round(self.initialization_seconds * 1000),
+            outcome="ready",
         )
         return time.monotonic() - started
 
@@ -460,9 +565,9 @@ class _PaddleWorkerPool:
             slot["state"] = "FAILED"
             self.condition.notify_all()
 
-    def request(self, image):
+    def request(self, image, *, request_id=None):
         submitted = time.monotonic()
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         deadline = submitted + self.timeout
         with self.condition:
             if not self.accepting:
@@ -673,13 +778,14 @@ class CameraOCRScreenStateProvider:
         self,
         external_screen,
         *,
-        language="en",
+        language=None,
         timeout=30.0,
         worker_pool_size=2,
         _shared_worker=None,
     ):
         self.external_screen = external_screen
-        self.language = language
+        requested_language = language or os.environ.get("CAMERA_OCR_LANGUAGE", "en")
+        self.language = _ocr_language_profile(requested_language)[0]
         self.timeout = float(timeout)
         if self.timeout <= 0:
             raise ValueError("Camera OCR timeout must be positive.")
@@ -976,6 +1082,28 @@ class CameraOCRScreenStateProvider:
             pass
         return math.inf, math.inf, index
 
+    @staticmethod
+    def _bounds(box):
+        try:
+            values = np.asarray(box, dtype=float)
+            if values.shape == (4,):
+                left, top, right, bottom = values.tolist()
+            elif values.ndim == 2 and values.shape[1] == 2:
+                left = float(values[:, 0].min())
+                top = float(values[:, 1].min())
+                right = float(values[:, 0].max())
+                bottom = float(values[:, 1].max())
+            else:
+                return None
+            bounds = [float(left), float(top), float(right), float(bottom)]
+            if not all(math.isfinite(value) for value in bounds):
+                return None
+            if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                return None
+            return bounds
+        except (TypeError, ValueError):
+            return None
+
     @classmethod
     def _candidates_from_results(cls, results):
         candidates, position = [], 0
@@ -1003,14 +1131,18 @@ class CameraOCRScreenStateProvider:
                     confidence *= 100
                 confidence = min(confidence, 100.0)
                 box = boxes[index] if index < len(boxes) else None
+                candidate = {
+                    "text": text,
+                    "confidence": confidence,
+                    "min_confidence": confidence,
+                }
+                bounds = cls._bounds(box)
+                if bounds is not None:
+                    candidate["box"] = bounds
                 candidates.append(
                     (
                         cls._position(box, position),
-                        {
-                            "text": text,
-                            "confidence": confidence,
-                            "min_confidence": confidence,
-                        },
+                        candidate,
                     )
                 )
                 position += 1
@@ -1202,9 +1334,19 @@ class CameraOCRScreenStateProvider:
                 timings["input_height"] = prepared.shape[0]
                 self._save_debug_image(prepared)
                 request_started = time.monotonic()
+                ocr_request_id = uuid.uuid4().hex
+                log_event(
+                    LOG,
+                    logging.DEBUG,
+                    "ocr",
+                    "ocr_request_started",
+                    ocr_request_id=ocr_request_id,
+                )
                 try:
-                    results, worker_timings = self._worker.request(prepared)
-                except Exception:
+                    results, worker_timings = self._worker.request(
+                        prepared, request_id=ocr_request_id
+                    )
+                except Exception as exc:
                     # A failed recognition invalidates even an older successful
                     # screen result; the next request must ask Paddle again.
                     self._cache_by_scope.clear()
@@ -1214,10 +1356,37 @@ class CameraOCRScreenStateProvider:
                     self._record_workflow_timings(
                         timings, frame_id, False, failed=True, scope=scope
                     )
+                    try:
+                        timed_out = "timed out" in str(exc).casefold()
+                    except Exception:
+                        timed_out = False
+                    log_event(
+                        LOG,
+                        logging.WARNING if timed_out else logging.ERROR,
+                        "ocr",
+                        "ocr_timeout" if timed_out else "ocr_inference_failed",
+                        ocr_request_id=ocr_request_id,
+                        error_code=(
+                            "ocr_timeout" if timed_out else "ocr_inference_failed"
+                        ),
+                        exception_type=type(exc).__name__,
+                        duration_ms=round(timings["total"] * 1000),
+                    )
                     raise
                 worker_queue_wait = worker_timings.pop("queue_wait", 0.0)
                 timings.update(worker_timings)
                 timings["queue_wait"] = provider_queue_wait + worker_queue_wait
+                log_event(
+                    LOG,
+                    logging.DEBUG,
+                    "ocr",
+                    "ocr_request_completed",
+                    ocr_request_id=ocr_request_id,
+                    worker_id=worker_timings.get("worker_id")
+                    or worker_timings.get("worker_pid"),
+                    duration_ms=round((time.monotonic() - request_started) * 1000),
+                    outcome="completed",
+                )
                 postprocess_started = time.monotonic()
                 candidates = self._candidates_from_results(results)
                 timings["postprocess"] = time.monotonic() - postprocess_started
@@ -1268,6 +1437,23 @@ class CameraOCRScreenStateProvider:
 
     def visible_texts(self):
         return [item["text"] for item in self.visible_text_candidates()]
+
+    def visible_text_candidates_in_roi(self, roi):
+        """Recognize only an explicitly selected normalized screen region."""
+        total_started = time.monotonic()
+        snapshot, sequence, timings = self._capture_snapshot_with_timings()
+        cropped = self._crop_roi(snapshot, roi)
+        candidates = self._recognize_candidates(
+            cropped,
+            timings=timings,
+            total_started=total_started,
+            frame_id=sequence,
+            scope="roi:verify_text:" + repr(tuple(normalized_roi(roi))),
+        )
+        return candidates
+
+    def visible_texts_in_roi(self, roi):
+        return [item["text"] for item in self.visible_text_candidates_in_roi(roi)]
 
     def contains_text(self, text, *, image=None):
         expected = " ".join(text.split()).casefold()

@@ -1,5 +1,6 @@
 """Display-only observations from the dashboard's existing external camera."""
 
+import threading
 import time
 
 import cv2
@@ -7,6 +8,132 @@ import numpy as np
 
 from .stability import ScreenStabilityError
 from ..workflows.timing import record_timing
+
+
+def warp_calibrated(
+    image,
+    calibration,
+    device,
+    frame_width,
+    frame_height,
+    output_width=None,
+    output_height=1000,
+    *,
+    timings=None,
+):
+    """Apply the canonical camera-to-phone homography to one decoded frame."""
+    height, width = image.shape[:2]
+    if output_width is None:
+        device_width = getattr(device, "width", None)
+        device_height = getattr(device, "height", None)
+        if (
+            type(device_width) is int
+            and type(device_height) is int
+            and min(device_width, device_height) >= 2
+        ):
+            aspect = device_width / device_height
+        else:
+            # Pi control exposes normalized coordinates without Android pixel
+            # geometry. Estimate the phone aspect from the quadrilateral in
+            # actual camera pixels.
+            points = calibration.corners * np.array([frame_width, frame_height])
+            horizontal = (
+                np.linalg.norm(points[1] - points[0])
+                + np.linalg.norm(points[2] - points[3])
+            ) / 2
+            vertical = (
+                np.linalg.norm(points[3] - points[0])
+                + np.linalg.norm(points[2] - points[1])
+            ) / 2
+            aspect = horizontal / vertical
+        output_width = round(output_height * float(np.clip(aspect, 0.3, 2.5)))
+
+    if timings is not None:
+        timings.update(warped_width=output_width, warped_height=output_height)
+
+    matrix = (
+        np.diag([float(output_width - 1), float(output_height - 1), 1.0])
+        @ calibration.transform
+        @ np.diag([1.0 / width, 1.0 / height, 1.0])
+    )
+    warp_started = time.monotonic()
+    crop = cv2.warpPerspective(image, matrix, (output_width, output_height))
+    if timings is not None:
+        timings["warp"] = time.monotonic() - warp_started
+
+    # Preserve the established OCR/screenshot semantics by excluding the two
+    # interpolation-edge pixels around the calibrated display.
+    return crop[2 : output_height - 2, 2 : output_width - 2]
+
+
+class CalibratedPreviewCache:
+    """Encode one calibrated JPEG per logical device and source-frame identity."""
+
+    def __init__(self, output_height=1000):
+        self.output_height = output_height
+        self.lock = threading.RLock()
+        self.entries = {}
+
+    def _key(self, device_id, camera, calibration, device, frame):
+        _, sequence, frame_width, frame_height = frame
+        return (
+            device_id,
+            id(camera),
+            sequence,
+            frame_width,
+            frame_height,
+            getattr(camera, "configured_source", getattr(camera, "source", None)),
+            getattr(camera, "rotate", None),
+            getattr(device, "device_id", None),
+            getattr(device, "width", None),
+            getattr(device, "height", None),
+            self.output_height,
+            calibration.corners.tobytes(),
+            calibration.transform.tobytes(),
+        )
+
+    def encode(self, device_id, camera, calibration, device, frame):
+        """Return JPEG, sequence and output geometry without opening a camera."""
+        key = self._key(device_id, camera, calibration, device, frame)
+        with self.lock:
+            cached = self.entries.get(device_id)
+            if cached is not None and cached[0] == key:
+                return (*cached[1:], True)
+
+            jpeg, sequence, frame_width, frame_height = frame
+            try:
+                image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            except cv2.error:
+                image = None
+            if image is None:
+                raise ScreenStabilityError(
+                    "External camera frame could not be decoded."
+                )
+
+            calibrated = warp_calibrated(
+                image,
+                calibration,
+                device,
+                frame_width,
+                frame_height,
+                output_height=self.output_height,
+            )
+            try:
+                encoded, result = cv2.imencode(".jpg", calibrated)
+            except cv2.error:
+                encoded, result = False, None
+            if not encoded or result is None:
+                raise ScreenStabilityError(
+                    "Calibrated camera preview could not be encoded."
+                )
+            output = (
+                result.tobytes(),
+                sequence,
+                calibrated.shape[1],
+                calibrated.shape[0],
+            )
+            self.entries[device_id] = (key, *output)
+            return (*output, False)
 
 
 class CalibratedCamera:
@@ -154,50 +281,16 @@ class _DisplaySession:
         output_height,
         timings,
     ):
-        height, width = image.shape[:2]
-        if output_width is None:
-            device = self.signature[0]
-            device_width = getattr(device, "width", None)
-            device_height = getattr(device, "height", None)
-            if (
-                type(device_width) is int
-                and type(device_height) is int
-                and min(device_width, device_height) >= 2
-            ):
-                aspect = device_width / device_height
-            else:
-                # Pi control exposes normalized coordinates without Android
-                # pixel geometry. Estimate the phone aspect from the calibrated
-                # quadrilateral in actual camera pixels.
-                points = self.calibration.corners * np.array(
-                    [frame_width, frame_height]
-                )
-                horizontal = (
-                    np.linalg.norm(points[1] - points[0])
-                    + np.linalg.norm(points[2] - points[3])
-                ) / 2
-                vertical = (
-                    np.linalg.norm(points[3] - points[0])
-                    + np.linalg.norm(points[2] - points[1])
-                ) / 2
-                aspect = horizontal / vertical
-            output_width = round(output_height * float(np.clip(aspect, 0.3, 2.5)))
-
-        if timings is not None:
-            timings.update(warped_width=output_width, warped_height=output_height)
-
-        matrix = (
-            np.diag([float(output_width - 1), float(output_height - 1), 1.0])
-            @ self.calibration.transform
-            @ np.diag([1.0 / width, 1.0 / height, 1.0])
+        return warp_calibrated(
+            image,
+            self.calibration,
+            self.signature[0],
+            frame_width,
+            frame_height,
+            output_width,
+            output_height,
+            timings=timings,
         )
-        warp_started = time.monotonic()
-        crop = cv2.warpPerspective(image, matrix, (output_width, output_height))
-        if timings is not None:
-            timings["warp"] = time.monotonic() - warp_started
-
-        # Keep only the two interpolation-edge pixels around the calibrated display.
-        return crop[2 : output_height - 2, 2 : output_width - 2]
 
     def _capture_calibrated(
         self,

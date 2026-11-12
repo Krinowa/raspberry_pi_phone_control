@@ -1,6 +1,31 @@
 "use strict";
 
 (() => {
+  const workflowUi = (key, fallback, params) =>
+    window.PhoneI18n?.t(key, params) ?? fallback;
+  const workflowUiText = (element, key, fallback, params) => {
+    if (window.PhoneI18n?.bindText)
+      return window.PhoneI18n.bindText(element, key, params);
+    element.textContent = fallback;
+    return element;
+  };
+  const workflowUiComputed = (element, compute) => {
+    if (window.PhoneI18n?.bindComputedText)
+      return window.PhoneI18n.bindComputedText(element, compute);
+    element.textContent = compute();
+    return element;
+  };
+  const workflowLiteral = (text) =>
+    window.PhoneI18n?.translateEnglish?.(text) ?? text;
+  const workflowError = (message) =>
+    window.PhoneI18n?.translateError?.(message) ?? message;
+  const workflowBackendError = (code, params, fallback) =>
+    window.PhoneI18n?.translateBackendError?.(code, params, fallback) ??
+    fallback;
+  const workflowStatus = (status) =>
+    window.PhoneI18n?.translateStatus?.(status) ?? status;
+  const workflowLiteralText = (element, text) =>
+    workflowUiComputed(element, () => workflowLiteral(text));
   let recording = {
       active: false,
       workflow: null,
@@ -30,11 +55,23 @@
   const preview = $("workflow-preview"),
     paint = preview.getContext("2d");
   const piManual = () => state?.manual_backend === "raspberry_pi";
+  const previewCoordinateSpace = () =>
+    window.phonePreviewCoordinateSpace?.() || "camera_normalized";
+  const cameraPoint = (point) =>
+    previewCoordinateSpace() === "screen_normalized"
+      ? point
+      : (window.phonePreviewToCameraPoint?.(point) ?? point);
   let pendingManual = Promise.resolve();
   const terminal = new Set(["passed", "failed", "cancelled"]);
   const show = (message, error = false) => {
-    $("workflow-notice").textContent = message;
-    $("workflow-notice").classList.toggle("error", error);
+    const node = $("workflow-notice");
+    if (window.PhoneI18n?.bindComputedText)
+      window.PhoneI18n.bindComputedText(
+        node,
+        () => window.PhoneI18n.translateError?.(message) ?? message,
+      );
+    else node.textContent = message;
+    node.classList.toggle("error", error);
   };
 
   // Recording and review use one control pane so the phone surface remains
@@ -51,6 +88,12 @@
     try {
       await fn();
     } catch (error) {
+      if (error?.transient || Number(error?.status) >= 500)
+        window.phoneReportDiagnostic?.("frontend_workflow_command_failed", {
+          operation: "workflow_command",
+          ...(error?.errorCode ? { error_code: error.errorCode } : {}),
+          ...(error?.status ? { status: error.status } : {}),
+        });
       show(error.message, true);
     } finally {
       working = false;
@@ -60,44 +103,90 @@
 
   function describe(step, index = 0) {
     const suffix = step.label;
-    if (step.type === "tap") return `Tap${suffix ? " — " + suffix : ""}`;
+    if (step.type === "tap")
+      return `${workflowUi("workflow.step.tap", "Tap")}${suffix ? " — " + suffix : ""}`;
 
     if (step.type === "swipe") {
       const dx = step.end[0] - step.start[0],
         dy = step.end[1] - step.start[1];
-      return `Swipe ${Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "Right" : "Left") : dy > 0 ? "Down" : "Up"}${step.label ? " — " + step.label : ""}`;
+      const directionKey =
+        Math.abs(dx) > Math.abs(dy)
+          ? dx > 0
+            ? "right"
+            : "left"
+          : dy > 0
+            ? "down"
+            : "up";
+      const direction = workflowUi(
+        `workflow.direction.${directionKey}`,
+        directionKey.charAt(0).toUpperCase() + directionKey.slice(1),
+      );
+      return `${workflowUi("workflow.step.swipe", `Swipe ${direction}`, { direction })}${step.label ? " — " + step.label : ""}`;
     }
 
     if (step.type === "input") {
       const variable = recording.workflow?.variables.find(
         (v) => v.name === step.variable,
       );
-      const format =
+      const format = workflowLiteral(
         step.variable === "amount"
           ? {
               implied_cents: "Implied cents",
               whole_number: "Whole amount only",
             }[step.amount_format]
-          : null;
-      return `Type Text${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}${format ? " · " + format : ""}`;
+          : null,
+      );
+      return `${workflowUi("workflow.step.typeText", "Type Text")}${variable?.label || suffix ? " — " + (variable?.label || suffix) : ""}${format ? " · " + format : ""}`;
     }
 
     if (step.type === "wait_until_stable")
-      return `Wait for Screen to Settle — Stable for ${step.stable_ms} ms · Max ${step.timeout_seconds} sec`;
+      return workflowUi(
+        "workflow.step.waitStable",
+        `Wait for Screen to Settle — Stable for ${step.stable_ms} ms · Max ${step.timeout_seconds} sec`,
+        { stable: step.stable_ms, seconds: step.timeout_seconds },
+      );
 
     if (step.type === "wait_for_text")
-      return `Wait for Text — “${step.text}” · Wait up to ${step.timeout_seconds} sec`;
+      return workflowUi(
+        "workflow.step.waitText",
+        `Wait for Text — “${step.text}” · Wait up to ${step.timeout_seconds} sec`,
+        { text: step.text, seconds: step.timeout_seconds },
+      );
 
-    if (step.type === "if_text") return `Special Case — “${step.text}”`;
+    if (step.type === "verify_text") {
+      return workflowUi(
+        "workflow.step.verify",
+        `Verify Text — ${verifyFieldConfig(step.variable)?.label || "Configured field"}`,
+        {
+          field:
+            workflowLiteral(verifyFieldConfig(step.variable)?.label) ||
+            workflowLiteral("Configured field"),
+        },
+      );
+    }
+
+    if (step.type === "if_text")
+      return workflowUi(
+        "workflow.step.specialCase",
+        `Special Case — “${step.text}”`,
+        { text: step.text },
+      );
     if (step.type === "ocr_value")
-      return `Read Balance — ${step.label || step.output}`;
+      return workflowUi(
+        "workflow.step.readBalance",
+        `Read Balance — ${step.label || step.output}`,
+        { label: step.label || step.output },
+      );
 
     if (step.type === "capture_screen") {
       const label = typeof suffix === "string" ? suffix.trim() : "";
-      return `Capture Screenshot${label && !["screenshot", "receipt screenshot"].includes(label.toLocaleLowerCase()) ? " — " + label : ""}`;
+      return `${workflowUi("workflow.step.screenshot", "Capture Screenshot")}${label && !["screenshot", "receipt screenshot"].includes(label.toLocaleLowerCase()) ? " — " + label : ""}`;
     }
 
-    if (step.type === "wait") return `Wait ${step.seconds} seconds`;
+    if (step.type === "wait")
+      return workflowUi("workflow.step.wait", `Wait ${step.seconds} seconds`, {
+        seconds: step.seconds,
+      });
 
     if (step.type === "key")
       return (
@@ -114,7 +203,7 @@
         }[step.key.toUpperCase()] ||
         `Press ${step.key.charAt(0).toUpperCase()}${step.key.slice(1).toLowerCase().replaceAll("_", " ")}`
       );
-    return `Manual checkpoint${step.label ? " — " + step.label : ""}`;
+    return `${workflowUi("workflow.step.checkpoint", "Manual checkpoint")}${step.label ? " — " + step.label : ""}`;
   }
 
   function allWorkflowSteps(steps = recording.workflow?.steps || []) {
@@ -148,7 +237,7 @@
   function button(label, fn) {
     const element = document.createElement("button");
     element.type = "button";
-    element.textContent = label;
+    workflowLiteralText(element, label);
     element.addEventListener("click", () => task(fn));
     return element;
   }
@@ -169,6 +258,7 @@
     variableInputOpen = false,
     readValueOpen = false,
     liveWaitOpen = false,
+    liveVerifyOpen = false,
     addStepType = "wait",
     returnToVariableInput = false,
     alternateSetupOpen = false,
@@ -183,6 +273,7 @@
     variableInputOpen ||
     readValueOpen ||
     liveWaitOpen ||
+    liveVerifyOpen ||
     alternateSetupOpen;
 
   function keyboardOptions(select, captureOption = false) {
@@ -196,7 +287,9 @@
     );
 
     if (captureOption)
-      options.push(new Option("+ Capture New Keyboard", "__capture__"));
+      options.push(
+        new Option(workflowLiteral("+ Capture New Keyboard"), "__capture__"),
+      );
 
     select.replaceChildren(...options);
     return keyboards;
@@ -208,8 +301,8 @@
   }
 
   function displayKeyboardKey(key) {
-    if (key === " ") return "SPACE";
-    if (key.toLowerCase() === "backspace") return "BACKSPACE";
+    if (key === " ") return workflowLiteral("SPACE");
+    if (key.toLowerCase() === "backspace") return workflowLiteral("BACKSPACE");
     return key;
   }
 
@@ -292,9 +385,18 @@
       });
     });
 
-    $("expected-text-title").textContent = step
-      ? `Choose expected text after ${describe(step)}`
-      : "Choose expected text for the current screen";
+    workflowUiComputed($("expected-text-title"), () =>
+      step
+        ? workflowUi(
+            "workflow.chooseExpectedAfter",
+            `Choose expected text after ${describe(step)}`,
+            { step: describe(step) },
+          )
+        : workflowUi(
+            "workflow.chooseExpectedCurrent",
+            "Choose expected text for the current screen",
+          ),
+    );
 
     $("expected-text-value").value = wait?.text || "";
 
@@ -304,7 +406,10 @@
     expectedROIPicker.reset(expectedOriginalROI);
     $("expected-text-advanced").open = !!expectedOriginalROI;
     $("expected-suggestions").replaceChildren();
-    $("expected-text-status").textContent = "Reading current phone screen…";
+    workflowLiteralText(
+      $("expected-text-status"),
+      "Reading current phone screen…",
+    );
     renderRecording();
     render();
     try {
@@ -347,13 +452,18 @@
           return label;
         }),
       );
-      $("expected-text-status").textContent = choices.length
-        ? "Suggestions from the current screen. Select one or enter text manually."
-        : "No reliable text suggestions found. Enter expected text manually.";
+      workflowLiteralText(
+        $("expected-text-status"),
+        choices.length
+          ? "Suggestions from the current screen. Select one or enter text manually."
+          : "No reliable text suggestions found. Enter expected text manually.",
+      );
     } catch (error) {
       if (expectedMode === mode && expectedActionId === (step?.id || null))
-        $("expected-text-status").textContent =
-          "No reliable text suggestions found. Enter expected text manually.";
+        workflowLiteralText(
+          $("expected-text-status"),
+          "No reliable text suggestions found. Enter expected text manually.",
+        );
     }
     renderRecording();
   }
@@ -433,11 +543,15 @@
   });
 
   function renderInsertPositions(steps = recording.workflow?.steps || []) {
-    const positions = [new Option("At the beginning", "0")];
+    const positions = [new Option(workflowLiteral("At the beginning"), "0")];
     steps.forEach((step, index) =>
       positions.push(
         new Option(
-          `After ${index + 1}. ${describe(step, index)}`,
+          workflowUi(
+            "workflow.afterStep",
+            `After ${index + 1}. ${describe(step, index)}`,
+            { number: index + 1, step: describe(step, index) },
+          ),
           String(index + 1),
         ),
       ),
@@ -457,6 +571,7 @@
   const addStepSections = {
     wait: "add-step-wait",
     wait_for_text: "add-step-text",
+    verify_text: "add-step-verify",
     capture_screen: "add-step-screenshot",
     ocr_value: "add-step-value",
   };
@@ -488,6 +603,7 @@
       const focusTarget = {
         wait: "record-wait-seconds",
         wait_for_text: "record-text-value",
+        verify_text: "verify-field",
         ocr_value: "record-value-preset",
       }[addStepType];
 
@@ -530,13 +646,13 @@
           title = document.createElement("strong");
         row.dataset ||= {};
         row.dataset.stepId = step.id;
-        title.textContent = describe(step, index);
+        workflowUiComputed(title, () => describe(step, index));
         row.append(title);
 
         if (step.critical === true) {
           const warning = document.createElement("p");
           warning.className = "small";
-          warning.textContent = "Irreversible payment submission";
+          workflowLiteralText(warning, "Irreversible payment submission");
           row.append(warning);
         }
 
@@ -549,7 +665,7 @@
         if (step.preview) {
           const image = document.createElement("img");
           image.src = "data:image/png;base64," + step.preview;
-          image.alt = "Target preview before the tap";
+          image.alt = workflowLiteral("Target preview before the tap");
           image.width = 96;
           image.height = 96;
           row.append(image);
@@ -600,23 +716,27 @@
 
         const actions = document.createElement("div");
         actions.className = "flow-buttons";
-        actions.append(button("Edit", () => openEditor(step)));
+        const editButton = button("Edit", () => openEditor(step));
+        workflowUiText(editButton, "common.edit", "Edit");
+        actions.append(editButton);
 
         if (step.type === "input") {
           const value = document.createElement("p");
           value.textContent =
             step.source === "fixed"
               ? "“" + step.value + "”"
-              : "Variable: " +
-                (draft.variables.find((v) => v.name === step.variable)?.label ||
-                  "Input");
+              : workflowUi("workflow.variableValue", "Variable: {label}", {
+                  label:
+                    draft.variables.find((v) => v.name === step.variable)
+                      ?.label || workflowLiteral("Input"),
+                });
           row.append(value);
         }
-        actions.append(
-          button("Delete", () =>
-            review({ operation: "delete", step_id: step.id }),
-          ),
+        const deleteButton = button("Delete", () =>
+          review({ operation: "delete", step_id: step.id }),
         );
+        workflowUiText(deleteButton, "common.delete", "Delete");
+        actions.append(deleteButton);
 
         if (index > 0)
           actions.append(
@@ -636,7 +756,16 @@
           const next = draft.steps[index + 1];
           const wait = next?.type === "wait_for_text" ? next : null;
           const expected = document.createElement("p");
-          expected.textContent = `Expected text: ${wait?.text || "Not configured"}`;
+          workflowUiText(
+            expected,
+            "workflow.expectedText",
+            `Expected text: ${wait?.text || "Not configured"}`,
+            {
+              text:
+                wait?.text ||
+                workflowUi("common.notConfigured", "Not configured"),
+            },
+          );
           row.append(expected);
           actions.append(
             button(wait ? "Change" : "Add Expected Text", () =>
@@ -664,7 +793,21 @@
           const branches = document.createElement("div");
           branches.className = "condition-branches";
           const summary = document.createElement("p");
-          summary.textContent = `Looking for: “${step.text}” · ${step.then_steps.length} recorded ${step.then_steps.length === 1 ? "action" : "actions"} · If not shown: Continue normally`;
+          workflowUiText(
+            summary,
+            "workflow.specialSummary",
+            `Looking for: “${step.text}” · ${step.then_steps.length} recorded ${step.then_steps.length === 1 ? "action" : "actions"} · If not shown: Continue normally`,
+            () => ({
+              text: step.text,
+              count: step.then_steps.length,
+              action: workflowUi(
+                step.then_steps.length === 1
+                  ? "workflow.action.one"
+                  : "workflow.action.many",
+                step.then_steps.length === 1 ? "action" : "actions",
+              ),
+            }),
+          );
           branches.append(summary);
           const configuredBranches = [
             ["Actions when shown", "then_steps"],
@@ -676,14 +819,14 @@
             const section = document.createElement("section"),
               heading = document.createElement("h5"),
               list = document.createElement("ol");
-            heading.textContent = label;
+            workflowLiteralText(heading, label);
             list.className = "condition-step-list";
             const childRows = renderRows(step[branch], true);
             list.replaceChildren(...childRows);
             if (!childRows.length) {
               const empty = document.createElement("li");
               empty.className = "condition-empty";
-              empty.textContent = "No steps recorded";
+              workflowUiText(empty, "workflow.noSteps", "No steps recorded");
               list.append(empty);
             }
             section.append(heading, list);
@@ -741,25 +884,39 @@
         name.textContent = keyboard.name;
         const kind =
           keyboard.kind.charAt(0).toUpperCase() + keyboard.kind.slice(1);
-        detail.textContent = `${kind} · ${Object.keys(keyboard.keys).length} keys`;
+        workflowUiText(
+          detail,
+          "workflow.keyboardSummary",
+          `${kind} · ${Object.keys(keyboard.keys).length} keys`,
+          {
+            kind: workflowLiteral(kind),
+            count: Object.keys(keyboard.keys).length,
+          },
+        );
         const uses = allWorkflowSteps().filter(
           (step) =>
             step.input_method === "screen_keyboard" &&
             step.keyboard_id === keyboard.id,
         );
-        usage.textContent = uses.length
-          ? `Used by: ${uses
-              .map((step) =>
-                step.source === "variable" && step.variable
-                  ? `Input {{${step.variable}}}`
-                  : "input step",
-              )
-              .join(", ")}`
-          : "Unused";
+        if (uses.length) {
+          const usageItems = uses
+            .map((step) =>
+              step.source === "variable" && step.variable
+                ? `${workflowLiteral("Input")} {{${step.variable}}}`
+                : workflowLiteral("input step"),
+            )
+            .join(", ");
+          workflowUiText(
+            usage,
+            "workflow.keyboardUsedBy",
+            `Used by: ${usageItems}`,
+            { uses: usageItems },
+          );
+        } else workflowLiteralText(usage, "Unused");
         remove.disabled =
           referenced.has(keyboard.id) || annotationBusy() || working;
         if (referenced.has(keyboard.id)) {
-          remove.textContent = "In Use";
+          workflowLiteralText(remove, "In Use");
           remove.title = usage.textContent;
         }
         info.append(name, detail, usage);
@@ -826,7 +983,20 @@
 
     $("record-wait-live-slot").hidden = !live || !liveWaitOpen;
     waitControls.hidden = live && !liveWaitOpen;
-    $("record-wait").textContent = live ? "Add Wait" : "Insert Wait";
+    workflowLiteralText($("record-wait"), live ? "Add Wait" : "Insert Wait");
+
+    const verifyControls = $("record-verify-controls");
+    const verifySlot = live
+      ? $("record-verify-live-slot")
+      : $("record-verify-review-slot");
+    if (verifyControls.parentElement !== verifySlot)
+      verifySlot.append(verifyControls);
+    $("record-verify-live-slot").hidden = !live || !liveVerifyOpen;
+    verifyControls.hidden = live && !liveVerifyOpen;
+    workflowLiteralText(
+      $("verify-add"),
+      live ? "Add Verification" : "Insert Step",
+    );
 
     if (!live) renderAddStepType();
 
@@ -844,17 +1014,38 @@
       timelineSlot.append($("record-timeline"));
     }
 
-    $("record-status").textContent = stopping
-      ? "Finishing recording…"
-      : recording.alternate_screen
-        ? "● Recording Special Case"
-        : `● Recording • ${draft?.steps.length || 0} ${
-            draft?.steps.length === 1 ? "step" : "steps"
-          }`;
+    if (stopping)
+      workflowLiteralText($("record-status"), "Finishing recording…");
+    else if (recording.alternate_screen)
+      workflowLiteralText($("record-status"), "● Recording Special Case");
+    else
+      workflowUiText(
+        $("record-status"),
+        "workflow.recordingCount",
+        `● Recording • ${draft?.steps.length || 0} ${draft?.steps.length === 1 ? "step" : "steps"}`,
+        {
+          count: draft?.steps.length || 0,
+          step: workflowUi(
+            draft?.steps.length === 1
+              ? "workflow.step.one"
+              : "workflow.step.many",
+            draft?.steps.length === 1 ? "step" : "steps",
+          ),
+        },
+      );
 
-    $("record-count").textContent = recording.alternate_screen
-      ? `Looking for: “${recording.alternate_screen.text}”`
-      : "Taps, swipes and typing appear below.";
+    if (recording.alternate_screen)
+      workflowUiText(
+        $("record-count"),
+        "workflow.lookingFor",
+        `Looking for: “${recording.alternate_screen.text}”`,
+        { text: recording.alternate_screen.text },
+      );
+    else
+      workflowLiteralText(
+        $("record-count"),
+        "Taps, swipes and typing appear below.",
+      );
 
     $("record-start").disabled = working || !!draft;
 
@@ -864,6 +1055,7 @@
     $("record-expect-current").disabled = stopping || annotationBusy();
     $("record-read-value").disabled = stopping || annotationBusy();
     $("record-wait-here").disabled = stopping || annotationBusy();
+    $("record-verify-text-here").disabled = stopping || annotationBusy();
     $("record-capture-keyboard").disabled = stopping || annotationBusy();
     $("review-capture-keyboard").disabled = annotationBusy();
     $("record-input-variable").disabled = stopping || annotationBusy();
@@ -874,9 +1066,23 @@
     $("alternate-screen-active").hidden = !recording.alternate_screen;
     $("alternate-screen-finish").disabled = stopping || annotationBusy();
     $("alternate-screen-cancel").disabled = stopping || annotationBusy();
-    $("alternate-screen-status").textContent = recording.alternate_screen
-      ? `Looking for: “${recording.alternate_screen.text}” · ${recording.alternate_screen.step_count} recorded ${recording.alternate_screen.step_count === 1 ? "action" : "actions"}`
-      : "";
+    if (recording.alternate_screen)
+      workflowUiText(
+        $("alternate-screen-status"),
+        "workflow.specialActive",
+        `Looking for: “${recording.alternate_screen.text}” · ${recording.alternate_screen.step_count} recorded ${recording.alternate_screen.step_count === 1 ? "action" : "actions"}`,
+        {
+          text: recording.alternate_screen.text,
+          count: recording.alternate_screen.step_count,
+          action: workflowUi(
+            recording.alternate_screen.step_count === 1
+              ? "workflow.action.one"
+              : "workflow.action.many",
+            recording.alternate_screen.step_count === 1 ? "action" : "actions",
+          ),
+        },
+      );
+    else $("alternate-screen-status").textContent = "";
     $("record-screenshot-here").disabled =
       working || stopping || annotationBusy();
     $("record-variable-input").hidden = !variableInputOpen;
@@ -889,9 +1095,10 @@
       working ||
       sharedPhysicalBusy ||
       !!window.phoneConnection?.isReconnecting?.();
-    $("record-variable-type").textContent = sharedPhysicalBusy
-      ? "Typing now..."
-      : "Add & Type Now";
+    workflowLiteralText(
+      $("record-variable-type"),
+      sharedPhysicalBusy ? "Typing now..." : "Add & Type Now",
+    );
     $("keyboard-capture").hidden =
       !keyboardSetupOpen && !recording.keyboard_capture;
 
@@ -909,14 +1116,21 @@
       overlay.hidden = false;
       overlayKey.textContent = label;
 
-      $("keyboard-capture-instruction").textContent =
-        `Tap ${label} on the phone preview.`;
+      workflowUiText(
+        $("keyboard-capture-instruction"),
+        "workflow.captureInstruction",
+        `Tap ${label} on the phone preview.`,
+        { key: label },
+      );
     } else {
       overlay.hidden = true;
 
-      $("keyboard-capture-instruction").textContent = recording.keyboard_capture
-        ? "All selected keys are captured. Save the keyboard or cancel."
-        : "Choose keys, then start capture.";
+      workflowLiteralText(
+        $("keyboard-capture-instruction"),
+        recording.keyboard_capture
+          ? "All selected keys are captured. Save the keyboard or cancel."
+          : "Choose keys, then start capture.",
+      );
     }
 
     $("keyboard-capture-start").hidden = !!recording.keyboard_capture;
@@ -934,13 +1148,15 @@
 
     $("record-save").disabled = working || !draft?.steps.length || live;
 
-    $("record-save").textContent = editingExisting
-      ? "Save Changes"
-      : "Save Workflow";
+    workflowLiteralText(
+      $("record-save"),
+      editingExisting ? "Save Changes" : "Save Workflow",
+    );
 
-    $("record-cancel").textContent = editingExisting
-      ? "Cancel Editing"
-      : "Discard Recording";
+    workflowLiteralText(
+      $("record-cancel"),
+      editingExisting ? "Cancel Editing" : "Discard Recording",
+    );
 
     renderDeviceAvailability();
 
@@ -953,17 +1169,22 @@
     const reviewTitle = $("review-flow")?.querySelector("h3");
 
     if (reviewTitle) {
-      reviewTitle.textContent = editingExisting
-        ? "Edit Workflow"
-        : "Review Recording";
+      workflowLiteralText(
+        reviewTitle,
+        editingExisting ? "Edit Workflow" : "Review Recording",
+      );
     }
 
     if (draft && !live && editingExisting) {
-      $("record-empty").textContent =
-        "This workflow has no steps. Add or edit steps, then save your changes.";
+      workflowLiteralText(
+        $("record-empty"),
+        "This workflow has no steps. Add or edit steps, then save your changes.",
+      );
     } else {
-      $("record-empty").textContent =
-        "No steps recorded yet. Use the phone preview to record taps, swipes, typing and navigation.";
+      workflowLiteralText(
+        $("record-empty"),
+        "No steps recorded yet. Use the phone preview to record taps, swipes, typing and navigation.",
+      );
     }
 
     renderTimeline();
@@ -999,7 +1220,12 @@
   }
 
   function variableChoiceFields(selectId, customFieldId, customId, name) {
-    const predefined = ["account_number", "amount", "bank_name"];
+    const predefined = [
+      "account_number",
+      "account_name",
+      "amount",
+      "bank_name",
+    ];
     if (name === "__custom__") {
       $(selectId).value = name;
       $(customFieldId).hidden = false;
@@ -1043,6 +1269,7 @@
       "step-text-options",
       ["wait_for_text", "if_text"].includes(step.type),
     );
+    setSectionVisible("step-verify-options", step.type === "verify_text");
 
     $("step-stable-ms").value = step.stable_ms ?? 700;
     $("step-stable-timeout").value = step.timeout_seconds ?? 10;
@@ -1052,6 +1279,13 @@
 
     stepROIPicker.reset(step.roi);
     $("step-text-advanced").open = !!step.roi;
+
+    if (step.type === "verify_text") {
+      $("step-verify-field").value = verifyFieldConfig(step.variable)
+        ? step.variable
+        : "account_name";
+      stepVerifyROIPicker.reset(step.roi);
+    }
 
     // Tap
     if (step.type === "tap") {
@@ -1089,7 +1323,9 @@
       step.source === "fixed"
     ) {
       $("input-value").value = "";
-      $("input-value").placeholder = "Leave blank to keep existing value";
+      $("input-value").placeholder = workflowLiteral(
+        "Leave blank to keep existing value",
+      );
     } else {
       $("input-value").value = step.value ?? definition?.default ?? "";
       $("input-value").placeholder = "";
@@ -1300,6 +1536,14 @@
         });
       }
 
+      if (old.type === "verify_text") {
+        await review({
+          operation: "fields",
+          step_id,
+          fields: verifyTextFields("step-verify", stepVerifyROIPicker, old.roi),
+        });
+      }
+
       if (old.type === "wait") {
         if (!Number.isFinite(seconds) || seconds < 0 || seconds > 3600) {
           throw new Error("Wait duration must be between 0 and 3600 seconds.");
@@ -1357,6 +1601,14 @@
     const template = $("region-ocr-template");
     if (!template?.content) return;
     const fragment = template.content.cloneNode(true);
+    for (const label of fragment.querySelectorAll("[data-roi-i18n]")) {
+      workflowUiText(
+        label,
+        label.dataset.roiI18n,
+        label.textContent.trim().replace(/\s+/g, " "),
+      );
+      label.removeAttribute("data-roi-i18n");
+    }
     for (const control of fragment.querySelectorAll("[data-roi-control]")) {
       control.id = `${prefix}-roi-${control.dataset.roiControl}`;
       control.removeAttribute("data-roi-control");
@@ -1407,16 +1659,29 @@
       });
     }
 
+    function valueSummary() {
+      if (!hasValues()) return workflowLiteral("No OCR region selected.");
+      return roiKeys
+        .map((key) => {
+          const label =
+            key === "width"
+              ? workflowUi("workflow.roi.width", "Width")
+              : key === "height"
+                ? workflowUi("workflow.roi.height", "Height")
+                : key.toUpperCase();
+          return `${label}: ${read(false)[key].toFixed(4)}`;
+        })
+        .join(" · ");
+    }
+
     function draw() {
-      const roi = read(false);
-      $(`${prefix}-roi-values`).textContent = hasValues()
-        ? roiKeys.map((key) => `${key}: ${roi[key].toFixed(4)}`).join(" · ")
-        : "No OCR region selected.";
+      $(`${prefix}-roi-values`).textContent = valueSummary();
       $(`${prefix}-roi-result`).textContent = "";
       if (!image) return;
       const context = canvas.getContext("2d");
       context.drawImage(image, 0, 0);
       if (!hasValues()) return;
+      const roi = read(false);
       context.strokeStyle = "#ff3b30";
       context.lineWidth = Math.max(2, canvas.width / 200);
       context.strokeRect(
@@ -1426,6 +1691,8 @@
         roi.height * canvas.height,
       );
     }
+
+    workflowUiComputed($(`${prefix}-roi-values`), valueSummary);
 
     function reset(roi) {
       generation++;
@@ -1505,8 +1772,14 @@
       canvas.addEventListener(name, () => {
         start = null;
       });
-    $(`${prefix}-roi-test`).addEventListener("click", () =>
+    const testButton = $(`${prefix}-roi-test`);
+    if (!parser && !textPrefix) {
+      testButton.hidden = true;
+      testButton.disabled = true;
+    }
+    testButton.addEventListener("click", () =>
       task(async () => {
+        if (!parser && !textPrefix) return;
         if (!token) throw new Error("Select an OCR region snapshot first.");
         const testedGeneration = generation;
         const text = parser ? "" : $(`${textPrefix}-text-value`).value.trim();
@@ -1518,10 +1791,23 @@
         });
         if (testedGeneration !== generation) return;
         $(`${prefix}-roi-result`).textContent = parser
-          ? `Read Balance: ${result.value}`
+          ? workflowUi("workflow.readResult", `Read Balance: ${result.value}`, {
+              value: result.value,
+            })
           : result.found
-            ? `Target detected in selected snapshot crop · ${result.texts.join(" | ")}`
-            : `Target not detected in selected snapshot crop · ${result.texts.join(" | ") || "No text read"}`;
+            ? workflowUi(
+                "workflow.targetDetected",
+                `Target detected in selected snapshot crop · ${result.texts.join(" | ")}`,
+                { texts: result.texts.join(" | ") },
+              )
+            : workflowUi(
+                "workflow.targetNotDetected",
+                `Target not detected in selected snapshot crop · ${result.texts.join(" | ") || "No text read"}`,
+                {
+                  texts:
+                    result.texts.join(" | ") || workflowLiteral("No text read"),
+                },
+              );
       }),
     );
 
@@ -1529,7 +1815,9 @@
   }
 
   const stepROIPicker = createRegionOCRPicker("step", "step");
+  const stepVerifyROIPicker = createRegionOCRPicker("step-verify", null);
   const recordROIPicker = createRegionOCRPicker("record", "record");
+  const verifyROIPicker = createRegionOCRPicker("verify", null);
   const conditionROIPicker = createRegionOCRPicker("condition", "condition");
   const expectedROIPicker = createRegionOCRPicker("expected", "expected");
   const valueROIPicker = createRegionOCRPicker("value", null, "currency");
@@ -1546,7 +1834,39 @@
   liveValueROIPicker.reset(null);
   recordValueROIPicker.reset(null);
   recordROIPicker.reset(null);
+  verifyROIPicker.reset(null);
   conditionROIPicker.reset(null);
+
+  const VERIFY_FIELDS = Object.freeze({
+    account_name: Object.freeze({
+      label: "Account Name",
+      match_mode: "account_name",
+    }),
+    account_number: Object.freeze({
+      label: "Account Number",
+      match_mode: "account_number",
+    }),
+    bank_name: Object.freeze({ label: "Bank Name", match_mode: "contains" }),
+    amount: Object.freeze({ label: "Amount", match_mode: "amount" }),
+  });
+
+  function verifyFieldConfig(variable) {
+    return VERIFY_FIELDS[variable] || null;
+  }
+
+  function verifyTextFields(prefix, picker, existingROI = null) {
+    const variable = $(`${prefix}-field`).value;
+    const config = verifyFieldConfig(variable);
+    if (!config) throw new Error("Choose a field to verify.");
+    const fields = {
+      source: "variable",
+      variable,
+      match_mode: config.match_mode,
+      timeout_seconds: 5,
+    };
+    Object.assign(fields, picker.fields(existingROI));
+    return fields;
+  }
 
   function textWaitFields(prefix) {
     const text = $(`${prefix}-text-value`).value.trim();
@@ -1595,6 +1915,37 @@
       $("record-text-advanced").open = false;
     }),
   );
+
+  $("verify-add").addEventListener("click", () =>
+    task(async () => {
+      const step = {
+        type: "verify_text",
+        ...verifyTextFields("verify", verifyROIPicker),
+      };
+      step.label = `Verify ${verifyFieldConfig(step.variable).label}`;
+      if (recording.active) {
+        await pendingManual;
+        await captureQueue;
+        recording = await api("/api/recorder/step", {
+          capture: false,
+          step,
+        });
+        liveVerifyOpen = false;
+        show("Text verification added. Recording continues.");
+      } else {
+        await review(insertionPayload(step));
+        closeAddStep();
+      }
+      verifyROIPicker.reset(null);
+    }),
+  );
+
+  $("verify-cancel").addEventListener("click", () => {
+    if (recording.active) {
+      liveVerifyOpen = false;
+      renderRecording();
+    } else closeAddStep();
+  });
 
   $("record-wait").addEventListener("click", () =>
     task(async () => {
@@ -1772,8 +2123,9 @@
 
       recording.active = false;
       show(
-        error.message +
-          " Recording stopped; inspect the phone before continuing.",
+        `${error.message} ${workflowLiteral(
+          "Recording stopped; inspect the phone before continuing.",
+        )}`,
         true,
       );
     }
@@ -1844,12 +2196,19 @@
     textTimer = setTimeout(flushText, 400);
   }
 
-  function naturalAction(action, point) {
+  function naturalAction(
+    action,
+    point,
+    coordinateSpace = previewCoordinateSpace(),
+  ) {
     if (!recording.active || stopping || annotationBusy()) return;
     flushText();
 
     if (action === "tap")
-      return enqueue({ type: "tap" }, { camera_start: point });
+      return enqueue(
+        { type: "tap" },
+        { camera_start: point, coordinate_space: coordinateSpace },
+      );
 
     const swipes = {
       swipe_up: [0.5, 0.75, 0.5, 0.25],
@@ -2040,6 +2399,18 @@
     }),
   );
 
+  $("record-verify-text-here").addEventListener("click", () =>
+    task(async () => {
+      if (!recording.active || stopping || annotationBusy()) return;
+      await pendingManual;
+      await flushText();
+      await captureQueue;
+      liveVerifyOpen = true;
+      renderRecording();
+      requestAnimationFrame(() => $("verify-field").focus());
+    }),
+  );
+
   $("record-screenshot-here").addEventListener("click", () =>
     task(async () => {
       if (!recording.active || stopping || annotationBusy()) return;
@@ -2104,8 +2475,10 @@
     returnToVariableInput = true;
     variableInputOpen = false;
     keyboardSetupOpen = true;
-    $("keyboard-capture-instruction").textContent =
-      "Choose keys, then start capture.";
+    workflowLiteralText(
+      $("keyboard-capture-instruction"),
+      "Choose keys, then start capture.",
+    );
     keyboardCaptureKindFields();
     renderRecording();
   });
@@ -2162,7 +2535,9 @@
         : await request();
     } catch (error) {
       if (typeNow && error.transient)
-        error.message = `${error.message} Typing result uncertain; it was not retried automatically.`;
+        error.message = `${error.message} ${workflowLiteral(
+          "Typing result uncertain; it was not retried automatically.",
+        )}`;
       throw error;
     }
     variableInputOpen = false;
@@ -2187,8 +2562,10 @@
 
   function openKeyboardCapture() {
     keyboardSetupOpen = true;
-    $("keyboard-capture-instruction").textContent =
-      "Choose keys, then start capture.";
+    workflowLiteralText(
+      $("keyboard-capture-instruction"),
+      "Choose keys, then start capture.",
+    );
     keyboardCaptureKindFields();
     renderRecording();
     render();
@@ -2538,8 +2915,9 @@
       const step = swipe ? { type: "swipe", duration_ms } : { type: "tap" };
       const extra = camera
         ? {
-            camera_start: saved.start,
-            ...(swipe ? { camera_end: end } : {}),
+            camera_start: cameraPoint(swipe ? saved.start : end),
+            ...(swipe ? { camera_end: cameraPoint(end) } : {}),
+            coordinate_space: previewCoordinateSpace(),
             frame_id: frameId,
           }
         : {};
@@ -2578,7 +2956,13 @@
       task(async () => {
         recording = await api("/api/recorder/keyboard-capture/key", {
           key,
-          ...(camera ? { camera_point: point, frame_id: frameId } : { point }),
+          ...(camera
+            ? {
+                camera_point: cameraPoint(point),
+                coordinate_space: previewCoordinateSpace(),
+                frame_id: frameId,
+              }
+            : { point }),
         });
       });
     });
@@ -2650,8 +3034,9 @@
       keyboardSetupOpen = false;
       closeExpectedText();
       show(
-        error.message +
-          " Recording stopped. Input may already have occurred; inspect the phone before continuing. No retry attempted.",
+        `${error.message} ${workflowLiteral(
+          "Recording stopped. Input may already have occurred; inspect the phone before continuing. No retry attempted.",
+        )}`,
         true,
       );
       renderRecording();
@@ -2663,8 +3048,9 @@
       }
       recording.active = false;
       show(
-        error.message +
-          " Recording stopped. Input may already have occurred; inspect the phone before continuing. No retry attempted.",
+        `${error.message} ${workflowLiteral(
+          "Recording stopped. Input may already have occurred; inspect the phone before continuing. No retry attempted.",
+        )}`,
         true,
       );
       renderRecording();
@@ -2718,11 +3104,18 @@
     if (selected && !unrestricted && !allowedIds.has(selected.id)) {
       selected = null;
       $("run-variables").replaceChildren();
-      $("run-title").textContent = "Run Flow";
+      workflowUiText($("run-title"), "workflow.run", "Run Flow");
     }
 
     $("workflow-backend").textContent =
-      `Input: ${backend} · Screen: ${result.screen_backend}` +
+      workflowUi(
+        "workflow.backendSummary",
+        `Input: ${backend} · Screen: ${result.screen_backend}`,
+        {
+          input: backend,
+          screen: result.screen_backend,
+        },
+      ) +
       (result.selected_device_id
         ? unrestricted
           ? ` · ${result.selected_device_id}: legacy unrestricted`
@@ -2733,27 +3126,48 @@
       const row = document.createElement("li");
       const label = document.createElement("span");
 
-      label.textContent =
-        `${flow.name} · ` +
-        `${flow.purpose === "balance_check" ? "Balance Check" : "Payment"} · ` +
-        `${flow.step_count} steps · ` +
-        `${flow.variable_count} variables · ` +
-        `Created ${
-          flow.created_at ? new Date(flow.created_at).toLocaleString() : "—"
-        } · ` +
-        `Updated ${
-          flow.updated_at ? new Date(flow.updated_at).toLocaleString() : "—"
-        }`;
+      workflowUiComputed(label, () => {
+        const purpose =
+          flow.purpose === "balance_check"
+            ? workflowUi("balance.check", "Balance Check")
+            : workflowUi("ui.payment", "Payment");
+        const created = flow.created_at
+          ? new Date(flow.created_at).toLocaleString()
+          : "—";
+        const updated = flow.updated_at
+          ? new Date(flow.updated_at).toLocaleString()
+          : "—";
+        return workflowUi(
+          "workflow.flowSummary",
+          `${flow.name} · ${purpose} · ${flow.step_count} steps · ${flow.variable_count} variables · Created ${created} · Updated ${updated}`,
+          {
+            name: flow.name,
+            purpose,
+            steps: flow.step_count,
+            variables: flow.variable_count,
+            created,
+            updated,
+          },
+        );
+      });
 
       // Run workflow
       // Visible in BOTH Operate and Admin.
       // Reuses the existing workflow selection / execution flow.
       const select = document.createElement("button");
       select.type = "button";
-      select.textContent = "Run…";
+      workflowUiText(select, "workflow.runAction", "Run…");
       select.disabled = !unrestricted && !allowedIds.has(flow.id);
       if (select.disabled)
-        select.title = `Not assigned to ${result.selected_device_id || "the selected phone"}`;
+        select.title = workflowUi(
+          "workflow.notAssignedTo",
+          `Not assigned to ${result.selected_device_id || "the selected phone"}`,
+          {
+            device:
+              result.selected_device_id ||
+              workflowLiteral("the selected phone"),
+          },
+        );
 
       select.addEventListener("click", () => task(() => selectFlow(flow.id)));
 
@@ -2762,7 +3176,7 @@
       const edit = document.createElement("button");
       edit.type = "button";
       edit.className = "admin-only";
-      edit.textContent = "Edit";
+      workflowUiText(edit, "common.edit", "Edit");
 
       edit.addEventListener("click", () =>
         task(async () => {
@@ -2774,7 +3188,13 @@
           timelineSignature = "";
           editingId = null;
 
-          show(`Editing “${recording.workflow.name}”`);
+          show(
+            workflowUi(
+              "workflow.editing",
+              `Editing “${recording.workflow.name}”`,
+              { name: recording.workflow.name },
+            ),
+          );
 
           renderRecording();
 
@@ -2790,11 +3210,19 @@
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "admin-only stop";
-      remove.textContent = "Delete";
+      workflowUiText(remove, "common.delete", "Delete");
 
       remove.addEventListener("click", () =>
         task(async () => {
-          if (!window.confirm(`Delete workflow “${flow.name}”?`)) {
+          if (
+            !window.confirm(
+              workflowUi(
+                "workflow.deleteConfirm",
+                `Delete workflow “${flow.name}”?`,
+                { name: flow.name },
+              ),
+            )
+          ) {
             return;
           }
 
@@ -2806,7 +3234,7 @@
             selected = null;
 
             $("run-variables").replaceChildren();
-            $("run-title").textContent = "Run Flow";
+            workflowUiText($("run-title"), "workflow.run", "Run Flow");
           }
 
           await loadFlows();
@@ -2823,7 +3251,12 @@
 
   async function selectFlow(id) {
     selected = await api("/api/workflows/" + id, undefined, "GET");
-    $("run-title").textContent = "Run: " + selected.name;
+    workflowUiText(
+      $("run-title"),
+      "workflow.runNamed",
+      "Run: " + selected.name,
+      { name: selected.name },
+    );
     const fields = selected.variables
       .filter((variable) => variable.required && variable.default == null)
       .map((variable) => {
@@ -2893,7 +3326,7 @@
     paint.fillStyle = "#e0ffed";
     paint.lineWidth = 4;
     paint.font = "14px sans-serif";
-    paint.fillText("Phone preview", 16, 28);
+    paint.fillText(workflowLiteral("Phone preview"), 16, 28);
     if (!step) return;
     if (step.type === "tap") {
       paint.beginPath();
@@ -2945,8 +3378,32 @@
       window.phoneRuntimeStateChanged?.(running);
       if (terminal.has(running.status)) void window.refreshDeviceReadiness?.();
     }
-    $("flow-run-state").textContent =
-      `${running.status} · Step ${running.step_index || 0}/${running.step_count || 0} · ${running.preview ? describe(running.preview, (running.step_index || 1) - 1) : "Starting"}${running.checkpoint_message ? " — " + running.checkpoint_message : ""}${terminal.has(running.status) ? " — " + (running.message || "") : ""}`;
+    workflowUiComputed($("flow-run-state"), () => {
+      const detail = `${
+        running.preview
+          ? describe(running.preview, (running.step_index || 1) - 1)
+          : workflowUi("common.starting", "Starting")
+      }${running.checkpoint_message ? " — " + workflowError(running.checkpoint_message) : ""}${
+        terminal.has(running.status)
+          ? " — " +
+            workflowBackendError(
+              running.error_code,
+              running.error_params,
+              running.message || "",
+            )
+          : ""
+      }`;
+      return workflowUi(
+        "workflow.runState",
+        `${workflowStatus(running.status)} · Step ${running.step_index || 0}/${running.step_count || 0} · ${detail}`,
+        {
+          status: workflowStatus(running.status),
+          current: running.step_index || 0,
+          total: running.step_count || 0,
+          detail,
+        },
+      );
+    });
     $("flow-resume").hidden = running.status !== "waiting_manual";
     $("flow-cancel").disabled = terminal.has(running.status);
     $("workflow-logs").textContent = (running.logs || []).join("\n");
@@ -2956,6 +3413,11 @@
     drawPreview(running.preview);
     renderRecording();
   }
+
+  window.addEventListener?.("phonecontroller:languagechange", () => {
+    renderRecording();
+    if (running) renderRun();
+  });
 
   function scheduleRunPoll(delay = 500) {
     if (

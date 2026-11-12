@@ -14,6 +14,7 @@ import time
 
 import cv2
 
+from ..coordinates import normalized_roi
 from .state import ScreenStateError, TextDetectionUnavailable
 
 LOG = logging.getLogger("camera_ocr")
@@ -233,13 +234,13 @@ class CameraOCRScreenStateProvider:
         )
         LOG.log(
             logging.INFO if self.debug_logging else logging.DEBUG,
-            "OCR mode=%s scale=%.2fx psm=%d duration=%.3fs confidence=%s text=%r",
+            "OCR mode=%s scale=%.2fx psm=%d duration=%.3fs confidence=%s lines=%d",
             mode,
             scale,
             psm,
             duration,
             "n/a" if confidence is None else f"{confidence:.1f}",
-            " | ".join(texts)[:800],
+            len(texts),
         )
 
     def _recognize_image(
@@ -294,6 +295,7 @@ class CameraOCRScreenStateProvider:
                 stderr=subprocess.PIPE,
                 timeout=self.timeout,
                 check=False,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
         except subprocess.TimeoutExpired as exc:
             raise ScreenStateError(
@@ -341,9 +343,20 @@ class CameraOCRScreenStateProvider:
                     continue
                 if not math.isfinite(confidence) or confidence < 0:
                     continue
-                group = groups.setdefault(key, {"words": [], "confidences": []})
+                group = groups.setdefault(
+                    key, {"words": [], "confidences": [], "boxes": []}
+                )
                 group["words"].append(text)
                 group["confidences"].append(confidence)
+                try:
+                    left = int(row["left"])
+                    top = int(row["top"])
+                    width = int(row["width"])
+                    height = int(row["height"])
+                    if width > 0 and height > 0:
+                        group["boxes"].append([left, top, left + width, top + height])
+                except (TypeError, ValueError, KeyError):
+                    pass
         except csv.Error:
             return []
         result = []
@@ -351,13 +364,19 @@ class CameraOCRScreenStateProvider:
             if not group["words"]:
                 continue
             confidences = group["confidences"]
-            result.append(
-                {
-                    "text": " ".join(group["words"]),
-                    "confidence": sum(confidences) / len(confidences),
-                    "min_confidence": min(confidences),
-                }
-            )
+            candidate = {
+                "text": " ".join(group["words"]),
+                "confidence": sum(confidences) / len(confidences),
+                "min_confidence": min(confidences),
+            }
+            if group["boxes"]:
+                candidate["box"] = [
+                    min(box[0] for box in group["boxes"]),
+                    min(box[1] for box in group["boxes"]),
+                    max(box[2] for box in group["boxes"]),
+                    max(box[3] for box in group["boxes"]),
+                ]
+            result.append(candidate)
         return result
 
     @staticmethod
@@ -520,6 +539,37 @@ class CameraOCRScreenStateProvider:
 
     def visible_texts(self):
         return [candidate["text"] for candidate in self.visible_text_candidates()]
+
+    @staticmethod
+    def _crop_roi(image, roi):
+        x, y, width, height = normalized_roi(roi)
+        image_height, image_width = image.shape[:2]
+        left = min(image_width - 1, max(0, int(math.floor(x * image_width))))
+        top = min(image_height - 1, max(0, int(math.floor(y * image_height))))
+        right = min(
+            image_width,
+            max(left + 1, int(math.ceil((x + width) * image_width))),
+        )
+        bottom = min(
+            image_height,
+            max(top + 1, int(math.ceil((y + height) * image_height))),
+        )
+        return image[top:bottom, left:right]
+
+    def visible_text_candidates_in_roi(self, roi):
+        snapshot = self.capture_snapshot()
+        cropped = self._crop_roi(snapshot, roi)
+        self._run_debug_sweep(cropped)
+        primary = self._default_candidates(cropped)
+        if not self._needs_fallback(primary):
+            return primary
+        fallback = self._fallback_candidates(cropped)
+        return self._merge_candidates(primary, fallback)
+
+    def visible_texts_in_roi(self, roi):
+        return [
+            candidate["text"] for candidate in self.visible_text_candidates_in_roi(roi)
+        ]
 
     @staticmethod
     def _contains(candidates, expected):

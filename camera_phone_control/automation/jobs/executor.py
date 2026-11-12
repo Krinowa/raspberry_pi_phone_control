@@ -13,6 +13,7 @@ from copy import deepcopy
 
 
 from automation.workflows.validation import validate_recovery_workflow
+from diagnostic_logging import log_event
 
 
 from .models import PENDING_JOB_STATES
@@ -106,9 +107,17 @@ class BackgroundJobExecutor:
 
                 self._dispatch()
 
-            except Exception:
+            except Exception as exc:
 
-                LOG.exception("Persistent job dispatch failed; it will be retried.")
+                log_event(
+                    LOG,
+                    logging.WARNING,
+                    "jobs",
+                    "job_dispatch_failed",
+                    error_code="job_dispatch_failed",
+                    exception_type=type(exc).__name__,
+                    outcome="retrying",
+                )
 
     def _dispatch(self):
 
@@ -205,6 +214,20 @@ class BackgroundJobExecutor:
                     outputs=snapshot.get("outputs", {}),
                 )
 
+            elif snapshot.get("remote_takeover") and (
+                status == "cancelled"
+                # Started after the takeover: the remote lock refused it before
+                # any input was sent.
+                or str(snapshot.get("message", "")).startswith("Device busy")
+            ):
+
+                takeover = snapshot["remote_takeover"]
+                self.scheduler.interrupt_job(
+                    job.job_id,
+                    "Interrupted by remote takeover: user {user_id}, session "
+                    "{session_id}, at {at}. Reason: {reason}".format(**takeover),
+                )
+
             elif status == "cancelled":
 
                 self.scheduler.finish_cancelled(
@@ -260,15 +283,35 @@ class BackgroundJobExecutor:
                     failed_step_type=failed_step_type,
                 )
 
-        except (RecordConflict, RecordNotFound):
+        except (RecordConflict, RecordNotFound) as exc:
 
-            LOG.exception(
-                "Persistent job state changed unexpectedly for %s", job.job_id
+            log_event(
+                LOG,
+                logging.ERROR,
+                "jobs",
+                "job_state_conflict",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=job.workflow,
+                error_code="job_state_conflict",
+                exception_type=type(exc).__name__,
+                outcome="failed",
             )
 
-        except Exception:
+        except Exception as exc:
 
-            LOG.exception("Background workflow failed to start for %s", job.job_id)
+            log_event(
+                LOG,
+                logging.ERROR,
+                "workflow",
+                "workflow_failed",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=job.workflow,
+                error_code="workflow_start_failed",
+                exception_type=type(exc).__name__,
+                outcome="failed",
+            )
 
             try:
 
@@ -455,13 +498,35 @@ class BackgroundJobExecutor:
                     screenshots=snapshot.get("screenshots", []),
                 )
 
-        except (RecordConflict, RecordNotFound):
+        except (RecordConflict, RecordNotFound) as exc:
 
-            LOG.exception("Recovery state changed unexpectedly for %s", job.job_id)
+            log_event(
+                LOG,
+                logging.ERROR,
+                "workflow",
+                "reconciliation_required",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=workflow.get("id"),
+                error_code="recovery_state_conflict",
+                exception_type=type(exc).__name__,
+                outcome="needs_attention",
+            )
 
-        except Exception:
+        except Exception as exc:
 
-            LOG.exception("Recovery workflow failed for %s", job.job_id)
+            log_event(
+                LOG,
+                logging.ERROR,
+                "workflow",
+                "reconciliation_required",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=workflow.get("id"),
+                error_code="recovery_workflow_failed",
+                exception_type=type(exc).__name__,
+                outcome="needs_attention",
+            )
 
             try:
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import threading
+import logging
 
 
 import time
@@ -16,6 +17,9 @@ from dataclasses import replace
 
 
 from automation.workflows.models import now
+from diagnostic_logging import log_event
+
+LOG = logging.getLogger("jobs")
 
 
 from .models import (
@@ -95,6 +99,24 @@ class DeviceEligibility:
 
             self.catalog_lock.release()
 
+    def lock_identity(self, device_id):
+
+        # The DeviceLocks key every owner of device_id must use.
+
+        with self.state.lock:
+
+            if self.state.pi_bridge is not None:
+
+                identity = "pi-api:" + self.state.pi_bridge.client.base_url
+
+                if device_id != "phone_A":
+
+                    identity += "#" + device_id
+
+                return identity
+
+            return self.state.device.serial if self.state.device is not None else None
+
     def inspect(self, device_id, *, reserved=False):
 
         # The worker cannot depend on an open dashboard to refresh Pi state.
@@ -113,11 +135,7 @@ class DeviceEligibility:
 
                 runtime_healthy = self.state.pi_connection.get("api") == "online"
 
-                lock_identity = "pi-api:" + self.state.pi_bridge.client.base_url
-
-                if device_id != "phone_A":
-
-                    lock_identity += "#" + device_id
+                lock_identity = self.lock_identity(device_id)
 
                 manual_busy = self.state.pi_bridge.device_id == device_id and (
                     self.state.owner is not None or self.state.pending
@@ -133,9 +151,7 @@ class DeviceEligibility:
 
                 runtime_healthy = connected
 
-                lock_identity = (
-                    self.state.device.serial if self.state.device is not None else None
-                )
+                lock_identity = self.lock_identity(device_id)
 
                 manual_busy = self.state.owner is not None or self.state.pending
 
@@ -158,6 +174,8 @@ class DeviceEligibility:
         available = camera["status"].get("ready") is True
 
         workflow_busy = self.workflow_service.has_active_run(device_id)
+
+        remote_held = self.workflow_service.is_remote_held(device_id)
 
         reasons = []
 
@@ -189,6 +207,10 @@ class DeviceEligibility:
 
             reasons.append("device_owned")
 
+        if remote_held:
+
+            reasons.append("remote_control")
+
         if reserved:
 
             reasons.append("job_reserved")
@@ -200,7 +222,11 @@ class DeviceEligibility:
             "camera_configured": configured,
             "camera_available": available,
             "runtime_healthy": runtime_healthy,
-            "busy": workflow_busy or manual_busy or lock_busy or reserved,
+            "busy": workflow_busy
+            or manual_busy
+            or lock_busy
+            or reserved
+            or remote_held,
             "ready": not reasons,
             "reasons": reasons,
         }
@@ -263,6 +289,39 @@ class JobScheduler:
             "Recovery was interrupted by backend restart; it was not replayed.",
         )
 
+        for job_id in jobs:
+            try:
+                job = self.store.get(job_id)
+            except Exception:
+                continue
+            log_event(
+                LOG,
+                logging.ERROR,
+                "workflow",
+                "workflow_interrupted",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=job.workflow,
+                error_code="backend_restarted",
+                outcome="interrupted",
+            )
+        for job_id in recoveries:
+            try:
+                job = self.store.get(job_id)
+            except Exception:
+                continue
+            log_event(
+                LOG,
+                logging.ERROR,
+                "workflow",
+                "reconciliation_required",
+                device_id=job.device_id,
+                job_id=job.job_id,
+                workflow_id=job.recovery_workflow_id,
+                error_code="recovery_interrupted",
+                outcome="needs_attention",
+            )
+
         return jobs + recoveries
 
     def enqueue(
@@ -307,12 +366,15 @@ class JobScheduler:
             if original.action == "withdraw_v2" and not withdraw_authorized:
 
                 raise RecordConflict(
-                    "Withdraw Bot retry requires integration safety validation."
+                    "Withdraw Bot retry requires integration safety validation.",
+                    "retry_blocked",
                 )
 
             if original.status not in {"FAILED", "INTERRUPTED"}:
 
-                raise RecordConflict("Only failed or interrupted jobs can be retried.")
+                raise RecordConflict(
+                    "Only failed or interrupted jobs can be retried.", "retry_blocked"
+                )
 
             if mode == "failed_step":
 
@@ -325,13 +387,15 @@ class JobScheduler:
                 if original.recovery_status not in allowed_recovery_states:
 
                     raise RecordConflict(
-                        "The phone must be restored and marked ready before retrying."
+                        "The phone must be restored and marked ready before retrying.",
+                        "retry_blocked",
                     )
 
                 if original.failed_step_index is None:
 
                     raise RecordConflict(
-                        "The failed workflow step is unavailable; restart the workflow instead."
+                        "The failed workflow step is unavailable; restart the workflow instead.",
+                        "retry_blocked",
                     )
 
                 start_step_index = original.failed_step_index
@@ -342,7 +406,8 @@ class JobScheduler:
 
                     raise RecordConflict(
                         "Phone is not verified ready. Use Manual Assistance and "
-                        "Verify Phone Ready before restarting the workflow."
+                        "Verify Phone Ready before restarting the workflow.",
+                        "retry_blocked",
                     )
 
                 start_step_index = 0
@@ -365,7 +430,9 @@ class JobScheduler:
                 for candidate in self.list_jobs()
             ):
 
-                raise RecordConflict("A retry for this job is already active.")
+                raise RecordConflict(
+                    "A retry for this job is already active.", "retry_blocked"
+                )
 
             ready = self.is_device_ready(original.device_id)["ready"]
 
