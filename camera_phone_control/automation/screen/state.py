@@ -227,6 +227,18 @@ def _account_number_matches(visible_texts, expected):
     return False
 
 
+def _fps_phone_matches(visible_texts, expected):
+    """Require the complete eight-digit FPS phone identifier."""
+    expected_digits = re.sub(r"[ -]", "", str(expected))
+    if re.fullmatch(r"[0-9]{8}", expected_digits) is None:
+        return False
+    for value in visible_texts:
+        visible_digits = re.sub(r"[ -]", "", str(value))
+        if visible_digits == expected_digits:
+            return True
+    return False
+
+
 def _verified_amount(value):
     text = " ".join(str(value).split())
     match = _VERIFIED_AMOUNT.fullmatch(text)
@@ -265,6 +277,8 @@ def text_verification_matches(visible_texts, expected, match_mode, last_n=None):
         return _account_name_matches(visible_texts, expected)
     if match_mode == "account_number":
         return _account_number_matches(visible_texts, expected)
+    if match_mode == "fps_phone":
+        return _fps_phone_matches(visible_texts, expected)
     if match_mode == "amount":
         expected_amount = _verified_amount(expected)
         return expected_amount is not None and any(

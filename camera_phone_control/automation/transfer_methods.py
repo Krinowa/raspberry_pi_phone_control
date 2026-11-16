@@ -10,20 +10,65 @@ import re
 TRANSFER_METHODS_FILE_ENV = "PHONE_TRANSFER_METHODS_FILE"
 _METHOD_VALUE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _MAXIMUM_FILE_SIZE = 64 * 1024
-_PROFILE_FIELDS = {
-    "account_number": "account_number",
-    "mobile_no": "mobile_no",
+_PROFILE_DEFINITIONS = {
+    "account_number": {
+        "identifier_field": "account_number",
+        "workflow_variable": "account_number",
+        "api_type": "bank",
+        "recipient_name_field": "account_name",
+        "validation_type": "nonempty_text",
+        "verification_modes": ("account_number",),
+    },
+    "fps_phone_number": {
+        "identifier_field": "mobile_no",
+        "workflow_variable": "fps_phone_number",
+        "api_type": "kuaizhuan",
+        "recipient_name_field": "holder_name",
+        "validation_type": "hk_phone_number",
+        "verification_modes": ("fps_phone",),
+    },
+    "fps_email": {
+        "identifier_field": "mobile_no",
+        "workflow_variable": "fps_email",
+        "api_type": "kuaizhuan",
+        "recipient_name_field": "holder_name",
+        "validation_type": "email",
+        "verification_modes": ("exact",),
+    },
+    "fps_id": {
+        "identifier_field": "mobile_no",
+        "workflow_variable": "fps_id",
+        "api_type": "kuaizhuan",
+        "recipient_name_field": "holder_name",
+        "validation_type": "fps_id",
+        "verification_modes": ("exact",),
+    },
+    # Compatibility profile for explicitly configured pre-v2.1.3 aliases.
+    # It is not used by any built-in live method and performs no inference.
+    "mobile_no": {
+        "identifier_field": "mobile_no",
+        "workflow_variable": "mobile_no",
+        "api_type": "kuaizhuan",
+        "recipient_name_field": "holder_name",
+        "validation_type": "nonempty_text",
+        "verification_modes": ("exact", "account_number"),
+    },
 }
 
 
 def _definition(value, label, profile):
+    semantics = _PROFILE_DEFINITIONS[profile]
     return {
         "value": value,
         "label": label,
         "identifier_profile": profile,
-        "identifier_field": _PROFILE_FIELDS[profile],
+        "identifier_field": semantics["identifier_field"],
+        "workflow_variable": semantics["workflow_variable"],
+        "api_type": semantics["api_type"],
+        "recipient_name_field": semantics["recipient_name_field"],
+        "verification_modes": list(semantics["verification_modes"]),
         "validation": {
-            "type": "nonempty_text",
+            "type": semantics["validation_type"],
             "max_length": 256,
             "preserve_leading_zeroes": True,
         },
@@ -34,9 +79,18 @@ BUILTIN_TRANSFER_METHODS = {
     "bank_account": _definition(
         "bank_account", "Bank Account Transfer", "account_number"
     ),
+    "phone_no": _definition("phone_no", "FPS Phone Number", "fps_phone_number"),
+    "email": _definition("email", "FPS Email Address", "fps_email"),
+    "fps_id": _definition("fps_id", "FPS ID", "fps_id"),
+}
+
+# These definitions exist only so historical workflow documents and unresolved
+# journal metadata can be inspected without rewriting them. validate_transfer_method
+# deliberately does not consult this registry.
+LEGACY_TRANSFER_METHODS = {
     "mobile_number": _definition(
-        "mobile_number", "Mobile Number Transfer", "mobile_no"
-    ),
+        "mobile_number", "Legacy Mobile Number Transfer", "mobile_no"
+    )
 }
 
 # Keep this object stable because workflow modules import it directly. Startup
@@ -132,7 +186,11 @@ def _load_configured_methods(path):
             raise TransferMethodConfigurationError(
                 f"Transfer-method label for {value!r} is unsafe."
             )
-        if not isinstance(profile, str) or profile not in _PROFILE_FIELDS:
+        if (
+            not isinstance(profile, str)
+            or profile not in _PROFILE_DEFINITIONS
+            or profile == "mobile_no"
+        ):
             raise TransferMethodConfigurationError(
                 f"Transfer method {value!r} uses an unknown identifier_profile."
             )
@@ -166,7 +224,26 @@ def transfer_method_fingerprint(value):
         "value": method["value"],
         "identifier_profile": method["identifier_profile"],
         "identifier_field": method["identifier_field"],
+        "workflow_variable": method["workflow_variable"],
+        "api_type": method["api_type"],
+        "recipient_name_field": method["recipient_name_field"],
+        "verification_modes": method["verification_modes"],
         "validation": method["validation"],
+    }
+    encoded = json.dumps(semantics, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _pre_v213_fingerprint(definition):
+    semantics = {
+        "value": definition["value"],
+        "identifier_profile": definition["identifier_profile"],
+        "identifier_field": definition["identifier_field"],
+        "validation": {
+            "type": "nonempty_text",
+            "max_length": 256,
+            "preserve_leading_zeroes": True,
+        },
     }
     encoded = json.dumps(semantics, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -179,6 +256,17 @@ def validate_transfer_method(value):
 
 
 def validate_stored_transfer_method(value, profile=None, fingerprint=None):
+    if value in LEGACY_TRANSFER_METHODS:
+        definition = deepcopy(LEGACY_TRANSFER_METHODS[value])
+        if profile is None and fingerprint is None:
+            return definition
+        if profile != definition["identifier_profile"]:
+            raise ValueError(
+                "Stored withdrawal transfer-method profile is incompatible."
+            )
+        if fingerprint == _pre_v213_fingerprint(definition):
+            return definition
+        raise ValueError("Stored withdrawal transfer-method configuration changed.")
     definition = transfer_method_definition(value)
     # Old releases did not persist profile/fingerprint. Only immutable built-ins
     # may use that legacy representation.
@@ -186,7 +274,10 @@ def validate_stored_transfer_method(value, profile=None, fingerprint=None):
         return definition
     if profile != definition["identifier_profile"]:
         raise ValueError("Stored withdrawal transfer-method profile is incompatible.")
-    if fingerprint != transfer_method_fingerprint(value):
+    if fingerprint not in {
+        transfer_method_fingerprint(value),
+        _pre_v213_fingerprint(definition),
+    }:
         raise ValueError("Stored withdrawal transfer-method configuration changed.")
     return definition
 
@@ -196,14 +287,65 @@ def validate_recipient_identifier(raw, method):
     definition = transfer_method_definition(method)
     field = definition["identifier_field"]
     value = raw.get(field) if isinstance(raw, dict) else None
-    maximum = definition["validation"]["max_length"]
+    validation = definition["validation"]
+    maximum = validation["max_length"]
     if (
         not isinstance(value, str)
-        or not value.strip()
+        or not value
+        or value != value.strip()
         or len(value) > maximum
-        or any(ord(character) < 32 for character in value)
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise ValueError(
             f"Cannot confidently resolve {field}; physical payment is disabled."
         )
-    return field, value.strip()
+    kind = validation["type"]
+    if kind == "hk_phone_number":
+        normalized = re.sub(r"[ -]", "", value)
+        valid = re.fullmatch(r"[0-9]{8}", normalized) is not None
+    elif kind == "email":
+        valid = (
+            len(value) <= 254
+            and re.fullmatch(
+                r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+                r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+                r"[A-Za-z]{2,63}",
+                value,
+            )
+            is not None
+        )
+    elif kind == "fps_id":
+        # Hong Kong FPS identifiers are issued as 7- or 9-digit values.
+        valid = re.fullmatch(r"(?:[0-9]{7}|[0-9]{9})", value) is not None
+    else:
+        valid = True
+    if not valid:
+        raise ValueError(
+            f"Cannot confidently resolve {field} for transfer_method {method}; "
+            "physical payment is disabled."
+        )
+    return field, value
+
+
+def validate_transfer_method_payload(raw, method, *, require_recipient_name=False):
+    """Validate v2.1.3 method semantics without inferring from other fields."""
+    definition = transfer_method_definition(method)
+    if not isinstance(raw, dict) or raw.get("type") != definition["api_type"]:
+        raise ValueError(
+            f"Withdrawal type does not match transfer_method {method}; "
+            "physical payment is disabled."
+        )
+    field, identifier = validate_recipient_identifier(raw, method)
+    name_field = definition["recipient_name_field"]
+    name = raw.get(name_field)
+    if require_recipient_name and (
+        not isinstance(name, str)
+        or not name
+        or name != name.strip()
+        or len(name) > 256
+        or any(ord(character) < 32 or ord(character) == 127 for character in name)
+    ):
+        raise ValueError(
+            f"Cannot confidently resolve {name_field}; physical payment is disabled."
+        )
+    return field, identifier, name_field, name

@@ -7,7 +7,8 @@ venv/
 /build/
 /dist/
 /installer/
-tests/*
 automation/job_data/
 automation/auth_data/users.json
+automation/camera_data/
+automation/workflow_data/*.json
 *.secret

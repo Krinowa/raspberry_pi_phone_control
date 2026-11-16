@@ -278,7 +278,10 @@
   function transferMethodLabel(method) {
     const builtInLabels = {
       bank_account: "Bank Account",
-      mobile_number: "Mobile Number",
+      mobile_number: "Legacy Mobile Number",
+      phone_no: "FPS Phone Number",
+      email: "FPS Email Address",
+      fps_id: "FPS ID",
     };
     const builtIn = builtInLabels[method?.value];
     return builtIn
@@ -890,11 +893,25 @@
         if (step.type === "switch_transfer_method") {
           const branches = document.createElement("div");
           branches.className = "condition-branches";
-          for (const method of transferMethods) {
+          const visibleMethods = [
+            ...transferMethods,
+            ...Object.keys(step.branches || {})
+              .filter(
+                (value) =>
+                  !transferMethods.some((method) => method.value === value),
+              )
+              .map((value) => ({
+                value,
+                label: value,
+                identifier_field: "legacy",
+                workflow_variable: "legacy",
+              })),
+          ];
+          for (const method of visibleMethods) {
             const section = document.createElement("section"),
               heading = document.createElement("h5"),
               list = document.createElement("ol");
-            heading.textContent = `${transferMethodLabel(method)} · ${method.identifier_field}`;
+            heading.textContent = `${transferMethodLabel(method)} · ${method.workflow_variable || method.identifier_field}`;
             list.className = "condition-step-list";
             const branchSteps = step.branches?.[method.value] || [];
             const childRows = renderRows(branchSteps, true);
@@ -1333,7 +1350,11 @@
     const predefined = [
       "account_number",
       "mobile_no",
+      "fps_phone_number",
+      "fps_email",
+      "fps_id",
       "account_name",
+      "holder_name",
       "amount",
       "bank_name",
     ];
@@ -1973,6 +1994,10 @@
       label: "Account Name",
       match_mode: "account_name",
     }),
+    holder_name: Object.freeze({
+      label: "Holder Name",
+      match_mode: "account_name",
+    }),
     account_number: Object.freeze({
       label: "Account Number",
       match_mode: "account_number",
@@ -1981,6 +2006,15 @@
       label: "Mobile Number",
       match_mode: "account_number",
     }),
+    fps_phone_number: Object.freeze({
+      label: "FPS Phone Number",
+      match_mode: "fps_phone",
+    }),
+    fps_email: Object.freeze({
+      label: "FPS Email Address",
+      match_mode: "exact",
+    }),
+    fps_id: Object.freeze({ label: "FPS ID", match_mode: "exact" }),
     bank_name: Object.freeze({ label: "Bank Name", match_mode: "contains" }),
     amount: Object.freeze({ label: "Amount", match_mode: "amount" }),
   });
@@ -2663,6 +2697,10 @@
             {
               account_number: "Account Number",
               mobile_no: "Mobile Number",
+              fps_phone_number: "FPS Phone Number",
+              fps_email: "FPS Email Address",
+              fps_id: "FPS ID",
+              holder_name: "Holder Name",
               amount: "Amount",
               bank_name: "Bank Name",
             }[name] || name.replaceAll("_", " "),
@@ -2948,73 +2986,73 @@
     }),
   );
 
-  // function localTarget(event) {
-  //   return (
-  //     event.target?.isContentEditable ||
-  //     event.target?.closest?.(
-  //       "input, textarea, select, button, a, [role='button']",
-  //     )
-  //   );
-  // }
-  // document.addEventListener("keydown", (event) => {
-  //   if (
-  //     piManual() ||
-  //     !recording.active ||
-  //     stopping ||
-  //     annotationBusy() ||
-  //     event.defaultPrevented ||
-  //     localTarget(event) ||
-  //     document.hidden ||
-  //     !document.hasFocus()
-  //   )
-  //     return;
-  //   if (
-  //     event.ctrlKey ||
-  //     event.metaKey ||
-  //     event.altKey ||
-  //     event.isComposing ||
-  //     event.keyCode === 229 ||
-  //     event.getModifierState?.("AltGraph")
-  //   )
-  //     return;
-  //   if (backend !== "mock" && (!active() || !fresh())) return;
-  //   if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
-  //     event.preventDefault();
-  //     addText(event.key);
-  //   } else if (
-  //     !event.shiftKey &&
-  //     ["Enter", "Backspace", "Tab"].includes(event.key)
-  //   ) {
-  //     event.preventDefault();
-  //     if (event.key === "Backspace" && textBuffer)
-  //       textBuffer = textBuffer.slice(0, -1);
-  //     else {
-  //       flushText();
-  //       enqueue({ type: "key", key: event.key.toUpperCase() });
-  //     }
-  //   }
-  // });
-  // document.addEventListener("paste", (event) => {
-  //   if (
-  //     piManual() ||
-  //     !recording.active ||
-  //     stopping ||
-  //     annotationBusy() ||
-  //     localTarget(event) ||
-  //     document.hidden ||
-  //     !document.hasFocus()
-  //   )
-  //     return;
-  //   if (backend !== "mock" && (!active() || !fresh())) return;
-  //   const value = event.clipboardData?.getData("text/plain") || "";
-  //   event.preventDefault();
-  //   if (!/^[ -~]*$/.test(value))
-  //     return show(
-  //       "This phone input currently supports printable English characters only.",
-  //       true,
-  //     );
-  //   addText(value);
-  // });
+  function localTarget(event) {
+    return (
+      event.target?.isContentEditable ||
+      event.target?.closest?.(
+        "input, textarea, select, button, a, [role='button']",
+      )
+    );
+  }
+  document.addEventListener("keydown", (event) => {
+    if (
+      piManual() ||
+      !recording.active ||
+      stopping ||
+      annotationBusy() ||
+      event.defaultPrevented ||
+      localTarget(event) ||
+      document.hidden ||
+      !document.hasFocus()
+    )
+      return;
+    if (
+      event.ctrlKey ||
+      event.metaKey ||
+      event.altKey ||
+      event.isComposing ||
+      event.keyCode === 229 ||
+      event.getModifierState?.("AltGraph")
+    )
+      return;
+    if (backend !== "mock" && (!active() || !fresh())) return;
+    if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
+      event.preventDefault();
+      addText(event.key);
+    } else if (
+      !event.shiftKey &&
+      ["Enter", "Backspace", "Tab"].includes(event.key)
+    ) {
+      event.preventDefault();
+      if (event.key === "Backspace" && textBuffer)
+        textBuffer = textBuffer.slice(0, -1);
+      else {
+        flushText();
+        enqueue({ type: "key", key: event.key.toUpperCase() });
+      }
+    }
+  });
+  document.addEventListener("paste", (event) => {
+    if (
+      piManual() ||
+      !recording.active ||
+      stopping ||
+      annotationBusy() ||
+      localTarget(event) ||
+      document.hidden ||
+      !document.hasFocus()
+    )
+      return;
+    if (backend !== "mock" && (!active() || !fresh())) return;
+    const value = event.clipboardData?.getData("text/plain") || "";
+    event.preventDefault();
+    if (!/^[ -~]*$/.test(value))
+      return show(
+        "This phone input currently supports printable English characters only.",
+        true,
+      );
+    addText(value);
+  });
 
   function installGestures(element, camera) {
     element.addEventListener("pointerdown", (event) => {
@@ -3425,15 +3463,29 @@
     const simulatedMethod = $("run-transfer-method-simulation").hidden
       ? null
       : $("run-transfer-method").value;
+    const selectedMethodDefinition = transferMethodDefinition(simulatedMethod);
     const selectedIdentifier =
-      transferMethodDefinition(simulatedMethod)?.identifier_field;
+      selectedMethodDefinition?.workflow_variable ||
+      selectedMethodDefinition?.identifier_field;
+    const selectedRecipientName =
+      selectedMethodDefinition?.recipient_name_field;
     const inactiveIdentifiers = new Set(
       selectedIdentifier
         ? transferMethods
-            .filter((method) => method.identifier_field !== selectedIdentifier)
-            .map((method) => method.identifier_field)
+            .filter(
+              (method) =>
+                (method.workflow_variable || method.identifier_field) !==
+                selectedIdentifier,
+            )
+            .map(
+              (method) => method.workflow_variable || method.identifier_field,
+            )
         : [],
     );
+    if (selectedRecipientName) {
+      for (const name of ["account_name", "holder_name"])
+        if (name !== selectedRecipientName) inactiveIdentifiers.add(name);
+    }
     return selected.variables.filter(
       (variable) =>
         variable.required &&

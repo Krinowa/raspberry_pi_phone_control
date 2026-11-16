@@ -9,7 +9,7 @@ import uuid
 from automation.transfer_methods import (
     transfer_method_definition,
     transfer_method_fingerprint,
-    validate_recipient_identifier,
+    validate_transfer_method_payload,
     validate_transfer_method,
 )
 from .balance import final_amount
@@ -168,7 +168,7 @@ class WithdrawDispatcher:
                 tx_id = item.get("tx_id")
                 try:
                     method = validate_transfer_method(item.get("transfer_method"))
-                    validate_recipient_identifier(item, method)
+                    validate_transfer_method_payload(item, method)
                 except ValueError:
                     LOG.info(
                         "[withdraw-dispatch] client-pending skip "
@@ -327,7 +327,7 @@ class WithdrawDispatcher:
             return self._log_skip(worker, item, reason, detail=detail)
         method_readiness = getattr(worker, "payment_method_readiness", None)
         if callable(method_readiness):
-            method_ready, method_error = method_readiness(item["transfer_method"])
+            method_ready, method_error = method_readiness(item["transfer_method"], item)
             if not method_ready:
                 return self._log_skip(
                     worker,
@@ -571,7 +571,7 @@ class WithdrawDispatcher:
     def _dispatch_item(self, item, visible, unavailable):
         try:
             method = validate_transfer_method(item.get("transfer_method"))
-            validate_recipient_identifier(item, method)
+            validate_transfer_method_payload(item, method)
             final_amount(item)
         except (ValueError, TypeError):
             LOG.info(

@@ -213,9 +213,15 @@ def _windows_pnp_devices():
             "Windows camera identity discovery failed.",
             error_code="camera_discovery_failed",
         ) from exc
-    if completed.returncode:
+    if getattr(completed, "returncode", 1):
         raise CameraIdentityError("Windows camera identity discovery failed.")
-    output = _decode_command_output(completed.stdout, encodings=("utf-8-sig",))
+    captured_stdout = getattr(completed, "stdout", None)
+    if captured_stdout is None:
+        raise CameraIdentityError(
+            "Windows camera identity output was incomplete or invalid.",
+            error_code="camera_discovery_output_invalid",
+        )
+    output = _decode_command_output(captured_stdout, encodings=("utf-8-sig",))
     if output is None:
         raise CameraIdentityError(
             "Windows camera identity output could not be decoded safely.",
@@ -229,12 +235,24 @@ def _windows_pnp_devices():
             error_code="camera_discovery_output_invalid",
         ) from exc
     if isinstance(raw, dict):
-        return [raw]
+        raw = [raw]
     if not isinstance(raw, list):
         raise CameraIdentityError(
             "Windows camera identity output was incomplete or invalid.",
             error_code="camera_discovery_output_invalid",
         )
+    for item in raw:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("FriendlyName"), str)
+            or not item["FriendlyName"].strip()
+            or not isinstance(item.get("InstanceId"), str)
+            or not item["InstanceId"].strip()
+        ):
+            raise CameraIdentityError(
+                "Windows camera identity output was incomplete or invalid.",
+                error_code="camera_discovery_output_invalid",
+            )
     return raw
 
 
@@ -377,12 +395,14 @@ def _windows_mapping_failure_reason(
     return "pnp_moniker_not_matched"
 
 
-def discover_windows_devices():
+def discover_windows_devices(*, pnp_devices=None, directshow_result=None):
     if sys.platform != "win32":
         return []
-    pnp_devices = _windows_pnp_devices()
+    pnp_devices = _windows_pnp_devices() if pnp_devices is None else list(pnp_devices)
     directshow_devices, directshow_error, directshow_executable = (
         _windows_directshow_devices(include_status=True)
+        if directshow_result is None
+        else directshow_result
     )
     pnp_name_counts = {}
     for item in pnp_devices:

@@ -31,6 +31,17 @@ def _pe_machine(path):
         return struct.unpack("<H", machine)[0]
 
 
+def _command_bytes(value):
+    """Return subprocess output as bytes without invoking locale decoding."""
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace")
+    return b""
+
+
 def validate_ffmpeg(path):
     executable = Path(path).resolve()
     if not executable.is_file() or executable.is_symlink():
@@ -43,7 +54,7 @@ def validate_ffmpeg(path):
         version = subprocess.run(
             [str(executable), "-hide_banner", "-version"],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=15,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -51,7 +62,7 @@ def validate_ffmpeg(path):
         devices = subprocess.run(
             [str(executable), "-hide_banner", "-devices"],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=15,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -63,12 +74,14 @@ def validate_ffmpeg(path):
         ) from exc
     if (
         version.returncode != 0
-        or "ffmpeg version" not in (version.stdout + version.stderr).casefold()
+        or b"ffmpeg version"
+        not in (_command_bytes(version.stdout) + _command_bytes(version.stderr)).lower()
     ):
         raise FFmpegValidationError("FFmpeg version validation failed.")
     if (
         devices.returncode != 0
-        or "dshow" not in (devices.stdout + devices.stderr).casefold()
+        or b"dshow"
+        not in (_command_bytes(devices.stdout) + _command_bytes(devices.stderr)).lower()
     ):
         raise FFmpegValidationError(
             "FFmpeg does not expose the required DirectShow input device."

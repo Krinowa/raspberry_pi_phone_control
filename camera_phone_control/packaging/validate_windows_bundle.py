@@ -311,8 +311,7 @@ def _run_frozen_smoke_test(executable, compiled_modules):
                 timeout=240,
                 check=False,
                 capture_output=True,
-                text=True,
-                errors="replace",
+                text=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(

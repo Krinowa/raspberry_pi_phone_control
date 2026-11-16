@@ -1277,6 +1277,11 @@
     "Manual Simulation": "手動模擬",
     "Bank Account": "銀行戶口",
     "Mobile Number": "手提電話號碼",
+    "Legacy Mobile Number": "舊版手提電話號碼",
+    "FPS Phone Number": "轉數快手提電話號碼",
+    "FPS Email Address": "轉數快電郵地址",
+    "FPS ID": "轉數快識別碼",
+    "Holder Name": "持有人姓名",
     "Unsupported Transfer Method": "不支援的轉賬方式",
     "The Transfer Method condition is no longer available.":
       "轉賬方式條件已不再可用。",

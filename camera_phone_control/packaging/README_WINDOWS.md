@@ -210,7 +210,11 @@ environment-specific endpoints must be commissioned separately.
 Optional transfer-method aliases are loaded once at startup from
 `%LOCALAPPDATA%\Phone Controller\config\transfer_methods.json`. The file is not
 created automatically and is retained across EXE upgrades. It accepts only the
-compiled `account_number` and `mobile_no` identifier profiles:
+compiled `account_number`, `fps_phone_number`, `fps_email`, and `fps_id`
+identifier profiles. The old generic `mobile_no` profile remains readable only
+inside historical workflows and cannot activate a new live alias. A profile fixes the API field, API `type`,
+recipient-name field, validation, workflow variable, and verification semantics;
+an alias never changes or infers those semantics:
 
 ```json
 {
@@ -219,7 +223,7 @@ compiled `account_number` and `mobile_no` identifier profiles:
     {
       "value": "duitnow_mobile",
       "label": "DuitNow Mobile",
-      "identifier_profile": "mobile_no"
+      "identifier_profile": "fps_phone_number"
     }
   ]
 }
@@ -249,6 +253,20 @@ Use an absolute path to a separately provisioned secret file with restricted
 Windows ACLs. The secret file and its contents are never bundled. Source runs may
 instead use `camera_phone_control\.env`; the installed application reads
 `%LOCALAPPDATA%\Phone Controller\config\.env`.
+
+## Camera diagnostics
+
+On an installed Windows PC, create a read-only camera discovery report with:
+
+```bat
+PhoneController.exe --camera-diagnostics
+```
+
+The UTF-8 JSON report is written to
+`%LOCALAPPDATA%\Phone Controller\logs\camera-diagnostics.json`. It records the
+Windows ANSI and console code pages, PnP identities, FFmpeg DirectShow camera
+names, decode/enumeration errors, and fail-closed mapping status. This command
+does not open a camera, start the dashboard, or change saved camera mappings.
 
 ## Signing
 

@@ -19,6 +19,10 @@ VERIFY_VARIABLE_LABELS = {
     "account_name": "Account Name",
     "account_number": "Account Number",
     "mobile_no": "Mobile Number",
+    "fps_phone_number": "FPS Phone Number",
+    "fps_email": "FPS Email Address",
+    "fps_id": "FPS ID",
+    "holder_name": "Holder Name",
     "bank_name": "Bank Name",
     "amount": "Amount",
 }

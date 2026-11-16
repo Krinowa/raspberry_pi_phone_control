@@ -17,6 +17,7 @@ from automation.transfer_methods import (
     transfer_method_definition,
     transfer_method_fingerprint,
     validate_stored_transfer_method,
+    validate_transfer_method_payload,
     validate_transfer_method,
 )
 
@@ -1762,6 +1763,11 @@ class WithdrawWorker:
         ):
             raise ValueError("Pending withdrawal identifiers are invalid.")
 
+        pending_method = validate_transfer_method(item.get("transfer_method"))
+        pending_identifier_field, pending_identifier, _, _ = (
+            validate_transfer_method_payload(item, pending_method)
+        )
+
         if not claimed and self.journal.was_confirmed(self.device_id, item["tx_id"]):
             raise ValueError(
                 "Previously confirmed transaction appeared in pending; "
@@ -1769,7 +1775,7 @@ class WithdrawWorker:
             )
 
         if not claimed:
-            method = validate_transfer_method(item.get("transfer_method"))
+            method = pending_method
             method_definition = transfer_method_definition(method)
             self.journal.begin(
                 self.device_id,
@@ -1814,12 +1820,20 @@ class WithdrawWorker:
                 transfer_method_fingerprint=transfer_method_fingerprint(locked_method),
             )
 
+            locked_identifier_field, locked_identifier, _, _ = (
+                validate_transfer_method_payload(
+                    raw, locked_method, require_recipient_name=True
+                )
+            )
+
             if (
                 raw.get("id") != item["id"]
                 or raw.get("tx_id") != item["tx_id"]
                 or final_amount(raw) != final_amount(item)
                 or locked_method
-                != validate_transfer_method(item.get("transfer_method"))
+                != pending_method
+                or locked_identifier_field != pending_identifier_field
+                or locked_identifier != pending_identifier
             ):
                 raise ValueError(
                     "Locked withdrawal does not match the selected "
@@ -2253,11 +2267,18 @@ class WithdrawWorker:
 
         return True, None
 
-    def payment_method_readiness(self, method):
+    def payment_method_readiness(self, method, pending=None):
         """Validate an API method's workflow branch before external locking."""
         try:
             _, workflow = self._route()
-            require_transfer_method_branch(workflow, method)
+            identifier = None
+            if pending is not None:
+                _, identifier, _, _ = validate_transfer_method_payload(
+                    pending, validate_transfer_method(method)
+                )
+            require_transfer_method_branch(
+                workflow, method, recipient_identifier=identifier
+            )
         except (KeyError, ValueError) as error:
             return False, str(error)
         return True, None

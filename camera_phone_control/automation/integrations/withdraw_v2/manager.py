@@ -10,7 +10,12 @@ from pathlib import Path
 
 
 from automation.jobs.storage import RecordConflict, RecordNotFound
-from automation.transfer_methods import validate_stored_transfer_method
+from automation.transfer_methods import (
+    transfer_method_definition,
+    transfer_method_fingerprint as method_fingerprint,
+    validate_stored_transfer_method,
+    validate_transfer_method,
+)
 
 from .balance import (
     CameraOCRBalanceProvider,
@@ -192,6 +197,20 @@ class WithdrawManager:
         transfer_method_fingerprint = (
             metadata.get("transfer_method_fingerprint") if anchored else None
         )
+        if raw is not None:
+            try:
+                raw_method = validate_transfer_method(raw.get("transfer_method"))
+            except ValueError:
+                raw_method = None
+            if raw_method is None:
+                raw = None
+            elif transfer_method is None:
+                method_definition = transfer_method_definition(raw_method)
+                transfer_method = raw_method
+                transfer_method_profile = method_definition["identifier_profile"]
+                transfer_method_fingerprint = method_fingerprint(raw_method)
+            elif raw_method != transfer_method:
+                raw = None
         if transfer_method is not None:
             validate_stored_transfer_method(
                 transfer_method,
@@ -221,12 +240,6 @@ class WithdrawManager:
 
                 final_amount = None
 
-        if final_amount is None and isinstance(job.payload, dict):
-
-            amount = job.payload.get("amount")
-
-            final_amount = amount if isinstance(amount, str) and amount else None
-
         missing = [
             name
             for name, value in (
@@ -236,6 +249,7 @@ class WithdrawManager:
                 ("raw_withdrawal", raw),
                 ("lock_expires_at", lock_expires_at),
                 ("final_amount", final_amount),
+                ("transfer_method", transfer_method),
             )
             if value is None
         ]

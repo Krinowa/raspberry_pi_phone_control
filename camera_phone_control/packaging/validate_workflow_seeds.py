@@ -44,9 +44,17 @@ def validate_seed_file(path):
             if not isinstance(variable, dict):
                 continue
             name = str(variable.get("name") or "").lower()
-            if name in {"account_number", "amount", "bank_name"} and variable.get(
-                "default"
-            ) not in (None, ""):
+            if name in {
+                "account_number",
+                "fps_phone_number",
+                "fps_email",
+                "fps_id",
+                "mobile_no",
+                "account_name",
+                "holder_name",
+                "amount",
+                "bank_name",
+            } and variable.get("default") not in (None, ""):
                 findings.append(
                     f"$.variables[{index}].default: payment sample/default values "
                     "must be empty in installer seeds"

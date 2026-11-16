@@ -2368,11 +2368,13 @@ function renderDevices({ presentationOnly = false } = {}) {
 
       const issueMessage = document.createElement("span");
       issueMessage.textContent = withdraw.status?.error
-        ? uiBackendError(
-            withdraw.status.error_code,
-            withdraw.status.error_params,
-            withdraw.status.error,
-          )
+        ? withdraw.status.error_code
+          ? uiBackendError(
+              withdraw.status.error_code,
+              withdraw.status.error_params,
+              withdraw.status.error,
+            )
+          : friendlyOperationalError(withdraw.status.error)
         : uiLiteral("Withdrawal recovery requires attention.");
 
       const jobState = document.createElement("span");
@@ -5580,76 +5582,76 @@ async function sendPreviewSwipe(
   });
 }
 
-// const phoneKeys = {
-//   Enter: "enter",
-//   Backspace: "backspace",
-//   Tab: "tab",
-//   ArrowLeft: "left",
-//   ArrowRight: "right",
-//   ArrowUp: "up",
-//   ArrowDown: "down",
-//   Delete: "delete",
-//   Home: "home",
-//   End: "end",
-//   PageUp: "pageup",
-//   PageDown: "pagedown",
-// };
+const phoneKeys = {
+  Enter: "enter",
+  Backspace: "backspace",
+  Tab: "tab",
+  ArrowLeft: "left",
+  ArrowRight: "right",
+  ArrowUp: "up",
+  ArrowDown: "down",
+  Delete: "delete",
+  Home: "home",
+  End: "end",
+  PageUp: "pageup",
+  PageDown: "pagedown",
+};
 
-// document.addEventListener("keydown", (event) => {
-//   if (event.key === "Escape" && keyboardArmed) {
-//     event.preventDefault();
-//     releaseKeyboard();
-//     canvas.blur();
-//     return;
-//   }
-//   if (
-//     !keyboardActive() ||
-//     busy ||
-//     physicalBusy ||
-//     event.defaultPrevented ||
-//     event.repeat ||
-//     event.ctrlKey ||
-//     event.metaKey ||
-//     event.altKey ||
-//     event.isComposing ||
-//     event.keyCode === 229 ||
-//     event.getModifierState("AltGraph") ||
-//     event.getModifierState("Fn")
-//   )
-//     return;
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && keyboardArmed) {
+    event.preventDefault();
+    releaseKeyboard();
+    canvas.blur();
+    return;
+  }
+  if (
+    !keyboardActive() ||
+    busy ||
+    physicalBusy ||
+    event.defaultPrevented ||
+    event.repeat ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    event.isComposing ||
+    event.keyCode === 229 ||
+    event.getModifierState("AltGraph") ||
+    event.getModifierState("Fn")
+  )
+    return;
 
-//   // Leave local editing and keyboard activation of dashboard controls intact.
-//   const target = event.target;
-//   if (target?.isContentEditable || target?.closest?.("input, textarea, select"))
-//     return;
-//   if (
-//     (event.key === "Enter" || event.key === " ") &&
-//     target?.closest?.("button, a, [role='button']")
-//   )
-//     return;
+  // Leave local editing and keyboard activation of dashboard controls intact.
+  const target = event.target;
+  if (target?.isContentEditable || target?.closest?.("input, textarea, select"))
+    return;
+  if (
+    (event.key === "Enter" || event.key === " ") &&
+    target?.closest?.("button, a, [role='button']")
+  )
+    return;
 
-//   let type, value;
-//   if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
-//     type = "text";
-//     value = event.key;
-//   } else if (!event.shiftKey && Object.hasOwn(phoneKeys, event.key)) {
-//     type = "key";
-//     value = phoneKeys[event.key];
-//   } else return;
+  let type, value;
+  if (event.key.length === 1 && event.key >= " " && event.key <= "~") {
+    type = "text";
+    value = event.key;
+  } else if (!event.shiftKey && Object.hasOwn(phoneKeys, event.key)) {
+    type = "key";
+    value = phoneKeys[event.key];
+  } else return;
 
-//   event.preventDefault();
-//   // Send immediately using the existing busy gate. No buffer or keyboard history.
-//   report(async () => {
-//     try {
-//       await manualApi("/api/key", { type, value, frame_id: frameId });
-//     } catch (error) {
-//       // An uncertain input is never retried, even after a network timeout.
-//       manual = false;
-//       api("/api/control", { enabled: false }).catch(() => {});
-//       throw error;
-//     }
-//   });
-// });
+  event.preventDefault();
+  // Send immediately using the existing busy gate. No buffer or keyboard history.
+  report(async () => {
+    try {
+      await manualApi("/api/key", { type, value, frame_id: frameId });
+    } catch (error) {
+      // An uncertain input is never retried, even after a network timeout.
+      manual = false;
+      api("/api/control", { enabled: false }).catch(() => {});
+      throw error;
+    }
+  });
+});
 
 window.addEventListener("focus", renderKeyboard);
 window.addEventListener("blur", releaseKeyboard);

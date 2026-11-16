@@ -7,7 +7,7 @@ import re
 import unicodedata
 from copy import deepcopy
 from automation.transfer_methods import (
-    BUILTIN_TRANSFER_METHODS,
+    LEGACY_TRANSFER_METHODS,
     TRANSFER_METHODS,
     validate_transfer_method,
 )
@@ -48,6 +48,10 @@ KEYS = {
     "PAGEUP",
     "PAGEDOWN",
 }
+
+
+def _workflow_method_definition(method):
+    return TRANSFER_METHODS.get(method) or LEGACY_TRANSFER_METHODS.get(method)
 
 
 def identifier(value):
@@ -501,6 +505,7 @@ def validate_workflow(workflow, *, allow_empty=False):
                 "last_n_digits",
                 "account_name",
                 "account_number",
+                "fps_phone",
                 "amount",
             }:
                 raise ValueError("Unsupported verify_text match mode.")
@@ -573,7 +578,9 @@ def validate_workflow(workflow, *, allow_empty=False):
                 raise ValueError(
                     "Transfer-method condition must contain explicit branches."
                 )
-            unknown = set(branches) - set(TRANSFER_METHODS)
+            unknown = (
+                set(branches) - set(TRANSFER_METHODS) - set(LEGACY_TRANSFER_METHODS)
+            )
             if unknown:
                 raise ValueError(
                     "Transfer-method condition contains an unsupported branch."
@@ -671,14 +678,19 @@ def validate_workflow(workflow, *, allow_empty=False):
         )
 
     if not allow_empty and workflow.get("purpose", "payment") == "payment":
+        method_definitions = {
+            **LEGACY_TRANSFER_METHODS,
+            **TRANSFER_METHODS,
+        }
         identifier_fields = {
-            definition["identifier_field"] for definition in TRANSFER_METHODS.values()
+            definition["workflow_variable"]
+            for definition in method_definitions.values()
         }
 
         def validate_identifier_scope(branch_steps, selected_method=None):
             selected_identifier = (
-                TRANSFER_METHODS[selected_method]["identifier_field"]
-                if selected_method in TRANSFER_METHODS
+                _workflow_method_definition(selected_method)["workflow_variable"]
+                if _workflow_method_definition(selected_method) is not None
                 else None
             )
             for child in branch_steps:
@@ -707,7 +719,8 @@ def validate_workflow(workflow, *, allow_empty=False):
             validate_identifier_scope(steps)
         for switch in transfer_switches:
             for method, branch in switch["branches"].items():
-                identifier_field = TRANSFER_METHODS[method]["identifier_field"]
+                method_definition = _workflow_method_definition(method)
+                identifier_field = method_definition["workflow_variable"]
                 if not any(
                     child.get("type") == "input"
                     and child.get("source") == "variable"
@@ -726,6 +739,18 @@ def validate_workflow(workflow, *, allow_empty=False):
                     raise ValueError(
                         f"Transfer-method branch {method} must verify {identifier_field}."
                     )
+                verification_modes = set(method_definition["verification_modes"])
+                if any(
+                    child.get("type") == "verify_text"
+                    and child.get("source") == "variable"
+                    and child.get("variable") == identifier_field
+                    and child.get("match_mode") not in verification_modes
+                    for child in branch
+                ):
+                    raise ValueError(
+                        f"Transfer-method branch {method} uses an unsafe "
+                        f"verification mode for {identifier_field}."
+                    )
 
     if workflow.get("financial") and steps and steps[-1]["type"] != "manual_checkpoint":
         raise ValueError(
@@ -734,7 +759,7 @@ def validate_workflow(workflow, *, allow_empty=False):
     return deepcopy(workflow)
 
 
-def require_transfer_method_branch(workflow, method):
+def require_transfer_method_branch(workflow, method, *, recipient_identifier=None):
     """Fail before locking when a method has no explicit executable branch."""
     method = validate_transfer_method(method)
     pending = list(workflow.get("steps", []))
@@ -749,7 +774,7 @@ def require_transfer_method_branch(workflow, method):
             for branch in step.get("branches", {}).values():
                 pending.extend(branch)
     if not switches:
-        if method in BUILTIN_TRANSFER_METHODS:
+        if method == "bank_account":
             return workflow
         raise ValueError(
             f"Payment workflow has no explicit branch for transfer_method {method}."
@@ -758,6 +783,57 @@ def require_transfer_method_branch(workflow, method):
         raise ValueError(
             f"Payment workflow has no explicit branch for transfer_method {method}."
         )
+    if recipient_identifier is not None:
+        definition = TRANSFER_METHODS[method]
+        variable = definition["workflow_variable"]
+
+        def identifier_inputs(steps):
+            for child in steps:
+                if (
+                    child.get("type") == "input"
+                    and child.get("source") == "variable"
+                    and child.get("variable") == variable
+                ):
+                    yield child
+                if child.get("type") == "if_text":
+                    yield from identifier_inputs(child.get("then_steps", []))
+                    yield from identifier_inputs(child.get("else_steps", []))
+
+        for switch in switches:
+            for input_step in identifier_inputs(switch["branches"][method]):
+                if input_step.get("input_method", "hid") == "screen_keyboard":
+                    keyboard = workflow.get("keyboards", {}).get(
+                        input_step.get("keyboard_id")
+                    )
+                    keys = set((keyboard or {}).get("keys", {}))
+                    missing = sorted(set(recipient_identifier) - keys)
+                    uppercase = (
+                        sorted(
+                            character
+                            for character in recipient_identifier
+                            if character.isupper()
+                        )
+                        if (keyboard or {}).get("kind") == "alphabetic"
+                        else []
+                    )
+                    if missing or uppercase:
+                        raise ValueError(
+                            f"Transfer-method branch {method} cannot safely type "
+                            f"the API {definition['identifier_field']} with its "
+                            "captured keyboard."
+                        )
+                elif (
+                    not isinstance(recipient_identifier, str)
+                    or not 1 <= len(recipient_identifier) <= 4096
+                    or any(
+                        not " " <= character <= "~"
+                        for character in recipient_identifier
+                    )
+                ):
+                    raise ValueError(
+                        f"Transfer-method branch {method} cannot safely type the "
+                        f"API {definition['identifier_field']} through HID."
+                    )
     return workflow
 
 
@@ -773,12 +849,20 @@ def resolve_variables(workflow, supplied=None, *, execution_context=None):
     inactive_identifiers = set()
     if execution_context and "transfer_method" in execution_context:
         selected_method = validate_transfer_method(execution_context["transfer_method"])
-        selected_identifier = TRANSFER_METHODS[selected_method]["identifier_field"]
+        selected_definition = TRANSFER_METHODS[selected_method]
+        selected_identifier = selected_definition["workflow_variable"]
         inactive_identifiers = {
-            definition["identifier_field"]
-            for definition in TRANSFER_METHODS.values()
-            if definition["identifier_field"] != selected_identifier
+            definition["workflow_variable"]
+            for definition in [
+                *TRANSFER_METHODS.values(),
+                *LEGACY_TRANSFER_METHODS.values(),
+            ]
+            if definition["workflow_variable"] != selected_identifier
         }
+        inactive_identifiers.update(
+            {"account_name", "holder_name"}
+            - {selected_definition["recipient_name_field"]}
+        )
     for definition in workflow["variables"]:
         name = definition["name"]
         value = supplied[name] if name in supplied else definition.get("default")

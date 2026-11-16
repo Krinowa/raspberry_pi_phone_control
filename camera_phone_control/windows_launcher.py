@@ -45,9 +45,9 @@ def _configure_logging(log_directory: Path):
     )
 
 
-def _message_box(title, message):
+def _message_box(title, message, style=0x10):
     if os.name == "nt":
-        ctypes.windll.user32.MessageBoxW(None, str(message), str(title), 0x10)
+        ctypes.windll.user32.MessageBoxW(None, str(message), str(title), style)
     else:
         LOG.error("Could not display Windows message box: %s", title)
 
@@ -320,12 +320,47 @@ def _parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--shutdown", action="store_true")
     parser.add_argument(
+        "--camera-diagnostics",
+        nargs="?",
+        const="",
+        metavar="OUTPUT_JSON",
+        help="write read-only Windows camera discovery diagnostics and exit",
+    )
+    parser.add_argument(
         "--package-smoke-test", action="store_true", help=argparse.SUPPRESS
     )
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
     return args
+
+
+def _run_camera_diagnostics(output_path):
+    from hardware.camera_diagnostics import collect_windows_camera_diagnostics
+
+    path = (
+        Path(output_path).expanduser().resolve()
+        if output_path
+        else default_data_root() / "logs" / "camera-diagnostics.json"
+    )
+    try:
+        report = collect_windows_camera_diagnostics()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _message_box("Camera diagnostics failed", str(exc))
+        return 1
+    if sys.stdout is not None:
+        print(f"Camera diagnostics written to {path}")
+    _message_box(
+        "Camera diagnostics complete",
+        f"Report written to:\n{path}",
+        0x40,
+    )
+    return 0
 
 
 def _run_package_smoke_test():
@@ -546,6 +581,8 @@ def _run_package_smoke_test():
 
 def main(argv=None):
     args = _parse_args(argv)
+    if args.camera_diagnostics is not None:
+        return _run_camera_diagnostics(args.camera_diagnostics)
     if args.package_smoke_test:
         return _run_package_smoke_test()
     if args.shutdown:
