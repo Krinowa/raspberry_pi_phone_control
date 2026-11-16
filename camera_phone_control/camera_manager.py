@@ -43,7 +43,9 @@ LOG = logging.getLogger("camera-manager")
 
 
 class CameraManagerError(RuntimeError):
-    pass
+    def __init__(self, message, *, error_code="camera_operation_failed"):
+        super().__init__(message)
+        self.error_code = error_code
 
 
 def normalize_camera_source(value):
@@ -316,7 +318,18 @@ class CameraManager:
     def _identity_devices(self):
         if self.identity_discovery is None:
             return []
-        devices = self.identity_discovery()
+        try:
+            devices = self.identity_discovery()
+        except CameraIdentityError as exc:
+            raise CameraManagerError(
+                str(exc),
+                error_code=getattr(exc, "error_code", "camera_discovery_failed"),
+            ) from exc
+        except (AttributeError, UnicodeError) as exc:
+            raise CameraManagerError(
+                "Camera discovery failed safely while reading device output.",
+                error_code="camera_discovery_failed",
+            ) from exc
         if not isinstance(devices, list):
             raise CameraManagerError("Camera identity discovery returned invalid data.")
         result = []

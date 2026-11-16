@@ -215,6 +215,25 @@ def _validate_smoke_report(report_path, compiled_modules):
         )
     if report.get("multiprocessing_exit_code") != 0:
         raise RuntimeError("Frozen multiprocessing smoke check did not succeed.")
+    ocr_status = report.get("ocr_worker_status")
+    workers = ocr_status.get("workers", []) if isinstance(ocr_status, dict) else []
+    if not workers or any(item.get("state") != "IDLE" for item in workers):
+        raise RuntimeError("Frozen PaddleOCR worker/model smoke check did not succeed.")
+    language_statuses = report.get("ocr_language_statuses")
+    if not isinstance(language_statuses, dict) or set(language_statuses) != {
+        "en",
+        "zh-HK",
+        "zh-TW",
+    }:
+        raise RuntimeError("Frozen OCR language smoke checks were incomplete.")
+    for language, status in language_statuses.items():
+        language_workers = status.get("workers", []) if isinstance(status, dict) else []
+        if not language_workers or any(
+            item.get("state") != "IDLE" for item in language_workers
+        ):
+            raise RuntimeError(
+                f"Frozen {language} PaddleOCR worker/model smoke check failed."
+            )
     endpoint_statuses = {
         item.get("endpoint"): item.get("status_code")
         for item in report.get("endpoints", [])
@@ -281,13 +300,15 @@ def _run_frozen_smoke_test(executable, compiled_modules):
         )
         environment["PHONE_CONTROLLER_PACKAGE_SMOKE_STDOUT"] = os.fspath(stdout_path)
         environment["PHONE_CONTROLLER_PACKAGE_SMOKE_STDERR"] = os.fspath(stderr_path)
+        environment["CAMERA_OCR_LANGUAGE"] = "zh-HK"
+        environment["CAMERA_OCR_WORKER_POOL_SIZE"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
         try:
             completed = subprocess.run(
                 command,
                 cwd=executable.parent,
                 env=environment,
-                timeout=120,
+                timeout=240,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -299,7 +320,7 @@ def _run_frozen_smoke_test(executable, compiled_modules):
                 + _smoke_failure_details(
                     command=command,
                     cwd=executable.parent,
-                    exit_code="<timed out after 120 seconds>",
+                    exit_code="<timed out after 240 seconds>",
                     stdout=exc.stdout,
                     stderr=exc.stderr,
                     diagnostic_paths=diagnostic_paths,

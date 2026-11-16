@@ -19,7 +19,34 @@ LOG = logging.getLogger("camera-identity")
 
 
 class CameraIdentityError(RuntimeError):
-    pass
+    def __init__(self, message, *, error_code="camera_discovery_failed"):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _windows_ansi_encoding():
+    """Return the Windows ANSI encoding used by native GUI applications."""
+    try:
+        codepage = int(ctypes.windll.kernel32.GetACP())
+    except (AttributeError, OSError, TypeError, ValueError):
+        codepage = 0
+    return f"cp{codepage}" if codepage > 0 else None
+
+
+def _decode_command_output(value, *, encodings):
+    """Decode captured bytes without depending on Python's console encoding."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, (bytes, bytearray)):
+        return None
+    for encoding in dict.fromkeys(item for item in encodings if item):
+        try:
+            return bytes(value).decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return None
 
 
 def _device(stable_id, name, backend, runtime_source, **metadata):
@@ -159,19 +186,56 @@ def _windows_pnp_devices():
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "Get-PnpDevice -PresentOnly | Where-Object {$_.Class -in @('Camera','Image')} | Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress",
+        "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "Get-PnpDevice -PresentOnly | Where-Object {$_.Class -in @('Camera','Image')} | "
+        "Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress",
     ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=False,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except FileNotFoundError as exc:
+        raise CameraIdentityError(
+            "Windows camera identity discovery is unavailable.",
+            error_code="camera_discovery_unavailable",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CameraIdentityError(
+            "Windows camera identity discovery timed out.",
+            error_code="camera_discovery_timeout",
+        ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CameraIdentityError(
+            "Windows camera identity discovery failed.",
+            error_code="camera_discovery_failed",
+        ) from exc
     if completed.returncode:
         raise CameraIdentityError("Windows camera identity discovery failed.")
-    raw = json.loads(completed.stdout or "[]")
-    return raw if isinstance(raw, list) else [raw]
+    output = _decode_command_output(completed.stdout, encodings=("utf-8-sig",))
+    if output is None:
+        raise CameraIdentityError(
+            "Windows camera identity output could not be decoded safely.",
+            error_code="camera_discovery_decode_failed",
+        )
+    try:
+        raw = json.loads(output or "[]")
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise CameraIdentityError(
+            "Windows camera identity output was incomplete or invalid.",
+            error_code="camera_discovery_output_invalid",
+        ) from exc
+    if isinstance(raw, dict):
+        return [raw]
+    if not isinstance(raw, list):
+        raise CameraIdentityError(
+            "Windows camera identity output was incomplete or invalid.",
+            error_code="camera_discovery_output_invalid",
+        )
+    return raw
 
 
 def resolve_ffmpeg_executable(*, environment=None, frozen_root=None, which=None):
@@ -218,7 +282,7 @@ def _windows_directshow_devices(*, include_status=False):
                 "dummy",
             ],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -234,9 +298,17 @@ def _windows_directshow_devices(*, include_status=False):
         devices = []
         enumeration_error = "directshow_enumeration_failed"
         return (devices, enumeration_error, executable) if include_status else devices
+    output = _decode_command_output(
+        getattr(completed, "stderr", None),
+        encodings=("utf-8-sig", _windows_ansi_encoding()),
+    )
+    if output is None:
+        devices = []
+        enumeration_error = "directshow_output_decode_failed"
+        return (devices, enumeration_error, executable) if include_status else devices
     devices = []
     current = None
-    for line in completed.stderr.splitlines():
+    for line in output.splitlines():
         match = re.search(r'"([^"]+)"\s*\(video\)', line)
         if match:
             current = {

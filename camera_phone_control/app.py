@@ -32,6 +32,7 @@ from diagnostic_logging import (
     configure_development_logging,
     log_event,
     register_secrets,
+    sanitize_text,
 )
 
 import agent_frames
@@ -655,7 +656,10 @@ def create_app(
         return (
             jsonify(
                 ok=False,
-                **error_fields(str(exc), "camera_operation_failed"),
+                **error_fields(
+                    str(exc),
+                    getattr(exc, "error_code", "camera_operation_failed"),
+                ),
             ),
             503,
         )
@@ -2285,6 +2289,7 @@ def main():
                     "ocr_worker_start_failed",
                     error_code="ocr_worker_start_failed",
                     exception_type=type(exc).__name__,
+                    exception_detail=sanitize_text(str(exc))[:500],
                 )
 
         threading.Thread(

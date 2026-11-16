@@ -324,6 +324,8 @@
     if (kind === "alphabetic") {
       const keys = Array.from("qwertyuiopasdfghjklzxcvbnm");
 
+      if ($("keyboard-alphabetic-include-digits").checked)
+        keys.push(...Array.from("0123456789"));
       if ($("keyboard-include-space").checked) keys.push(" ");
       if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
 
@@ -348,11 +350,17 @@
   }
 
   function isUsefulExpectedText(text) {
-    const value = String(text || "").trim();
+    const value = String(text || "")
+      .normalize("NFKC")
+      .trim();
 
     if (value.length < 2) return false;
 
-    const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+    // Keep letters and numbers from every Unicode script. The keyboard-noise
+    // signatures below are deliberately ASCII, so Chinese and other non-Latin
+    // labels must not collapse to the empty string and match every signature.
+    const compact = value.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+    if (!compact) return false;
 
     const keyboardPatterns = [
       "qwertyuiop",
@@ -426,7 +434,11 @@
         return;
 
       const choices = (result.suggestions || [])
-        .map((text) => String(text || "").trim())
+        .map((text) =>
+          String(text || "")
+            .normalize("NFKC")
+            .trim(),
+        )
         .filter(isUsefulExpectedText)
         .filter(
           (text, index, list) =>
@@ -1725,11 +1737,17 @@
     }
 
     roiKeys.forEach((key) =>
-      $(`${prefix}-roi-${key}`).addEventListener("input", draw),
+      $(`${prefix}-roi-${key}`).addEventListener("input", () => {
+        // An in-flight test must not overwrite feedback for an edited crop.
+        generation++;
+        draw();
+      }),
     );
     $(`${prefix}-roi-refresh`).addEventListener("click", () =>
       task(async () => {
         const selectedGeneration = ++generation;
+        // Prevent testing an old snapshot while a new one is being requested.
+        token = null;
         const result = await api("/api/ocr/roi-preview", {});
         const nextImage = new Image();
         await new Promise((resolve, reject) => {
@@ -1783,6 +1801,8 @@
         if (!token) throw new Error("Select an OCR region snapshot first.");
         const testedGeneration = generation;
         const text = parser ? "" : $(`${textPrefix}-text-value`).value.trim();
+        if (!parser && !text)
+          throw new Error("Enter the expected text before testing the crop.");
         const result = await api("/api/ocr/roi-test", {
           token,
           roi: read(),
@@ -1790,24 +1810,36 @@
           ...(parser ? { parser } : {}),
         });
         if (testedGeneration !== generation) return;
-        $(`${prefix}-roi-result`).textContent = parser
-          ? workflowUi("workflow.readResult", `Read Balance: ${result.value}`, {
-              value: result.value,
-            })
-          : result.found
-            ? workflowUi(
-                "workflow.targetDetected",
-                `Target detected in selected snapshot crop · ${result.texts.join(" | ")}`,
-                { texts: result.texts.join(" | ") },
-              )
-            : workflowUi(
-                "workflow.targetNotDetected",
-                `Target not detected in selected snapshot crop · ${result.texts.join(" | ") || "No text read"}`,
-                {
-                  texts:
-                    result.texts.join(" | ") || workflowLiteral("No text read"),
-                },
-              );
+        const recognized = Array.isArray(result.texts)
+          ? result.texts
+              .filter((item) => typeof item === "string" && item.trim())
+              .join(" | ")
+          : "";
+        const resultNode = $(`${prefix}-roi-result`);
+        if (parser) {
+          resultNode.textContent = workflowUi(
+            "workflow.readResult",
+            `Read Balance: ${result.value}`,
+            { value: result.value },
+          );
+        } else if (result.found === true) {
+          resultNode.textContent = workflowUi(
+            "workflow.targetDetected",
+            `Target detected in selected snapshot crop · ${recognized}`,
+            { texts: recognized },
+          );
+        } else {
+          // Expose the exact target and raw backend OCR text, without claiming
+          // that a mismatch is a successful recognition or weakening matching.
+          const failure = workflowUi(
+            "workflow.targetNotDetected",
+            `Target not detected in selected snapshot crop · ${recognized || "No text read"}`,
+            { texts: recognized || workflowLiteral("No text read") },
+          );
+          resultNode.textContent =
+            `${failure} · Expected: ${text} · OCR read: ${recognized || "(none)"}. ` +
+            "Check the selected crop, snapshot freshness, focus, and OCR language.";
+        }
       }),
     );
 

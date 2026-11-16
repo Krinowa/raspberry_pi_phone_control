@@ -25,6 +25,7 @@ from diagnostic_logging import (
     configure_production_logging,
     log_event,
     register_sensitive_environment,
+    sanitize_text,
     write_startup_error,
 )
 from windows_runtime import RuntimePaths, default_data_root
@@ -269,6 +270,7 @@ def _warm_ocr(app):
             "ocr_worker_start_failed",
             error_code="ocr_worker_start_failed",
             exception_type=type(exc).__name__,
+            exception_detail=sanitize_text(str(exc))[:500],
         )
 
 
@@ -412,6 +414,34 @@ def _run_package_smoke_test():
 
         report["phase"] = "flask_create_app"
         app, camera_manager = _create_application(paths, package_smoke=True)
+        report["phase"] = "ocr_worker"
+        provider = app.extensions.get("workflow_screen_state_provider")
+        start_worker = getattr(provider, "start_worker", None)
+        if start_worker is None:
+            raise RuntimeError("Frozen application has no OCR worker startup hook.")
+        ocr_status = start_worker()
+        report["ocr_worker_status"] = ocr_status
+        workers = ocr_status.get("workers", []) if isinstance(ocr_status, dict) else []
+        if not workers or any(item.get("state") != "IDLE" for item in workers):
+            raise RuntimeError(
+                f"Frozen OCR workers did not initialize successfully: {ocr_status!r}."
+            )
+        start_language_worker = getattr(provider, "start_language_worker", None)
+        if start_language_worker is None:
+            raise RuntimeError("Frozen application has no OCR language startup hook.")
+        report["ocr_language_statuses"] = {}
+        for language in ("en", "zh-HK", "zh-TW"):
+            status = start_language_worker(language)
+            report["ocr_language_statuses"][language] = status
+            language_workers = (
+                status.get("workers", []) if isinstance(status, dict) else []
+            )
+            if not language_workers or any(
+                item.get("state") != "IDLE" for item in language_workers
+            ):
+                raise RuntimeError(
+                    f"Frozen {language} OCR workers did not initialize: {status!r}."
+                )
         required_routes = {
             ("/agent/v1/devices/<device_id>/frames", "GET"),
             ("/agent/v1/devices/<device_id>/takeover", "POST"),

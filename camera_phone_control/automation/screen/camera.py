@@ -207,6 +207,18 @@ class _DisplaySession:
 
         jpeg, sequence, width, height, timestamp = sample
 
+        stale_after = getattr(camera, "frame_stale_seconds", None)
+        capture_active = getattr(camera, "thread", None) is not None
+        if (
+            capture_active
+            and isinstance(stale_after, (int, float))
+            and stale_after > 0
+            and time.monotonic() - timestamp >= stale_after
+        ):
+            raise ScreenStabilityError(
+                "External camera frame is stale; wait for a current frame."
+            )
+
         if (width, height) != self.signature[1:]:
             raise ScreenStabilityError(
                 "Camera resolution changed. Recalibrate the phone display."

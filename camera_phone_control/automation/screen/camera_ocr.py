@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
 
@@ -20,6 +21,7 @@ from diagnostic_logging import (
     configure_child_logging,
     current_logging_queue,
     log_event,
+    sanitize_text,
 )
 
 try:
@@ -54,6 +56,35 @@ OCR_LANGUAGE_ALIASES = {
     "malay": "ms",
 }
 
+_PACKAGED_MODEL_FILES = (
+    "config.json",
+    "inference.json",
+    "inference.pdiparams",
+    "inference.yml",
+)
+
+
+def _exception_diagnostics(exc):
+    """Return a bounded, path-sanitized description of an exception chain."""
+    chain = []
+    current = exc
+    seen = set()
+    while current is not None and id(current) not in seen and len(chain) < 4:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    root = chain[-1]
+    frames = traceback.extract_tb(root.__traceback__)[-8:]
+    trace_summary = " <- ".join(
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames
+    )
+    return {
+        "exception_type": type(root).__name__,
+        "exception_detail": sanitize_text(str(root))[:500],
+        "exception_chain": " <- ".join(type(item).__name__ for item in chain),
+        "traceback_summary": sanitize_text(trace_summary)[:500],
+    }
+
 
 def _ocr_language_profile(language):
     value = str(language or "").strip().casefold().replace("_", "-")
@@ -68,6 +99,31 @@ def _ocr_language_profile(language):
             f"supported languages are {supported}."
         )
     return value, profile[0], profile[1]
+
+
+def _contains_cjk_text(value):
+    """Return whether text needs the multilingual Chinese recognizer."""
+    for character in str(value or ""):
+        codepoint = ord(character)
+        if any(
+            start <= codepoint <= end
+            for start, end in (
+                (0x3400, 0x4DBF),
+                (0x4E00, 0x9FFF),
+                (0xF900, 0xFAFF),
+                (0x20000, 0x2FA1F),
+                (0x30000, 0x323AF),
+            )
+        ):
+            return True
+    return False
+
+
+def _ocr_language_for_text(text, fallback_language):
+    """Select a recognizer without changing exact target verification."""
+    if _contains_cjk_text(text):
+        return "chinese_cht"
+    return _ocr_language_profile(fallback_language)[0]
 
 
 def _process_cpu_times():
@@ -89,11 +145,16 @@ def _build_paddle_engine(
 ):
     """Construct Paddle only in the OCR child process."""
     try:
+        # Import Paddle explicitly so native-core/DLL load failures remain the
+        # root cause instead of being hidden behind PaddleOCR initialization.
+        import paddle
         from paddleocr import PaddleOCR
-    except ImportError as exc:
+
+        getattr(paddle, "framework").core
+    except (ImportError, OSError, RuntimeError, AttributeError) as exc:
         raise TextDetectionUnavailable(
-            "Camera OCR requires PaddleOCR and PaddlePaddle. "
-            "Install the camera OCR dependencies and restart the server."
+            "Camera OCR requires PaddleOCR and a loadable PaddlePaddle runtime. "
+            "Check the packaged dependencies and restart the server."
         ) from exc
 
     _, paddle_language, recognition_model = _ocr_language_profile(language)
@@ -120,14 +181,12 @@ def _build_paddle_engine(
             path.name
             for path in (detection, recognition)
             if not all(
-                (path / filename).is_file()
-                for filename in ("inference.json", "inference.pdiparams")
+                (path / filename).is_file() for filename in _PACKAGED_MODEL_FILES
             )
         ]
         orientation = model_root / "PP-LCNet_x1_0_textline_ori"
         if textline_orientation and not all(
-            (orientation / filename).is_file()
-            for filename in ("inference.json", "inference.pdiparams")
+            (orientation / filename).is_file() for filename in _PACKAGED_MODEL_FILES
         ):
             missing.append(orientation.name)
         if missing:
@@ -190,9 +249,16 @@ def _paddle_worker(connection, config):
         )
         connection.send(("ready", worker_pid, time.monotonic() - started))
     except BaseException as exc:
+        diagnostics = _exception_diagnostics(exc)
         try:
             connection.send(
-                ("startup_error", worker_pid, type(exc).__name__, str(exc)[:500])
+                (
+                    "startup_error",
+                    worker_pid,
+                    diagnostics["exception_type"],
+                    diagnostics["exception_detail"],
+                    diagnostics,
+                )
             )
         except (BrokenPipeError, EOFError, OSError):
             pass
@@ -343,7 +409,8 @@ class _PaddleWorkerClient:
             self._stop(force=True)
             raise
         if message[0] == "startup_error":
-            _, pid, error_type, detail = message
+            _, pid, error_type, detail, *extra = message
+            diagnostics = extra[0] if extra and isinstance(extra[0], dict) else {}
             log_event(
                 LOG,
                 logging.ERROR,
@@ -351,12 +418,15 @@ class _PaddleWorkerClient:
                 "ocr_worker_start_failed",
                 worker_id=pid,
                 exception_type=error_type,
+                exception_detail=diagnostics.get("exception_detail", detail),
+                exception_chain=diagnostics.get("exception_chain", error_type),
+                traceback_summary=diagnostics.get("traceback_summary", ""),
                 error_code="ocr_worker_start_failed",
             )
             self._stop(force=True)
             raise TextDetectionUnavailable(
                 f"PaddleOCR worker {pid} could not initialize: "
-                f"{error_type}: {detail}"
+                f"{error_type}. See the local diagnostic log for details."
             )
         if message[0] != "ready":
             self._stop(force=True)
@@ -370,6 +440,9 @@ class _PaddleWorkerClient:
             "ocr",
             "ocr_worker_ready",
             worker_id=pid,
+            ocr_engine="PaddleOCR PP-OCRv5",
+            ocr_language=self.config.get("language"),
+            recognition_model=_ocr_language_profile(self.config.get("language"))[2],
             duration_ms=round(self.initialization_seconds * 1000),
             outcome="ready",
         )
@@ -782,6 +855,8 @@ class CameraOCRScreenStateProvider:
         timeout=30.0,
         worker_pool_size=2,
         _shared_worker=None,
+        _shared_language_workers=None,
+        _shared_language_worker_lock=None,
     ):
         self.external_screen = external_screen
         requested_language = language or os.environ.get("CAMERA_OCR_LANGUAGE", "en")
@@ -818,16 +893,44 @@ class CameraOCRScreenStateProvider:
         self._change_candidate_since = None
         self._inference_lock = threading.Lock()
         self._owns_worker = _shared_worker is None
-        self._worker = _shared_worker or _PaddleWorkerPool(
-            {
-                "language": self.language,
-                "textline_orientation": self.textline_orientation,
-                "cpu_threads": self.cpu_threads,
-                "recognition_batch_size": self.recognition_batch_size,
-            },
-            self.timeout,
-            worker_pool_size,
+        self._worker = _shared_worker or self._new_worker_pool(
+            self.language, worker_pool_size
         )
+        self._language_workers = (
+            _shared_language_workers
+            if _shared_language_workers is not None
+            else {self.language: self._worker}
+        )
+        self._language_worker_lock = _shared_language_worker_lock or threading.RLock()
+
+    def _worker_config(self, language):
+        return {
+            "language": _ocr_language_profile(language)[0],
+            "textline_orientation": self.textline_orientation,
+            "cpu_threads": self.cpu_threads,
+            "recognition_batch_size": self.recognition_batch_size,
+        }
+
+    def _new_worker_pool(self, language, pool_size):
+        return _PaddleWorkerPool(
+            self._worker_config(language),
+            self.timeout,
+            pool_size,
+        )
+
+    def _worker_for_language(self, language):
+        language = _ocr_language_profile(language)[0]
+        with self._language_worker_lock:
+            worker = self._language_workers.get(language)
+            if worker is None:
+                # Alternate recognizers are lazy and single-worker to avoid
+                # multiplying the configured pool's memory footprint.
+                worker = self._new_worker_pool(language, 1)
+                self._language_workers[language] = worker
+            return worker
+
+    def language_for_text(self, text):
+        return _ocr_language_for_text(text, self.language)
 
     def for_screen(self, external_screen):
         """Create an isolated per-screen cache while sharing Paddle inference."""
@@ -837,6 +940,8 @@ class CameraOCRScreenStateProvider:
             timeout=self.timeout,
             worker_pool_size=self._worker.pool_size,
             _shared_worker=self._worker,
+            _shared_language_workers=self._language_workers,
+            _shared_language_worker_lock=self._language_worker_lock,
         )
 
     @staticmethod
@@ -1282,6 +1387,8 @@ class CameraOCRScreenStateProvider:
                 "cpu_user_seconds": timings.get("cpu_user"),
                 "cpu_system_seconds": timings.get("cpu_system"),
                 "native_thread_count": timings.get("native_threads"),
+                "ocr_language": timings.get("ocr_language"),
+                "recognition_model": timings.get("recognition_model"),
             },
         )
 
@@ -1294,9 +1401,24 @@ class CameraOCRScreenStateProvider:
         frame_id=None,
         scope="full",
         expected=None,
+        language=None,
     ):
         timings = {} if timings is None else timings
         total_started = time.monotonic() if total_started is None else total_started
+        recognition_language = _ocr_language_profile(
+            language or _ocr_language_for_text(expected, self.language)
+        )[0]
+        _, paddle_language, recognition_model = _ocr_language_profile(
+            recognition_language
+        )
+        worker = self._worker_for_language(recognition_language)
+        cache_scope = (recognition_language, scope)
+        timings.update(
+            ocr_engine="PaddleOCR PP-OCRv5",
+            ocr_language=recognition_language,
+            paddle_language=paddle_language,
+            recognition_model=recognition_model,
+        )
         preprocess_started = time.monotonic()
         signature = self._screen_signature(image)
         timings["signature"] = time.monotonic() - preprocess_started
@@ -1304,11 +1426,11 @@ class CameraOCRScreenStateProvider:
         with self._inference_lock:
             provider_queue_wait = time.monotonic() - inference_queued
             cache_hit, mean_difference, changed_ratio = self._cache_match(
-                signature, scope
+                signature, cache_scope
             )
             if cache_hit:
-                pool_status = self._worker.status()
-                candidates = copy.deepcopy(self._cache_by_scope[scope][1])
+                pool_status = worker.status()
+                candidates = copy.deepcopy(self._cache_by_scope[cache_scope][1])
                 timings.update(
                     preprocess=timings["signature"],
                     queue_wait=provider_queue_wait,
@@ -1341,9 +1463,14 @@ class CameraOCRScreenStateProvider:
                     "ocr",
                     "ocr_request_started",
                     ocr_request_id=ocr_request_id,
+                    ocr_engine=timings["ocr_engine"],
+                    ocr_language=recognition_language,
+                    paddle_language=paddle_language,
+                    recognition_model=recognition_model,
+                    ocr_scope="roi" if scope.startswith("roi:") else scope,
                 )
                 try:
-                    results, worker_timings = self._worker.request(
+                    results, worker_timings = worker.request(
                         prepared, request_id=ocr_request_id
                     )
                 except Exception as exc:
@@ -1390,7 +1517,7 @@ class CameraOCRScreenStateProvider:
                 postprocess_started = time.monotonic()
                 candidates = self._candidates_from_results(results)
                 timings["postprocess"] = time.monotonic() - postprocess_started
-                self._cache_by_scope[scope] = (
+                self._cache_by_scope[cache_scope] = (
                     signature.copy(),
                     copy.deepcopy(candidates),
                 )
@@ -1409,15 +1536,49 @@ class CameraOCRScreenStateProvider:
         )
         if expected is not None:
             timings["matched"] = self._candidates_contain(candidates, expected)
+        log_event(
+            LOG,
+            logging.INFO if scope.startswith("roi:") else logging.DEBUG,
+            "ocr",
+            "ocr_recognition_result",
+            ocr_engine=timings["ocr_engine"],
+            ocr_language=recognition_language,
+            paddle_language=paddle_language,
+            recognition_model=recognition_model,
+            ocr_scope="roi" if scope.startswith("roi:") else scope,
+            recognition_results=[
+                {
+                    "text": sanitize_text(item["text"])[:80],
+                    "confidence": round(item["confidence"], 2),
+                }
+                for item in candidates[:10]
+            ],
+            confidence_scores=[
+                round(item["confidence"], 2) for item in candidates[:10]
+            ],
+            matched=timings.get("matched"),
+            cache_hit=cache_hit,
+        )
         self._record_workflow_timings(timings, frame_id, cache_hit, scope=scope)
         return candidates
 
     def close(self):
         if self._owns_worker:
-            self._worker.close()
+            with self._language_worker_lock:
+                workers = list(
+                    {
+                        id(item): item for item in self._language_workers.values()
+                    }.values()
+                )
+            for worker in workers:
+                worker.close()
 
     def start_worker(self):
         return self._worker.start()
+
+    def start_language_worker(self, language):
+        """Warm one explicit packaged recognizer for release validation."""
+        return self._worker_for_language(language).start()
 
     def visible_text_candidates_from_image(self, image):
         return self._recognize_candidates(image)
@@ -1467,9 +1628,10 @@ class CameraOCRScreenStateProvider:
                 timings=timings,
                 total_started=total_started,
                 frame_id=sequence,
+                expected=expected,
             )
         else:
-            candidates = self.visible_text_candidates_from_image(image)
+            candidates = self._recognize_candidates(image, expected=expected)
         with measure_timing("ocr_matching"):
             complete_text = " ".join(item["text"] for item in candidates).casefold()
             return expected in complete_text
@@ -1614,6 +1776,7 @@ class CameraOCRScreenStateProvider:
                 timings=fallback_timings,
                 frame_id=sequence,
                 scope="full_fallback",
+                expected=expected,
             )
             roi_state.update(misses=0, last_fallback=time.monotonic())
         else:
@@ -1623,6 +1786,7 @@ class CameraOCRScreenStateProvider:
                 total_started=total_started,
                 frame_id=sequence,
                 scope="full",
+                expected=expected,
             )
         return True, self._candidates_contain(candidates, expected)
 

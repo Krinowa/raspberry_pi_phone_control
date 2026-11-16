@@ -20,7 +20,7 @@ PROTECTED_SCREEN_INPUT = re.compile(
 )
 KEYBOARD_KINDS = {"numeric", "alphabetic", "custom"}
 NUMERIC_KEY_LABELS = set("0123456789.") | {"BACKSPACE"}
-ALPHABETIC_KEY_LABELS = set("abcdefghijklmnopqrstuvwxyz ") | {"backspace"}
+ALPHABETIC_KEY_LABELS = set("abcdefghijklmnopqrstuvwxyz0123456789 ") | {"backspace"}
 MAX_CUSTOM_KEYS = 100
 MAX_CUSTOM_KEY_LABEL = 32
 MAX_CONDITION_DEPTH = 5
@@ -130,7 +130,7 @@ def normalize_capture_keyboard_labels(kind, labels):
         ):
             label = "BACKSPACE"
         elif kind == "alphabetic" and isinstance(label, str):
-            label = "backspace" if label.casefold() == "backspace" else label.lower()
+            label = "backspace" if label.casefold() == "backspace" else label
         normalized.append(label)
     validate_keyboard_labels(kind, normalized)
     return normalized
@@ -156,7 +156,8 @@ def validate_keyboard_labels(kind, labels):
         label not in ALPHABETIC_KEY_LABELS for label in labels
     ):
         raise ValueError(
-            "Alphabetic keyboards support lowercase a-z, space, and backspace."
+            "Alphabetic keyboards support lowercase a-z, digits 0-9, space, "
+            "and backspace."
         )
     if kind == "custom":
         for label in labels:
