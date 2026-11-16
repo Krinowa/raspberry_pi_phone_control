@@ -194,6 +194,22 @@
     "workflow.addSpecialCase": "Add Special Case",
     "workflow.addExpectedText": "Add Expected Text",
     "workflow.expectedText": "Expected text: {text}",
+    "workflow.recordingTransferBranch": "Recording {method} branch",
+    "workflow.transferBranchStatus": "{method} · {count} recorded {action}",
+    "workflow.error.transferBranchList":
+      "Transfer-method branch {method} must be a list of workflow steps.",
+    "workflow.error.transferBranchEmpty":
+      "Transfer-method branch {method} must not be empty.",
+    "workflow.error.transferBranchInput":
+      "Transfer-method branch {method} must input {field}.",
+    "workflow.error.transferBranchVerify":
+      "Transfer-method branch {method} must verify {field}.",
+    "workflow.error.paymentTransferBranchMissing":
+      "Payment workflow has no explicit branch for transfer_method {method}.",
+    "workflow.error.runTransferBranchMissing":
+      "Workflow has no configured branch for transfer_method {method}.",
+    "workflow.error.transferNesting":
+      "Transfer-method condition nesting cannot exceed {levels} levels.",
     "workflow.notStarted": "Not started",
     "workflow.technicalDetails": "Technical details",
     "workflow.runAction": "Run…",
@@ -509,6 +525,20 @@
     "workflow.addSpecialCase": "新增特殊情況",
     "workflow.addExpectedText": "新增預期文字",
     "workflow.expectedText": "預期文字：{text}",
+    "workflow.recordingTransferBranch": "正在錄製 {method} 分支",
+    "workflow.transferBranchStatus": "{method} · 已錄製 {count} 個{action}",
+    "workflow.error.transferBranchList":
+      "轉賬方式分支 {method} 必須為工作流程步驟清單。",
+    "workflow.error.transferBranchEmpty": "轉賬方式分支 {method} 不得為空。",
+    "workflow.error.transferBranchInput":
+      "轉賬方式分支 {method} 必須輸入 {field}。",
+    "workflow.error.transferBranchVerify":
+      "轉賬方式分支 {method} 必須驗證 {field}。",
+    "workflow.error.paymentTransferBranchMissing":
+      "付款工作流程未有為 transfer_method {method} 設定明確分支。",
+    "workflow.error.runTransferBranchMissing":
+      "工作流程未有為 transfer_method {method} 設定分支。",
+    "workflow.error.transferNesting": "轉賬方式條件不可嵌套超過 {levels} 層。",
     "workflow.notStarted": "尚未開始",
     "workflow.technicalDetails": "技術詳情",
     "workflow.runAction": "執行…",
@@ -1185,7 +1215,7 @@
     "Review recording and save workflow": "檢視錄製內容並儲存工作流程",
     "Actions recorded: 0": "已錄製操作：0",
     "Undo Last": "復原上一步",
-    "Expect Current Screen": "預期目前畫面",
+    "Expect Current Screen": "驗證目前畫面",
     "Finish Special Case": "完成特殊情況",
     "Add & Type Now": "新增並立即輸入",
     "Custom Value": "自訂數值",
@@ -1215,6 +1245,11 @@
     "Capture this key": "擷取此按鍵",
     "Tap this key on the phone": "在手機上點按此鍵",
     "Digits 0-9 are included.": "包括數字 0 至 9。",
+    "Include digits (0–9)": "包含數字（0–9）",
+    "Lowercase QWERTY keys and digits 0-9 are included.":
+      "包括小寫 QWERTY 按鍵及數字 0 至 9。",
+    "Enable only when digits remain visible on the same keyboard layout. Layout switching is not supported.":
+      "只應在數字於同一鍵盤版面持續顯示時啟用。不支援切換鍵盤版面。",
     "Include decimal": "包括小數點",
     "Include space": "包括空格",
     "Include backspace": "包括退格鍵",
@@ -1222,6 +1257,47 @@
       "驗證通過後工作流程才會繼續。",
     "Verification never resumes or retries the failed workflow.":
       "驗證不會恢復或重試失敗的工作流程。",
+    "Condition source": "條件來源",
+    "Branch on visible screen text or the validated withdrawal API transfer method.":
+      "根據畫面上的文字，或已驗證的提款 API 轉賬方式進行分支。",
+    "Screen Text": "畫面文字",
+    "Withdrawal API": "提款 API",
+    "API field": "API 欄位",
+    "Transfer Method": "轉賬方式",
+    "Branch to record": "要錄製的分支",
+    "Real withdrawals always use the validated API value. There is no default branch.":
+      "實際提款一律使用已驗證的 API 值，並無預設分支。",
+    "Record Branch": "錄製分支",
+    "Record More": "繼續錄製",
+    "No steps recorded — branch is unsafe": "尚未錄製步驟 — 此分支並不安全",
+    "Withdrawal API — Transfer Method": "提款 API — 轉賬方式",
+    "Simulate transfer method": "模擬轉賬方式",
+    "Manual test only; never overrides a withdrawal.":
+      "僅供手動測試；絕不會覆蓋提款 API 值。",
+    "Manual Simulation": "手動模擬",
+    "Bank Account": "銀行戶口",
+    "Mobile Number": "手提電話號碼",
+    "Unsupported Transfer Method": "不支援的轉賬方式",
+    "The Transfer Method condition is no longer available.":
+      "轉賬方式條件已不再可用。",
+    "A Transfer Method branch must not be empty.": "轉賬方式分支不得為空。",
+    "Manual simulation requires transfer_method only.":
+      "手動模擬只可指定 transfer_method。",
+    "Expected variables and optional simulation only.":
+      "只可提供預期變數及可選模擬設定。",
+    "Choose a valid condition branch.": "請選擇有效的條件分支。",
+    "The Special Case branch is no longer available.":
+      "特殊情況分支已不再可用。",
+    "Choose Screen Text or Withdrawal API.": "請選擇畫面文字或提款 API。",
+    "Only Withdrawal API branches can edit an existing condition.":
+      "只有提款 API 分支可編輯現有條件。",
+    "Unsupported workflow execution context.": "不支援的工作流程執行上下文。",
+    "Transfer-method condition must contain explicit branches.":
+      "轉賬方式條件必須包含明確分支。",
+    "Transfer-method condition contains an unsupported branch.":
+      "轉賬方式條件包含不支援的分支。",
+    "Transfer-method conditions are only valid in payment workflows.":
+      "轉賬方式條件只適用於付款工作流程。",
     "Verify field": "驗證欄位",
     "Expected text": "預期文字",
     "Choose expected text": "選擇預期文字",
@@ -1858,6 +1934,48 @@
       )
     )
       return t("error.networkRequestFailed");
+    let match =
+      /^Transfer-method branch (\S+) must be a list of workflow steps\.$/.exec(
+        source,
+      );
+    if (match)
+      return t("workflow.error.transferBranchList", { method: match[1] });
+    match = /^Transfer-method branch (\S+) must not be empty\.$/.exec(source);
+    if (match)
+      return t("workflow.error.transferBranchEmpty", { method: match[1] });
+    match = /^Transfer-method branch (\S+) must input (\S+)\.$/.exec(source);
+    if (match)
+      return t("workflow.error.transferBranchInput", {
+        method: match[1],
+        field: match[2],
+      });
+    match = /^Transfer-method branch (\S+) must verify (\S+)\.$/.exec(source);
+    if (match)
+      return t("workflow.error.transferBranchVerify", {
+        method: match[1],
+        field: match[2],
+      });
+    match =
+      /^Payment workflow has no explicit branch for transfer_method (\S+)\.$/.exec(
+        source,
+      );
+    if (match)
+      return t("workflow.error.paymentTransferBranchMissing", {
+        method: match[1],
+      });
+    match =
+      /^Workflow has no configured branch for transfer_method (\S+)\.$/.exec(
+        source,
+      );
+    if (match)
+      return t("workflow.error.runTransferBranchMissing", {
+        method: match[1],
+      });
+    match =
+      /^Transfer-method condition nesting cannot exceed (\d+) levels\.$/.exec(
+        source,
+      );
+    if (match) return t("workflow.error.transferNesting", { levels: match[1] });
     return translateEnglish(source);
   }
 

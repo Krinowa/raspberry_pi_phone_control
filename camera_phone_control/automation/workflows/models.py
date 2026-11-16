@@ -13,6 +13,7 @@ STEP_TYPES = {
     "wait_for_text",
     "verify_text",
     "if_text",
+    "switch_transfer_method",
     "capture_screen",
     "ocr_value",
     "manual_checkpoint",

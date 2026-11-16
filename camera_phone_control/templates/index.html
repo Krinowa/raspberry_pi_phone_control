@@ -1105,6 +1105,8 @@ Select Refresh Logs to load recent activity.</pre
                     <select id="record-variable-name">
                       <option value="account_number">Account Number</option>
 
+                      <option value="mobile_no">Mobile Number</option>
+
                       <option value="amount">Amount</option>
 
                       <option value="bank_name">Bank Name</option>
@@ -1254,44 +1256,71 @@ Select Refresh Logs to load recent activity.</pre
               <h3>Special Case</h3>
 
               <p class="small">
-                Sometimes something extra appears here. Record what to do when
-                it does.
+                Branch on visible screen text or the validated withdrawal API
+                transfer method.
               </p>
 
               <label>
-                When this appears
-
-                <input
-                  id="condition-text-value"
-                  maxlength="500"
-                  autocomplete="off"
-                />
+                Condition source
+                <select id="condition-source">
+                  <option value="screen_text">Screen Text</option>
+                  <option value="withdrawal_api">Withdrawal API</option>
+                </select>
               </label>
 
-              <label class="duration-field">
-                Check for up to
+              <div id="condition-screen-text-fields">
+                <label>
+                  When this appears
 
-                <span>
                   <input
-                    id="condition-text-timeout"
-                    type="number"
-                    min="0.1"
-                    max="300"
-                    step="any"
-                    value="2"
+                    id="condition-text-value"
+                    maxlength="500"
+                    autocomplete="off"
                   />
+                </label>
 
-                  seconds
-                </span>
-              </label>
+                <label class="duration-field">
+                  Check for up to
 
-              <details id="condition-text-advanced" class="advanced-options">
-                <summary>Advanced options</summary>
+                  <span>
+                    <input
+                      id="condition-text-timeout"
+                      type="number"
+                      min="0.1"
+                      max="300"
+                      step="any"
+                      value="2"
+                    />
 
-                <div id="condition-roi-picker"></div>
-              </details>
+                    seconds
+                  </span>
+                </label>
 
-              <p class="small">If not found: Continue normally</p>
+                <details id="condition-text-advanced" class="advanced-options">
+                  <summary>Advanced options</summary>
+
+                  <div id="condition-roi-picker"></div>
+                </details>
+
+                <p class="small">If not found: Continue normally</p>
+              </div>
+
+              <div id="condition-api-fields" hidden>
+                <label>
+                  API field
+                  <select id="condition-api-field" disabled>
+                    <option value="transfer_method">Transfer Method</option>
+                  </select>
+                </label>
+                <label>
+                  Branch to record
+                  <select id="condition-transfer-method"></select>
+                </label>
+                <p class="small">
+                  Real withdrawals always use the validated API value. There is
+                  no default branch.
+                </p>
+              </div>
 
               <div class="flow-buttons">
                 <button id="alternate-screen-start" type="button">
@@ -1779,6 +1808,7 @@ Select Refresh Logs to load recent activity.</pre
                 <select id="step-verify-field">
                   <option value="account_name">Account Name</option>
                   <option value="account_number">Account Number</option>
+                  <option value="mobile_no">Mobile Number</option>
                   <option value="bank_name">Bank Name</option>
                   <option value="amount">Amount</option>
                 </select>
@@ -1816,6 +1846,8 @@ Select Refresh Logs to load recent activity.</pre
 
                   <select id="variable-name">
                     <option value="account_number">Account Number</option>
+
+                    <option value="mobile_no">Mobile Number</option>
 
                     <option value="amount">Amount</option>
 
@@ -2040,6 +2072,7 @@ Select Refresh Logs to load recent activity.</pre
                         <select id="verify-field">
                           <option value="account_name">Account Name</option>
                           <option value="account_number">Account Number</option>
+                          <option value="mobile_no">Mobile Number</option>
                           <option value="bank_name">Bank Name</option>
                           <option value="amount">Amount</option>
                         </select>
@@ -2276,6 +2309,16 @@ Select Refresh Logs to load recent activity.</pre
 
           <form id="flow-run-form">
             <div id="run-variables"></div>
+
+            <div id="run-transfer-method-simulation" hidden>
+              <label>
+                Simulate transfer method
+                <select id="run-transfer-method"></select>
+              </label>
+              <p class="small">
+                Manual test only; never overrides a withdrawal.
+              </p>
+            </div>
 
             <button id="flow-run" class="primary" disabled>Start Run</button>
           </form>

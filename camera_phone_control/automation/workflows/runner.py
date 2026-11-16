@@ -5,6 +5,7 @@ import logging
 import time
 
 from diagnostic_logging import diagnostic_context, log_event
+from automation.transfer_methods import validate_transfer_method
 
 from .validation import validate_workflow, resolve_variables
 from ..context import Cancelled
@@ -91,6 +92,7 @@ class WorkflowRunner:
         capture_screen=None,
         output_callback=None,
         diagnostic_failure_callback=None,
+        execution_context=None,
     ):
         self.context = context
         self.external_screen = external_screen
@@ -103,6 +105,7 @@ class WorkflowRunner:
         self.capture_screen = capture_screen
         self.output_callback = output_callback
         self.diagnostic_failure_callback = diagnostic_failure_callback
+        self.execution_context = dict(execution_context or {})
 
     @staticmethod
     def _diagnostic_error_code(exc, step_type):
@@ -128,7 +131,11 @@ class WorkflowRunner:
             or start_step_index > len(workflow["steps"])
         ):
             raise ValueError("start_step_index is outside the workflow steps.")
-        values = resolve_variables(workflow, variables)
+        values = resolve_variables(
+            workflow,
+            variables,
+            execution_context=self.execution_context,
+        )
         ctx = self.context
         ctx.state.step_count = len(workflow["steps"])
         ctx.logger.info("Workflow started.")
@@ -370,6 +377,23 @@ class WorkflowRunner:
                 values or {},
                 keyboards or {},
                 "THEN" if matched else "ELSE",
+            )
+        elif kind == "switch_transfer_method":
+            method = validate_transfer_method(
+                self.execution_context.get("transfer_method")
+            )
+            branch = step["branches"].get(method)
+            if not branch:
+                raise ValueError(
+                    f"Workflow has no configured branch for transfer_method {method}."
+                )
+            self.timing.annotate_current(selected_branch=method)
+            ctx.logger.info("Selected withdrawal transfer-method branch=%s.", method)
+            self._execute_branch(
+                branch,
+                values or {},
+                keyboards or {},
+                "TRANSFER_METHOD:" + method,
             )
         elif kind == "ocr_value":
             value = read_currency(self.screen_state_provider, step["roi"], ctx)

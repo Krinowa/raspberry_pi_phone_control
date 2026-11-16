@@ -448,6 +448,7 @@ class JobScheduler:
                 recovery_workflow_id=original.recovery_workflow_id,
                 retry_of_job_id=original.job_id,
                 start_step_index=start_step_index,
+                protected_metadata=deepcopy(original.protected_metadata),
             )
 
             return self.store.create(retry)

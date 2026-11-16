@@ -207,6 +207,31 @@ Configuration is created in the writable `config` directory after installation.
 The release spec never embeds `client.env` or a source `.env`; credentials and
 environment-specific endpoints must be commissioned separately.
 
+Optional transfer-method aliases are loaded once at startup from
+`%LOCALAPPDATA%\Phone Controller\config\transfer_methods.json`. The file is not
+created automatically and is retained across EXE upgrades. It accepts only the
+compiled `account_number` and `mobile_no` identifier profiles:
+
+```json
+{
+  "schema_version": 1,
+  "methods": [
+    {
+      "value": "duitnow_mobile",
+      "label": "DuitNow Mobile",
+      "identifier_profile": "mobile_no"
+    }
+  ]
+}
+```
+
+Restart Phone Controller after changing the file. Invalid JSON, built-in
+overrides, duplicate values, and unknown profiles stop application startup so
+withdrawals cannot run with an uncertain registry. Record and validate an
+explicit workflow branch before the external API begins sending a new value.
+For development and isolated tests, `PHONE_TRANSFER_METHODS_FILE` may point to
+an alternate JSON file.
+
 Developer tools are disabled by default. To enable them for an installed client,
 set `PHONE_DEVELOPER_MODE_KEY` to a non-empty value in
 `%LOCALAPPDATA%\Phone Controller\config\.env`.

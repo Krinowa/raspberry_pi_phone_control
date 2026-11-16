@@ -6,6 +6,12 @@ import threading
 import time
 import uuid
 
+from automation.transfer_methods import (
+    transfer_method_definition,
+    transfer_method_fingerprint,
+    validate_recipient_identifier,
+    validate_transfer_method,
+)
 from .balance import final_amount
 from .client import APIError
 from .journal import TERMINAL
@@ -160,6 +166,17 @@ class WithdrawDispatcher:
             for item in pending:
                 withdraw_id = item.get("id")
                 tx_id = item.get("tx_id")
+                try:
+                    method = validate_transfer_method(item.get("transfer_method"))
+                    validate_recipient_identifier(item, method)
+                except ValueError:
+                    LOG.info(
+                        "[withdraw-dispatch] client-pending skip "
+                        "reason=invalid_transfer_method id=%s tx_id=%s",
+                        _sanitized_pending_value(withdraw_id),
+                        _sanitized_pending_value(tx_id),
+                    )
+                    continue
                 LOG.info(
                     "[withdraw-dispatch] client-pending device=%s id=%s "
                     "tx_id=%s final_amount_present=%s",
@@ -185,7 +202,10 @@ class WithdrawDispatcher:
                 found = by_id.get(withdraw_id)
 
                 if found:
-                    if found["item"].get("tx_id") != tx_id:
+                    if (
+                        found["item"].get("tx_id") != tx_id
+                        or found["item"].get("transfer_method") != method
+                    ):
                         inconsistent.add(withdraw_id)
                         LOG.info(
                             "[withdraw-dispatch] client-pending skip "
@@ -305,6 +325,16 @@ class WithdrawDispatcher:
             reason, detail = self._readiness_skip_reason(payment_error)
             unavailable[worker.device_id] = reason
             return self._log_skip(worker, item, reason, detail=detail)
+        method_readiness = getattr(worker, "payment_method_readiness", None)
+        if callable(method_readiness):
+            method_ready, method_error = method_readiness(item["transfer_method"])
+            if not method_ready:
+                return self._log_skip(
+                    worker,
+                    item,
+                    "payment_method_branch_not_ready",
+                    detail=method_error,
+                )
         balance_valid = getattr(worker, "balance_valid", None)
         fresh = balance_valid() if callable(balance_valid) else worker.cache.valid()
         if not fresh:
@@ -373,6 +403,8 @@ class WithdrawDispatcher:
 
         token = "withdraw-dispatch-" + uuid.uuid4().hex
         amount = final_amount(item)
+        method = validate_transfer_method(item["transfer_method"])
+        method_definition = transfer_method_definition(method)
 
         with self.scheduler.lock:
             if not self.ready_for_work(worker.device_id):
@@ -420,6 +452,9 @@ class WithdrawDispatcher:
                 tx_id=item["tx_id"],
                 operator_id=worker.api["operator_id"],
                 final_amount=format(amount, ".2f"),
+                transfer_method=method,
+                transfer_method_profile=method_definition["identifier_profile"],
+                transfer_method_fingerprint=transfer_method_fingerprint(method),
             )
         except Exception:
             self._clear_reservation(worker, token)
@@ -535,6 +570,8 @@ class WithdrawDispatcher:
 
     def _dispatch_item(self, item, visible, unavailable):
         try:
+            method = validate_transfer_method(item.get("transfer_method"))
+            validate_recipient_identifier(item, method)
             final_amount(item)
         except (ValueError, TypeError):
             LOG.info(

@@ -14,7 +14,15 @@ from ..runner import Runner
 from .runner import WorkflowRunner
 from .screenshots import WorkflowScreenshotStore
 from .timing import WorkflowTiming
-from .validation import validate_workflow, resolve_variables
+from .validation import (
+    require_transfer_method_branch,
+    resolve_variables,
+    validate_workflow,
+)
+from automation.transfer_methods import (
+    validate_stored_transfer_method,
+    validate_transfer_method,
+)
 
 
 class RemoteTakeoverRefused(Exception):
@@ -31,10 +39,18 @@ def critical_step_numbers(workflow):
     def critical(step):
         if step.get("critical") is True:
             return True
-        return step.get("type") == "if_text" and any(
-            critical(child)
-            for child in step.get("then_steps", []) + step.get("else_steps", [])
-        )
+        if step.get("type") == "if_text":
+            return any(
+                critical(child)
+                for child in step.get("then_steps", []) + step.get("else_steps", [])
+            )
+        if step.get("type") == "switch_transfer_method":
+            return any(
+                critical(child)
+                for branch in step.get("branches", {}).values()
+                for child in branch
+            )
+        return False
 
     return {
         number for number, step in enumerate(workflow["steps"], 1) if critical(step)
@@ -117,10 +133,21 @@ class WorkflowService:
         cancel_event=None,
         start_step_index=0,
         job_id=None,
+        execution_context=None,
     ):
         workflow = validate_workflow(workflow)
+        execution_context = deepcopy(execution_context or {})
+        if set(execution_context) - {"transfer_method"}:
+            raise ValueError("Unsupported workflow execution context.")
+        if "transfer_method" in execution_context:
+            execution_context["transfer_method"] = validate_transfer_method(
+                execution_context["transfer_method"]
+            )
+            require_transfer_method_branch(
+                workflow, execution_context["transfer_method"]
+            )
         variables = deepcopy(variables)
-        resolve_variables(workflow, variables)
+        resolve_variables(workflow, variables, execution_context=execution_context)
         backend_names()
         target_device_id = self.device_id if device_id is None else device_id
         with self.lock:
@@ -234,6 +261,7 @@ class WorkflowService:
                                 capture_screen=capture_screen,
                                 output_callback=store_output,
                                 diagnostic_failure_callback=store_diagnostic_failure,
+                                execution_context=execution_context,
                             ).run(
                                 workflow,
                                 variables,
@@ -366,6 +394,14 @@ class WorkflowService:
         if workflow.get("id") != job.workflow:
             raise ValueError("Job workflow does not match the loaded workflow.")
         options = {"device_id": job.device_id, "job_id": job.job_id}
+        if job.action == "withdraw_v2":
+            metadata = job.protected_metadata
+            definition = validate_stored_transfer_method(
+                metadata.get("transfer_method"),
+                metadata.get("transfer_method_profile"),
+                metadata.get("transfer_method_fingerprint"),
+            )
+            options["execution_context"] = {"transfer_method": definition["value"]}
         options["start_step_index"] = job.start_step_index
         if cancel_event is not None:
             options["cancel_event"] = cancel_event

@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 from automation.jobs.storage import RecordConflict, RecordNotFound
+from automation.transfer_methods import validate_stored_transfer_method
 
 from .balance import (
     CameraOCRBalanceProvider,
@@ -77,6 +78,7 @@ class WithdrawManager:
         self.scheduler, self.executor = scheduler, executor
 
         self.journal = WithdrawJournal(journal_path)
+        self.journal.validate_transfer_method_compatibility()
 
         self.worker_factory = worker_factory
 
@@ -153,7 +155,7 @@ class WithdrawManager:
         )
 
         anchored = (
-            metadata.get("version") == 1
+            metadata.get("version") in {1, 2, 3}
             and metadata.get("assigned_device_id") == job.device_id
             and metadata.get("account_id") == job.account_id
             and metadata.get("tx_id") == job.external_ref
@@ -183,6 +185,19 @@ class WithdrawManager:
         lock_expires_at = metadata.get("lock_expires_at") if anchored else None
 
         final_amount = metadata.get("final_amount") if anchored else None
+        transfer_method = metadata.get("transfer_method") if anchored else None
+        transfer_method_profile = (
+            metadata.get("transfer_method_profile") if anchored else None
+        )
+        transfer_method_fingerprint = (
+            metadata.get("transfer_method_fingerprint") if anchored else None
+        )
+        if transfer_method is not None:
+            validate_stored_transfer_method(
+                transfer_method,
+                transfer_method_profile,
+                transfer_method_fingerprint,
+            )
 
         if raw is not None and raw.get("lock_expires_at") != lock_expires_at:
 
@@ -236,6 +251,9 @@ class WithdrawManager:
             "job_id": job.job_id,
             "retry_of_job_id": job.retry_of_job_id,
             "final_amount": final_amount,
+            "transfer_method": transfer_method,
+            "transfer_method_profile": transfer_method_profile,
+            "transfer_method_fingerprint": transfer_method_fingerprint,
             "raw_withdrawal": raw,
             "lock_expires_at": lock_expires_at,
             "recovery_identity_complete": not missing,

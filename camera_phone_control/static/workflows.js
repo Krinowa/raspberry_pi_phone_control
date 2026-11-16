@@ -37,6 +37,7 @@
     working = false,
     gesture = null;
   let availableFlows = [];
+  let transferMethods = [];
   let flowLoadGeneration = 0;
   let editingId = null,
     timelineSignature = "",
@@ -171,6 +172,8 @@
         `Special Case — “${step.text}”`,
         { text: step.text },
       );
+    if (step.type === "switch_transfer_method")
+      return workflowLiteral("Withdrawal API — Transfer Method");
     if (step.type === "ocr_value")
       return workflowUi(
         "workflow.step.readBalance",
@@ -213,6 +216,9 @@
       if (step.type === "if_text") {
         result.push(...allWorkflowSteps(step.then_steps));
         result.push(...allWorkflowSteps(step.else_steps));
+      } else if (step.type === "switch_transfer_method") {
+        for (const branch of Object.values(step.branches || {}))
+          result.push(...allWorkflowSteps(branch));
       }
     }
     return result;
@@ -263,7 +269,41 @@
     returnToVariableInput = false,
     alternateSetupOpen = false,
     specialCaseAfterStepId = null,
+    specialCaseConditionId = null,
     enabledManualForReviewSpecialCase = false;
+
+  const transferMethodDefinition = (value) =>
+    transferMethods.find((method) => method.value === value);
+
+  function transferMethodLabel(method) {
+    const builtInLabels = {
+      bank_account: "Bank Account",
+      mobile_number: "Mobile Number",
+    };
+    const builtIn = builtInLabels[method?.value];
+    return builtIn
+      ? workflowLiteral(builtIn)
+      : method?.label || method?.value || "";
+  }
+
+  function populateTransferMethodSelect(select) {
+    const current = select.value;
+    select.replaceChildren(
+      ...transferMethods.map(
+        (method) => new Option(transferMethodLabel(method), method.value),
+      ),
+    );
+    if (transferMethods.some((method) => method.value === current))
+      select.value = current;
+    else select.value = transferMethods[0]?.value || "";
+  }
+
+  function renderConditionSource() {
+    const api = $("condition-source").value === "withdrawal_api";
+    setSectionVisible("condition-screen-text-fields", !api);
+    setSectionVisible("condition-api-fields", api);
+    $("condition-api-field").disabled = true;
+  }
 
   const annotationBusy = () =>
     !!expectedMode ||
@@ -847,6 +887,42 @@
           row.append(branches);
         }
 
+        if (step.type === "switch_transfer_method") {
+          const branches = document.createElement("div");
+          branches.className = "condition-branches";
+          for (const method of transferMethods) {
+            const section = document.createElement("section"),
+              heading = document.createElement("h5"),
+              list = document.createElement("ol");
+            heading.textContent = `${transferMethodLabel(method)} · ${method.identifier_field}`;
+            list.className = "condition-step-list";
+            const branchSteps = step.branches?.[method.value] || [];
+            const childRows = renderRows(branchSteps, true);
+            list.replaceChildren(...childRows);
+            if (!childRows.length) {
+              const empty = document.createElement("li");
+              empty.className = "condition-empty";
+              workflowLiteralText(
+                empty,
+                "No steps recorded — branch is unsafe",
+              );
+              list.append(empty);
+            }
+            const recordBranch = button(
+              branchSteps.length ? "Record More" : "Record Branch",
+              () =>
+                openSpecialCaseSetup(null, {
+                  source: "withdrawal_api",
+                  transferMethod: method.value,
+                  conditionId: step.id,
+                }),
+            );
+            section.append(heading, list, recordBranch);
+            branches.append(section);
+          }
+          row.append(branches);
+        }
+
         if (!recording.active) row.append(actions);
         return row;
       });
@@ -1047,12 +1123,24 @@
       );
 
     if (recording.alternate_screen)
-      workflowUiText(
-        $("record-count"),
-        "workflow.lookingFor",
-        `Looking for: “${recording.alternate_screen.text}”`,
-        { text: recording.alternate_screen.text },
-      );
+      recording.alternate_screen.source === "withdrawal_api"
+        ? workflowUiText(
+            $("record-count"),
+            "workflow.recordingTransferBranch",
+            `Recording ${transferMethodLabel(transferMethodDefinition(recording.alternate_screen.branch)) || recording.alternate_screen.branch} branch`,
+            {
+              method:
+                transferMethodLabel(
+                  transferMethodDefinition(recording.alternate_screen.branch),
+                ) || recording.alternate_screen.branch,
+            },
+          )
+        : workflowUiText(
+            $("record-count"),
+            "workflow.lookingFor",
+            `Looking for: “${recording.alternate_screen.text}”`,
+            { text: recording.alternate_screen.text },
+          );
     else
       workflowLiteralText(
         $("record-count"),
@@ -1079,21 +1167,31 @@
     $("alternate-screen-finish").disabled = stopping || annotationBusy();
     $("alternate-screen-cancel").disabled = stopping || annotationBusy();
     if (recording.alternate_screen)
-      workflowUiText(
-        $("alternate-screen-status"),
-        "workflow.specialActive",
-        `Looking for: “${recording.alternate_screen.text}” · ${recording.alternate_screen.step_count} recorded ${recording.alternate_screen.step_count === 1 ? "action" : "actions"}`,
-        {
-          text: recording.alternate_screen.text,
-          count: recording.alternate_screen.step_count,
-          action: workflowUi(
-            recording.alternate_screen.step_count === 1
-              ? "workflow.action.one"
-              : "workflow.action.many",
-            recording.alternate_screen.step_count === 1 ? "action" : "actions",
-          ),
-        },
-      );
+      recording.alternate_screen.source === "withdrawal_api"
+        ? workflowUiText(
+            $("alternate-screen-status"),
+            "workflow.transferBranchStatus",
+            `${transferMethodLabel(transferMethodDefinition(recording.alternate_screen.branch)) || recording.alternate_screen.branch} · ${recording.alternate_screen.step_count} recorded ${recording.alternate_screen.step_count === 1 ? "action" : "actions"}`,
+            {
+              method:
+                transferMethodLabel(
+                  transferMethodDefinition(recording.alternate_screen.branch),
+                ) || recording.alternate_screen.branch,
+              count: recording.alternate_screen.step_count,
+              action: workflowUi(
+                recording.alternate_screen.step_count === 1
+                  ? "workflow.action.one"
+                  : "workflow.action.many",
+                recording.alternate_screen.step_count === 1
+                  ? "action"
+                  : "actions",
+              ),
+            },
+          )
+        : workflowLiteralText(
+            $("alternate-screen-status"),
+            `Looking for: “${recording.alternate_screen.text}” · ${recording.alternate_screen.step_count} recorded ${recording.alternate_screen.step_count === 1 ? "action" : "actions"}`,
+          );
     else $("alternate-screen-status").textContent = "";
     $("record-screenshot-here").disabled =
       working || stopping || annotationBusy();
@@ -1234,6 +1332,7 @@
   function variableChoiceFields(selectId, customFieldId, customId, name) {
     const predefined = [
       "account_number",
+      "mobile_no",
       "account_name",
       "amount",
       "bank_name",
@@ -1878,6 +1977,10 @@
       label: "Account Number",
       match_mode: "account_number",
     }),
+    mobile_no: Object.freeze({
+      label: "Mobile Number",
+      match_mode: "account_number",
+    }),
     bank_name: Object.freeze({ label: "Bank Name", match_mode: "contains" }),
     amount: Object.freeze({ label: "Amount", match_mode: "amount" }),
   });
@@ -2261,7 +2364,7 @@
 
   $("record-new").addEventListener("click", () => $("record-start").click());
 
-  async function openSpecialCaseSetup(afterStepId = null) {
+  async function openSpecialCaseSetup(afterStepId = null, options = {}) {
     if (alternateSetupOpen) {
       show("Finish or cancel the current Special Case setup first.", true);
       return;
@@ -2272,7 +2375,7 @@
       return;
     }
 
-    const startedFromReview = !!afterStepId;
+    const startedFromReview = !!afterStepId || !!options.conditionId;
 
     enabledManualForReviewSpecialCase = false;
 
@@ -2289,7 +2392,14 @@
     }
 
     specialCaseAfterStepId = afterStepId;
+    specialCaseConditionId = options.conditionId || null;
     alternateSetupOpen = true;
+
+    $("condition-source").value = options.source || "screen_text";
+    populateTransferMethodSelect($("condition-transfer-method"));
+    if (options.transferMethod)
+      $("condition-transfer-method").value = options.transferMethod;
+    renderConditionSource();
 
     conditionROIPicker.reset(null);
     $("condition-text-advanced").open = false;
@@ -2308,6 +2418,8 @@
     task(() => openSpecialCaseSetup()),
   );
 
+  $("condition-source").addEventListener("change", renderConditionSource);
+
   $("alternate-screen-setup-cancel").addEventListener("click", () =>
     task(async () => {
       if (enabledManualForReviewSpecialCase) {
@@ -2320,6 +2432,7 @@
 
       alternateSetupOpen = false;
       specialCaseAfterStepId = null;
+      specialCaseConditionId = null;
 
       conditionROIPicker.reset(null);
       $("condition-text-advanced").open = false;
@@ -2334,13 +2447,22 @@
       await flushText();
 
       recording = await api("/api/recorder/alternate-screen/start", {
-        ...textWaitFields("condition"),
+        ...($("condition-source").value === "withdrawal_api"
+          ? {
+              source: "withdrawal_api",
+              transfer_method: $("condition-transfer-method").value,
+              ...(specialCaseConditionId
+                ? { condition_id: specialCaseConditionId }
+                : {}),
+            }
+          : textWaitFields("condition")),
         ...(specialCaseAfterStepId
           ? { after_step_id: specialCaseAfterStepId }
           : {}),
       });
 
       specialCaseAfterStepId = null;
+      specialCaseConditionId = null;
       alternateSetupOpen = false;
       conditionROIPicker.reset(null);
       $("condition-text-advanced").open = false;
@@ -2540,6 +2662,7 @@
           label:
             {
               account_number: "Account Number",
+              mobile_no: "Mobile Number",
               amount: "Amount",
               bank_name: "Bank Name",
             }[name] || name.replaceAll("_", " "),
@@ -3289,33 +3412,61 @@
       "Run: " + selected.name,
       { name: selected.name },
     );
-    const fields = selected.variables
-      .filter((variable) => variable.required && variable.default == null)
-      .map((variable) => {
-        const label = document.createElement("label"),
-          input = document.createElement("input");
-        label.textContent = variable.label;
-        input.name = variable.name;
-        input.type = variable.type === "number" ? "number" : "text";
-        if (input.type === "number") input.step = "any";
-        input.required = true;
-        input.value = "";
-        input.autocomplete = "off";
-        label.append(input);
-        return label;
-      });
-
-    $("run-variables").replaceChildren(...fields);
+    const needsTransferMethod = allWorkflowSteps(selected.steps).some(
+      (step) => step.type === "switch_transfer_method",
+    );
+    populateTransferMethodSelect($("run-transfer-method"));
+    $("run-transfer-method-simulation").hidden = !needsTransferMethod;
+    renderRunVariables();
     renderRecording();
   }
 
+  function runVariableDefinitions() {
+    const simulatedMethod = $("run-transfer-method-simulation").hidden
+      ? null
+      : $("run-transfer-method").value;
+    const selectedIdentifier =
+      transferMethodDefinition(simulatedMethod)?.identifier_field;
+    const inactiveIdentifiers = new Set(
+      selectedIdentifier
+        ? transferMethods
+            .filter((method) => method.identifier_field !== selectedIdentifier)
+            .map((method) => method.identifier_field)
+        : [],
+    );
+    return selected.variables.filter(
+      (variable) =>
+        variable.required &&
+        variable.default == null &&
+        !inactiveIdentifiers.has(variable.name),
+    );
+  }
+
+  function renderRunVariables() {
+    const fields = runVariableDefinitions().map((variable) => {
+      const label = document.createElement("label"),
+        input = document.createElement("input");
+      label.textContent = variable.label;
+      input.name = variable.name;
+      input.type = variable.type === "number" ? "number" : "text";
+      if (input.type === "number") input.step = "any";
+      input.required = true;
+      input.value = "";
+      input.autocomplete = "off";
+      label.append(input);
+      return label;
+    });
+
+    $("run-variables").replaceChildren(...fields);
+  }
+
   $("flows-refresh").addEventListener("click", () => task(loadFlows));
+  $("run-transfer-method").addEventListener("change", renderRunVariables);
   $("flow-run-form").addEventListener("submit", (event) => {
     event.preventDefault();
     task(async () => {
       const variables = {};
-      for (const definition of selected.variables) {
-        if (!definition.required || definition.default != null) continue;
+      for (const definition of runVariableDefinitions()) {
         const field = $("flow-run-form").elements.namedItem(definition.name);
         variables[definition.name] =
           field.value === ""
@@ -3324,7 +3475,13 @@
               ? Number(field.value)
               : field.value;
       }
-      running = await api(`/api/workflows/${selected.id}/run`, { variables });
+      const simulation = $("run-transfer-method-simulation").hidden
+        ? undefined
+        : { transfer_method: $("run-transfer-method").value };
+      running = await api(`/api/workflows/${selected.id}/run`, {
+        variables,
+        ...(simulation ? { simulation } : {}),
+      });
       for (const field of $("run-variables").querySelectorAll("input"))
         field.value = "";
       manual = false;
@@ -3447,6 +3604,8 @@
   }
 
   window.addEventListener?.("phonecontroller:languagechange", () => {
+    populateTransferMethodSelect($("condition-transfer-method"));
+    populateTransferMethodSelect($("run-transfer-method"));
     renderRecording();
     if (running) renderRun();
   });
@@ -3488,6 +3647,15 @@
   }
 
   task(async () => {
+    const methodResult = await api(
+      "/api/workflow-options/transfer-methods",
+      undefined,
+      "GET",
+    );
+    transferMethods = methodResult.transfer_methods || [];
+    populateTransferMethodSelect($("condition-transfer-method"));
+    populateTransferMethodSelect($("run-transfer-method"));
+    renderConditionSource();
     await loadFlows();
     recording = await api("/api/recorder", undefined, "GET");
     await openPendingExpectedText();

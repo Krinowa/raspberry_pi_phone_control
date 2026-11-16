@@ -6,6 +6,11 @@ import math
 import re
 import unicodedata
 from copy import deepcopy
+from automation.transfer_methods import (
+    BUILTIN_TRANSFER_METHODS,
+    TRANSFER_METHODS,
+    validate_transfer_method,
+)
 from ..coordinates import unit, normalized_roi
 from .models import STEP_TYPES, VARIABLE_TYPES, WORKFLOW_PURPOSES
 
@@ -310,6 +315,7 @@ def validate_workflow(workflow, *, allow_empty=False):
     ids = set()
 
     pending_steps = [(step, 0) for step in reversed(steps)]
+    transfer_switches = []
     validated_step_count = 0
     while pending_steps:
         step, depth = pending_steps.pop()
@@ -357,6 +363,7 @@ def validate_workflow(workflow, *, allow_empty=False):
                 "then_steps",
                 "else_steps",
             },
+            "switch_transfer_method": {"branches"},
             "capture_screen": {"output_key"},
             "ocr_value": {"roi", "parser", "output"},
             "manual_checkpoint": {"message"},
@@ -555,6 +562,34 @@ def validate_workflow(workflow, *, allow_empty=False):
                         (child, depth + 1) for child in reversed(nested)
                     )
 
+        elif kind == "switch_transfer_method":
+            if depth >= MAX_CONDITION_DEPTH:
+                raise ValueError(
+                    "Transfer-method condition nesting cannot exceed "
+                    f"{MAX_CONDITION_DEPTH} levels."
+                )
+            branches = step.get("branches")
+            if not isinstance(branches, dict) or not branches:
+                raise ValueError(
+                    "Transfer-method condition must contain explicit branches."
+                )
+            unknown = set(branches) - set(TRANSFER_METHODS)
+            if unknown:
+                raise ValueError(
+                    "Transfer-method condition contains an unsupported branch."
+                )
+            for method, nested in branches.items():
+                if not isinstance(nested, list):
+                    raise ValueError(
+                        f"Transfer-method branch {method} must be a list of workflow steps."
+                    )
+                if not nested and not allow_empty:
+                    raise ValueError(
+                        f"Transfer-method branch {method} must not be empty."
+                    )
+                pending_steps.extend((child, depth + 1) for child in reversed(nested))
+            transfer_switches.append(step)
+
         elif kind == "key":
             if not isinstance(step.get("key"), str) or step["key"].upper() not in KEYS:
                 raise ValueError("Unsupported workflow key.")
@@ -630,6 +665,68 @@ def validate_workflow(workflow, *, allow_empty=False):
             else:
                 raise ValueError("Input method must be hid or screen_keyboard.")
 
+    if transfer_switches and workflow.get("purpose", "payment") != "payment":
+        raise ValueError(
+            "Transfer-method conditions are only valid in payment workflows."
+        )
+
+    if not allow_empty and workflow.get("purpose", "payment") == "payment":
+        identifier_fields = {
+            definition["identifier_field"] for definition in TRANSFER_METHODS.values()
+        }
+
+        def validate_identifier_scope(branch_steps, selected_method=None):
+            selected_identifier = (
+                TRANSFER_METHODS[selected_method]["identifier_field"]
+                if selected_method in TRANSFER_METHODS
+                else None
+            )
+            for child in branch_steps:
+                variable = child.get("variable")
+                if (
+                    child.get("type") in {"input", "verify_text"}
+                    and variable in identifier_fields
+                    and variable != selected_identifier
+                ):
+                    raise ValueError(
+                        f"Recipient identifier {variable} must only be used in "
+                        "a branch with the matching identifier profile."
+                    )
+                if child.get("type") == "if_text":
+                    validate_identifier_scope(
+                        child.get("then_steps", []), selected_method
+                    )
+                    validate_identifier_scope(
+                        child.get("else_steps", []), selected_method
+                    )
+                elif child.get("type") == "switch_transfer_method":
+                    for nested_method, nested_branch in child["branches"].items():
+                        validate_identifier_scope(nested_branch, nested_method)
+
+        if transfer_switches:
+            validate_identifier_scope(steps)
+        for switch in transfer_switches:
+            for method, branch in switch["branches"].items():
+                identifier_field = TRANSFER_METHODS[method]["identifier_field"]
+                if not any(
+                    child.get("type") == "input"
+                    and child.get("source") == "variable"
+                    and child.get("variable") == identifier_field
+                    for child in branch
+                ):
+                    raise ValueError(
+                        f"Transfer-method branch {method} must input {identifier_field}."
+                    )
+                if not any(
+                    child.get("type") == "verify_text"
+                    and child.get("source") == "variable"
+                    and child.get("variable") == identifier_field
+                    for child in branch
+                ):
+                    raise ValueError(
+                        f"Transfer-method branch {method} must verify {identifier_field}."
+                    )
+
     if workflow.get("financial") and steps and steps[-1]["type"] != "manual_checkpoint":
         raise ValueError(
             "A financial flow must end with a manual authorization checkpoint."
@@ -637,7 +734,34 @@ def validate_workflow(workflow, *, allow_empty=False):
     return deepcopy(workflow)
 
 
-def resolve_variables(workflow, supplied=None):
+def require_transfer_method_branch(workflow, method):
+    """Fail before locking when a method has no explicit executable branch."""
+    method = validate_transfer_method(method)
+    pending = list(workflow.get("steps", []))
+    switches = []
+    while pending:
+        step = pending.pop()
+        if step.get("type") == "if_text":
+            pending.extend(step.get("then_steps", []))
+            pending.extend(step.get("else_steps", []))
+        elif step.get("type") == "switch_transfer_method":
+            switches.append(step)
+            for branch in step.get("branches", {}).values():
+                pending.extend(branch)
+    if not switches:
+        if method in BUILTIN_TRANSFER_METHODS:
+            return workflow
+        raise ValueError(
+            f"Payment workflow has no explicit branch for transfer_method {method}."
+        )
+    if any(not switch.get("branches", {}).get(method) for switch in switches):
+        raise ValueError(
+            f"Payment workflow has no explicit branch for transfer_method {method}."
+        )
+    return workflow
+
+
+def resolve_variables(workflow, supplied=None, *, execution_context=None):
     if supplied is None:
         supplied = {}
     if not isinstance(supplied, dict):
@@ -646,9 +770,20 @@ def resolve_variables(workflow, supplied=None):
     if set(supplied) - names:
         raise ValueError("Unknown workflow variable supplied.")
     resolved = {}
+    inactive_identifiers = set()
+    if execution_context and "transfer_method" in execution_context:
+        selected_method = validate_transfer_method(execution_context["transfer_method"])
+        selected_identifier = TRANSFER_METHODS[selected_method]["identifier_field"]
+        inactive_identifiers = {
+            definition["identifier_field"]
+            for definition in TRANSFER_METHODS.values()
+            if definition["identifier_field"] != selected_identifier
+        }
     for definition in workflow["variables"]:
         name = definition["name"]
         value = supplied[name] if name in supplied else definition.get("default")
+        if name in inactive_identifiers and value is None:
+            continue
         try:
             resolved[name] = validate_variable_value(definition, value)
         except ValueError as exc:
@@ -671,6 +806,9 @@ def validate_recovery_workflow(workflow):
         if step["type"] == "if_text":
             pending.extend(step["then_steps"])
             pending.extend(step["else_steps"])
+        elif step["type"] == "switch_transfer_method":
+            for branch in step["branches"].values():
+                pending.extend(branch)
     if any(
         step.get("critical") is True
         or step["type"] == "manual_checkpoint"

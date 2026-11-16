@@ -59,6 +59,7 @@ from automation.jobs.api import register_jobs
 from automation.jobs.storage import DeviceWorkflowAssignmentStore
 from automation.integrations.withdraw_v2.balance import balance_check_workflow
 from automation.integrations.withdraw_v2.manager import register_withdraw
+from automation.transfer_methods import load_transfer_methods
 from hardware.pi_api_client import (
     PiApiClient,
     PiApiError,
@@ -472,6 +473,9 @@ def create_app(
     agent_secret=None,
     remote_history=None,
 ):
+    # Transfer-method configuration is a startup snapshot. Invalid external
+    # configuration prevents workers from starting instead of being ignored.
+    load_transfer_methods()
     # Manual and workflow input are independent: explicit argument, env, default.
     manual_backend = (
         manual_backend or os.environ.get("PHONE_MANUAL_INPUT_BACKEND") or "raspberry_pi"

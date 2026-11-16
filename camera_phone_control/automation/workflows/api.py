@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from flask import jsonify, request
 
 from automation.error_codes import error_fields
+from automation.transfer_methods import transfer_method_options
 
 from ..backends import backend_names, select_device
 from ..context import AutomationContext
@@ -426,6 +427,7 @@ def register_workflows(
             if state.pi_bridge is not None
             else (service.device_id or "phone_A")
         )
+
         allowed = app.extensions["device_workflow_assignment_store"].get(
             selected_device_id
         )
@@ -437,6 +439,10 @@ def register_workflows(
             allowed_workflow_ids=None if allowed is None else list(allowed),
             workflow_access_unrestricted=allowed is None,
         )
+
+    @app.get("/api/workflow-options/transfer-methods")
+    def transfer_method_workflow_options():
+        return jsonify(transfer_methods=transfer_method_options())
 
     @app.post("/api/workflows")
     @admin_required
@@ -487,8 +493,13 @@ def register_workflows(
         data = payload()
         client = client_id()
 
-        if set(data) - {"variables"}:
-            raise ValueError("Expected variables only.")
+        if set(data) - {"variables", "simulation"}:
+            raise ValueError("Expected variables and optional simulation only.")
+        simulation = data.get("simulation")
+        if simulation is not None and (
+            not isinstance(simulation, dict) or set(simulation) != {"transfer_method"}
+        ):
+            raise ValueError("Manual simulation requires transfer_method only.")
 
         selected_workflow = storage.read(workflow_id)
         target_device_id = (
@@ -524,6 +535,7 @@ def register_workflows(
                         selected_workflow,
                         data.get("variables"),
                         device_id=target_device_id,
+                        execution_context=simulation,
                     )
                 ),
                 202,
@@ -774,7 +786,15 @@ def register_workflows(
     @admin_required
     def start_recording_alternate_screen():
         data = payload()
-        if set(data) - {"text", "timeout_seconds", "roi", "after_step_id"}:
+        if set(data) - {
+            "text",
+            "timeout_seconds",
+            "roi",
+            "after_step_id",
+            "source",
+            "transfer_method",
+            "condition_id",
+        }:
             raise ValueError("Unexpected Special Case fields.")
         with lock:
             return jsonify(
@@ -784,6 +804,9 @@ def register_workflows(
                     data.get("timeout_seconds", 0.8),
                     data.get("roi"),
                     data.get("after_step_id"),
+                    data.get("source", "screen_text"),
+                    data.get("transfer_method"),
+                    data.get("condition_id"),
                 )
             )
 

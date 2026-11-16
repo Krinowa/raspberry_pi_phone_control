@@ -13,8 +13,17 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from automation.jobs.storage import RecordConflict, RecordNotFound
+from automation.transfer_methods import (
+    transfer_method_definition,
+    transfer_method_fingerprint,
+    validate_stored_transfer_method,
+    validate_transfer_method,
+)
 
-from automation.workflows.validation import resolve_variables
+from automation.workflows.validation import (
+    require_transfer_method_branch,
+    resolve_variables,
+)
 
 from automation.workflows.values import parse_currency
 from diagnostic_logging import log_event
@@ -975,6 +984,15 @@ class WithdrawWorker:
         self, current, withdrawal, *, require_stored_fields=False
     ):
         """Return why an external item cannot represent this persisted retry."""
+        if current.get("transfer_method") is not None:
+            try:
+                validate_stored_transfer_method(
+                    current["transfer_method"],
+                    current.get("transfer_method_profile"),
+                    current.get("transfer_method_fingerprint"),
+                )
+            except ValueError as error:
+                return str(error)
         if not isinstance(withdrawal, dict):
             return "The external withdrawal response is invalid."
         if withdrawal.get("id") != current.get("withdraw_id") or withdrawal.get(
@@ -1017,6 +1035,7 @@ class WithdrawWorker:
             "holder_name",
             "bank_name",
             "mobile_no",
+            "transfer_method",
         ):
             expected_value = expected.get(field)
             if expected_value in (None, ""):
@@ -1750,6 +1769,8 @@ class WithdrawWorker:
             )
 
         if not claimed:
+            method = validate_transfer_method(item.get("transfer_method"))
+            method_definition = transfer_method_definition(method)
             self.journal.begin(
                 self.device_id,
                 phase="LOCK_INTENT",
@@ -1758,6 +1779,9 @@ class WithdrawWorker:
                 assigned_device_id=self.device_id,
                 operator_id=self.api["operator_id"],
                 final_amount=format(final_amount(item), ".2f"),
+                transfer_method=method,
+                transfer_method_profile=method_definition["identifier_profile"],
+                transfer_method_fingerprint=transfer_method_fingerprint(method),
             )
 
         try:
@@ -1772,6 +1796,8 @@ class WithdrawWorker:
 
         try:
             raw = retained_withdrawal(response.get("withdrawal"))
+            locked_method = validate_transfer_method(raw.get("transfer_method"))
+            locked_method_definition = transfer_method_definition(locked_method)
 
             # Persist the successful external lock response before further
             # validation. If validation below fails, we must not pretend the
@@ -1783,12 +1809,17 @@ class WithdrawWorker:
                 lock_expires_at=raw.get("lock_expires_at"),
                 assigned_device_id=self.device_id,
                 operator_id=self.api["operator_id"],
+                transfer_method=locked_method,
+                transfer_method_profile=locked_method_definition["identifier_profile"],
+                transfer_method_fingerprint=transfer_method_fingerprint(locked_method),
             )
 
             if (
                 raw.get("id") != item["id"]
                 or raw.get("tx_id") != item["tx_id"]
                 or final_amount(raw) != final_amount(item)
+                or locked_method
+                != validate_transfer_method(item.get("transfer_method"))
             ):
                 raise ValueError(
                     "Locked withdrawal does not match the selected "
@@ -2222,6 +2253,15 @@ class WithdrawWorker:
 
         return True, None
 
+    def payment_method_readiness(self, method):
+        """Validate an API method's workflow branch before external locking."""
+        try:
+            _, workflow = self._route()
+            require_transfer_method_branch(workflow, method)
+        except (KeyError, ValueError) as error:
+            return False, str(error)
+        return True, None
+
     def _balance_workflow(self):
 
         balance_workflow_id = self.assignments.integration(self.device_id).get(
@@ -2306,7 +2346,11 @@ class WithdrawWorker:
         if isinstance(values.get("bank_name"), str):
             values["bank_name"] = values["bank_name"].lower()
 
-        resolve_variables(workflow, values)
+        resolve_variables(
+            workflow,
+            values,
+            execution_context={"transfer_method": variables["transfer_method"]},
+        )
 
         with self.scheduler.lock:
 
@@ -2329,7 +2373,7 @@ class WithdrawWorker:
                 action="withdraw_v2",
                 recovery_workflow_id=workflow.get("recovery_workflow_id"),
                 protected_metadata={
-                    "version": 1,
+                    "version": 3,
                     "withdraw_id": raw["id"],
                     "tx_id": raw["tx_id"],
                     "assigned_device_id": self.device_id,
@@ -2337,6 +2381,13 @@ class WithdrawWorker:
                     "account_id": account.account_id,
                     "workflow_id": workflow["id"],
                     "final_amount": format(final_amount(raw), ".2f"),
+                    "transfer_method": variables["transfer_method"],
+                    "transfer_method_profile": transfer_method_definition(
+                        variables["transfer_method"]
+                    )["identifier_profile"],
+                    "transfer_method_fingerprint": transfer_method_fingerprint(
+                        variables["transfer_method"]
+                    ),
                     "raw_withdrawal": retained_withdrawal(raw),
                     "lock_expires_at": raw.get("lock_expires_at"),
                 },
