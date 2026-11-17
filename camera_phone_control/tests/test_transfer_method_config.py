@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 from automation.transfer_methods import (
     BUILTIN_TRANSFER_METHODS,
@@ -300,12 +300,14 @@ class TransferMethodConfigurationTests(unittest.TestCase):
         )
         runner = WorkflowRunner(
             context,
-            screen_state_provider=SimpleNamespace(
-                visible_texts=lambda: ["001234"]
-            ),
+            screen_state_provider=SimpleNamespace(visible_texts=lambda: ["001234"]),
             execution_context={"transfer_method": "instant_bank"},
         )
-        for step in (candidate["steps"][0], candidate["steps"][1], candidate["steps"][2]):
+        for step in (
+            candidate["steps"][0],
+            candidate["steps"][1],
+            candidate["steps"][2],
+        ):
             runner.execute_step(
                 step,
                 {"account_number": "001234", "mobile_no": ""},
@@ -392,11 +394,23 @@ class TransferMethodConfigurationTests(unittest.TestCase):
             transfer_methods_config_path({"PHONE_APP_DATA_DIR": str(data)}),
             data.resolve() / "config" / "transfer_methods.json",
         )
+        local = Path(self.temp.name) / "LocalAppData"
+        with patch("windows_runtime.os", SimpleNamespace(name="nt")):
+            self.assertEqual(
+                transfer_methods_config_path({"LOCALAPPDATA": str(local)}),
+                local / "Phone Controller" / "config" / "transfer_methods.json",
+            )
+            with self.assertRaisesRegex(RuntimeError, "LOCALAPPDATA is unavailable"):
+                transfer_methods_config_path(
+                    {"XDG_DATA_HOME": str(Path(self.temp.name) / "ignored-xdg")}
+                )
+
         xdg = Path(self.temp.name) / "xdg"
-        self.assertEqual(
-            transfer_methods_config_path({"XDG_DATA_HOME": str(xdg)}),
-            xdg / "phone-controller" / "config" / "transfer_methods.json",
-        )
+        with patch("windows_runtime.os", SimpleNamespace(name="posix")):
+            self.assertEqual(
+                transfer_methods_config_path({"XDG_DATA_HOME": str(xdg)}),
+                xdg / "phone-controller" / "config" / "transfer_methods.json",
+            )
 
 
 if __name__ == "__main__":
