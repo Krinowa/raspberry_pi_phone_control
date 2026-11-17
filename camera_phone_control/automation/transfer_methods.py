@@ -348,4 +348,19 @@ def validate_transfer_method_payload(raw, method, *, require_recipient_name=Fals
         raise ValueError(
             f"Cannot confidently resolve {name_field}; physical payment is disabled."
         )
+    if require_recipient_name and definition["api_type"] == "bank":
+        bank_name = raw.get("bank_name")
+        if (
+            not isinstance(bank_name, str)
+            or not bank_name
+            or bank_name != bank_name.strip()
+            or len(bank_name) > 256
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in bank_name
+            )
+        ):
+            raise ValueError(
+                "Cannot confidently resolve bank_name; physical payment is disabled."
+            )
     return field, identifier, name_field, name

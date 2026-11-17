@@ -234,10 +234,17 @@ class TransferMethodSwitchTests(unittest.TestCase):
         bank = normalize_locked_withdrawal(bank_raw)
         mobile = normalize_locked_withdrawal(mobile_raw)
         self.assertEqual(bank["account_number"], "001234")
+        self.assertEqual(bank["account_name"], "Recipient")
+        self.assertEqual(bank["bank_name"], "Bank")
+        self.assertNotIn("holder_name", bank)
+        self.assertNotIn("mobile_no", bank)
         self.assertEqual(mobile["mobile_no"], "0123-4567")
         self.assertEqual(mobile["fps_phone_number"], "0123-4567")
         self.assertEqual(mobile["holder_name"], "收款人")
         self.assertEqual(mobile["transfer_method"], "phone_no")
+        self.assertNotIn("bank_name", mobile)
+        self.assertNotIn("account_name", mobile)
+        self.assertNotIn("account_number", mobile)
         self.assertEqual(
             resolve_variables(
                 switching_workflow(),
@@ -263,12 +270,31 @@ class TransferMethodSwitchTests(unittest.TestCase):
             withdrawal(None),
             withdrawal("unknown"),
             withdrawal("bank_account", account_number=None),
+            withdrawal("bank_account", account_name=None),
+            withdrawal("bank_account", bank_name=None),
             withdrawal("phone_no", mobile_no=None),
+            withdrawal("phone_no", holder_name=None),
             withdrawal("email", mobile_no="not-an-email"),
             withdrawal("fps_id", mobile_no="12345678"),
         ):
             with self.assertRaises(ValueError):
                 normalize_locked_withdrawal(raw)
+
+    def test_type_and_transfer_method_combinations_are_explicit(self):
+        for method in TRANSFER_METHODS:
+            expected_type = "bank" if method == "bank_account" else "kuaizhuan"
+            with self.subTest(method=method, expected_type=expected_type):
+                self.assertEqual(
+                    normalize_locked_withdrawal(withdrawal(method))["transfer_method"],
+                    method,
+                )
+                incompatible_type = (
+                    "kuaizhuan" if expected_type == "bank" else "bank"
+                )
+                with self.assertRaisesRegex(ValueError, "type does not match"):
+                    normalize_locked_withdrawal(
+                        withdrawal(method, type=incompatible_type)
+                    )
 
     def test_phone_verification_requires_all_eight_digits(self):
         self.assertTrue(

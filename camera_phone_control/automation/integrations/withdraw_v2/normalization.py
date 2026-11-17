@@ -26,20 +26,8 @@ def normalize_locked_withdrawal(raw):
         name_field: recipient_name,
     }
     result["final_amount"] = result["amount"]
-    bank_name = raw.get("bank_name")
-    if bank_name not in (None, ""):
-        if (
-            not isinstance(bank_name, str)
-            or bank_name != bank_name.strip()
-            or len(bank_name) > 256
-            or any(
-                ord(character) < 32 or ord(character) == 127 for character in bank_name
-            )
-        ):
-            raise ValueError(
-                "Cannot confidently resolve bank_name; physical payment is disabled."
-            )
-        result["bank_name"] = bank_name
+    if definition["api_type"] == "bank":
+        result["bank_name"] = raw["bank_name"]
 
     for key in ("tx_id", "order_id"):
         if not isinstance(raw.get(key), str) or not raw[key] or len(raw[key]) > 256:

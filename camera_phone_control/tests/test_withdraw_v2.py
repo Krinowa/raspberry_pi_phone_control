@@ -399,6 +399,42 @@ class WithdrawWorkerTests(unittest.TestCase):
         self.assertEqual(record["phase"], "LOCKED")
         self.assertEqual(record["transfer_method"], "phone_no")
 
+    def test_pending_and_locked_documented_payee_fields_must_match(self):
+        cases = (
+            ("bank_name", {}, "Changed Bank"),
+            ("account_name", {}, "Changed Account"),
+            ("account_number", {}, "9999999999999999"),
+            (
+                "holder_name",
+                {
+                    "type": "kuaizhuan",
+                    "transfer_method": "phone_no",
+                    "mobile_no": "01234567",
+                },
+                "Changed Holder",
+            ),
+            (
+                "mobile_no",
+                {
+                    "type": "kuaizhuan",
+                    "transfer_method": "phone_no",
+                    "mobile_no": "01234567",
+                },
+                "87654321",
+            ),
+        )
+        for field, changes, locked_value in cases:
+            with self.subTest(field=field):
+                worker = self.worker(device=f"phone_{field}")
+                pending = {**withdrawal(), **changes}
+                locked = {**pending, field: locked_value}
+                worker.action = Mock(return_value={"withdrawal": locked})
+
+                with self.assertRaisesRegex(
+                    ValueError, "Locked withdrawal does not match"
+                ):
+                    worker.lock_withdrawal(pending)
+
     def waiting_cancel_worker(
         self, status="FAILED", *, action=None, continue_retry=None
     ):

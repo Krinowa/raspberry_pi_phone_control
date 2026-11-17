@@ -1764,9 +1764,12 @@ class WithdrawWorker:
             raise ValueError("Pending withdrawal identifiers are invalid.")
 
         pending_method = validate_transfer_method(item.get("transfer_method"))
-        pending_identifier_field, pending_identifier, _, _ = (
-            validate_transfer_method_payload(item, pending_method)
-        )
+        (
+            pending_identifier_field,
+            pending_identifier,
+            pending_name_field,
+            pending_name,
+        ) = validate_transfer_method_payload(item, pending_method)
 
         if not claimed and self.journal.was_confirmed(self.device_id, item["tx_id"]):
             raise ValueError(
@@ -1820,11 +1823,16 @@ class WithdrawWorker:
                 transfer_method_fingerprint=transfer_method_fingerprint(locked_method),
             )
 
-            locked_identifier_field, locked_identifier, _, _ = (
-                validate_transfer_method_payload(
-                    raw, locked_method, require_recipient_name=True
-                )
+            (
+                locked_identifier_field,
+                locked_identifier,
+                locked_name_field,
+                locked_name,
+            ) = validate_transfer_method_payload(
+                raw, locked_method, require_recipient_name=True
             )
+
+            pending_bank_name = item.get("bank_name")
 
             if (
                 raw.get("id") != item["id"]
@@ -1834,6 +1842,16 @@ class WithdrawWorker:
                 != pending_method
                 or locked_identifier_field != pending_identifier_field
                 or locked_identifier != pending_identifier
+                or locked_name_field != pending_name_field
+                or (
+                    pending_name not in (None, "")
+                    and locked_name != pending_name
+                )
+                or (
+                    item.get("type") == "bank"
+                    and pending_bank_name not in (None, "")
+                    and raw.get("bank_name") != pending_bank_name
+                )
             ):
                 raise ValueError(
                     "Locked withdrawal does not match the selected "
