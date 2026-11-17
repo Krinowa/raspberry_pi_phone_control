@@ -1,5 +1,7 @@
 """Static packaging contracts that can be verified without a Windows build."""
 
+import hashlib
+import io
 import json
 import importlib.util
 import tempfile
@@ -11,7 +13,6 @@ from unittest.mock import Mock, patch
 
 from hardware.camera_identity import resolve_ffmpeg_executable
 from windows_runtime import RuntimePaths
-
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,6 +33,10 @@ validate_models = _models._validate
 _ffmpeg = _load_packaging_module("validate_ffmpeg")
 FFmpegValidationError = _ffmpeg.FFmpegValidationError
 validate_ffmpeg = _ffmpeg.validate_ffmpeg
+_download = _load_packaging_module("download_ffmpeg")
+FFmpegDownloadError = _download.FFmpegDownloadError
+download_approved_ffmpeg = _download.download_approved_ffmpeg
+resolve_ffmpeg_source = _download.resolve_source
 _provision = _load_packaging_module("provision_ffmpeg")
 FFmpegProvisioningError = _provision.FFmpegProvisioningError
 provision_ffmpeg = _provision.provision_ffmpeg
@@ -39,6 +44,22 @@ _workflows = _load_packaging_module("validate_workflow_seeds")
 WorkflowSeedError = _workflows.WorkflowSeedError
 validate_seed_directory = _workflows.validate_seed_directory
 _protected = _load_packaging_module("build_protected_modules")
+
+
+class FakeDownloadResponse:
+    def __init__(self, status, body=b"", headers=None):
+        self.status = status
+        self.headers = headers or {}
+        self.stream = io.BytesIO(body)
+
+    def getcode(self):
+        return self.status
+
+    def read(self, size=-1):
+        return self.stream.read(size)
+
+    def close(self):
+        self.stream.close()
 
 
 class PackagingReadinessTests(unittest.TestCase):
@@ -60,9 +81,9 @@ class PackagingReadinessTests(unittest.TestCase):
         self.assertNotIn("CPython 3.11", build + requirements)
 
     def test_windows_313_dependency_family_is_pinned(self):
-        requirements = (
-            APP_ROOT / "packaging" / "requirements-windows.txt"
-        ).read_text(encoding="utf-8")
+        requirements = (APP_ROOT / "packaging" / "requirements-windows.txt").read_text(
+            encoding="utf-8"
+        )
 
         for requirement in (
             "numpy==2.1.3",
@@ -124,9 +145,7 @@ class PackagingReadinessTests(unittest.TestCase):
                         "id": "unsafe",
                         "name": "Unsafe",
                         "purpose": "payment",
-                        "variables": [
-                            {"name": "account_number", "default": "123456"}
-                        ],
+                        "variables": [{"name": "account_number", "default": "123456"}],
                         "steps": [{"type": "tap", "recording_screenshot": {}}],
                     }
                 ),
@@ -156,7 +175,8 @@ class PackagingReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertEqual(
                 resolve_ffmpeg_executable(
-                    environment={}, frozen_root=temporary,
+                    environment={},
+                    frozen_root=temporary,
                     which=lambda _: "C:/global/ffmpeg.exe",
                 ),
                 str(Path(temporary) / "tools" / "ffmpeg.exe"),
@@ -203,7 +223,9 @@ class PackagingReadinessTests(unittest.TestCase):
                 _ffmpeg.subprocess, "run", side_effect=[version, devices]
             ) as run:
                 self.assertEqual(validate_ffmpeg(executable), executable.resolve())
-            self.assertTrue(all(call.kwargs["text"] is False for call in run.call_args_list))
+            self.assertTrue(
+                all(call.kwargs["text"] is False for call in run.call_args_list)
+            )
 
     def test_ffmpeg_validator_rejects_build_without_directshow(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -211,8 +233,10 @@ class PackagingReadinessTests(unittest.TestCase):
             self._write_x64_pe(executable)
             version = Mock(returncode=0, stdout="ffmpeg version approved", stderr="")
             devices = Mock(returncode=0, stdout="file devices only", stderr="")
-            with patch.object(_ffmpeg.subprocess, "run", side_effect=[version, devices]), \
-                    self.assertRaisesRegex(FFmpegValidationError, "DirectShow"):
+            with (
+                patch.object(_ffmpeg.subprocess, "run", side_effect=[version, devices]),
+                self.assertRaisesRegex(FFmpegValidationError, "DirectShow"),
+            ):
                 validate_ffmpeg(executable)
 
     def test_ffmpeg_provisioning_supports_direct_exe_and_single_zip_entry(self):
@@ -222,9 +246,7 @@ class PackagingReadinessTests(unittest.TestCase):
             direct.write_bytes(b"MZdirect-approved")
             direct_target = root / "direct" / "ffmpeg.exe"
             direct_target.parent.mkdir()
-            self.assertEqual(
-                provision_ffmpeg(direct, direct_target), direct_target
-            )
+            self.assertEqual(provision_ffmpeg(direct, direct_target), direct_target)
             self.assertEqual(direct_target.read_bytes(), b"MZdirect-approved")
 
             archive = root / "approved.zip"
@@ -258,17 +280,125 @@ class PackagingReadinessTests(unittest.TestCase):
                         provision_ffmpeg(archive, target)
                     self.assertFalse(target.exists())
 
-    def test_ffmpeg_workflow_verifies_archive_before_provision_and_validation(self):
-        workflow_path = (
-            APP_ROOT.parent / ".github" / "workflows" / "build-windows.yml"
+    def test_ffmpeg_source_is_pinned_and_overrides_are_optional_but_paired(self):
+        config_path = APP_ROOT / "packaging" / "ffmpeg_source.json"
+        pinned_url, pinned_sha256 = resolve_ffmpeg_source(config_path, {})
+        self.assertEqual(
+            pinned_url,
+            "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/"
+            "autobuild-2026-11-11-12-39/"
+            "ffmpeg-n9.0.2-49-gc179411bbb-win64-lgpl-9.0.zip",
         )
+        self.assertEqual(
+            pinned_sha256,
+            "9ccd65428fb0e60a0d574b76145df41f402b754edd2d06c2e24fa506fc1c2b02",
+        )
+        override = {
+            "PHONE_CONTROLLER_FFMPEG_URL": pinned_url.replace(
+                "autobuild-2026-11-11-12-39", "autobuild-2026-11-10-12-39"
+            ),
+            "PHONE_CONTROLLER_FFMPEG_SHA256": "a" * 64,
+        }
+        self.assertEqual(
+            resolve_ffmpeg_source(config_path, override),
+            (override["PHONE_CONTROLLER_FFMPEG_URL"], "a" * 64),
+        )
+        for partial in (
+            {"PHONE_CONTROLLER_FFMPEG_URL": override["PHONE_CONTROLLER_FFMPEG_URL"]},
+            {"PHONE_CONTROLLER_FFMPEG_SHA256": "a" * 64},
+        ):
+            with self.assertRaisesRegex(FFmpegDownloadError, "provide both"):
+                resolve_ffmpeg_source(config_path, partial)
+        with self.assertRaisesRegex(FFmpegDownloadError, "pinned"):
+            resolve_ffmpeg_source(
+                config_path,
+                {
+                    "PHONE_CONTROLLER_FFMPEG_URL": pinned_url.replace(
+                        "autobuild-2026-11-11-12-39", "latest"
+                    ),
+                    "PHONE_CONTROLLER_FFMPEG_SHA256": "a" * 64,
+                },
+            )
+
+    def test_ffmpeg_download_allows_constrained_github_asset_redirect(self):
+        source_url, expected_sha256 = resolve_ffmpeg_source(
+            APP_ROOT / "packaging" / "ffmpeg_source.json", {}
+        )
+        asset_url = (
+            "https://release-assets.githubusercontent.com/github-production-release-asset/"
+            "123/approved?sig=redacted"
+        )
+        payload = b"approved complete ZIP bytes"
+        responses = [
+            FakeDownloadResponse(302, headers={"Location": asset_url}),
+            FakeDownloadResponse(200, body=payload),
+        ]
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(_download, "_request_once", side_effect=responses) as request,
+        ):
+            destination = Path(temporary) / "ffmpeg.zip"
+            self.assertEqual(
+                download_approved_ffmpeg(
+                    source_url,
+                    destination,
+                    hashlib.sha256(payload).hexdigest(),
+                ),
+                destination,
+            )
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(
+                [item.args[1] for item in request.call_args_list],
+                [source_url, asset_url],
+            )
+        self.assertNotEqual(expected_sha256, hashlib.sha256(payload).hexdigest())
+
+    def test_ffmpeg_download_blocks_redirects_and_checksum_mismatch(self):
+        source_url, _ = resolve_ffmpeg_source(
+            APP_ROOT / "packaging" / "ffmpeg_source.json", {}
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, location in enumerate(
+                (
+                    "http://release-assets.githubusercontent.com/asset.zip",
+                    "https://downloads.example/asset.zip",
+                )
+            ):
+                with (
+                    self.subTest(location=location),
+                    patch.object(
+                        _download,
+                        "_request_once",
+                        return_value=FakeDownloadResponse(
+                            302, headers={"Location": location}
+                        ),
+                    ),
+                ):
+                    destination = root / f"blocked-{index}.zip"
+                    with self.assertRaisesRegex(FFmpegDownloadError, "must use HTTPS"):
+                        download_approved_ffmpeg(source_url, destination, "0" * 64)
+                    self.assertFalse(destination.exists())
+
+            with patch.object(
+                _download,
+                "_request_once",
+                return_value=FakeDownloadResponse(200, body=b"wrong bytes"),
+            ):
+                destination = root / "mismatch.zip"
+                with self.assertRaisesRegex(FFmpegDownloadError, "SHA-256 mismatch"):
+                    download_approved_ffmpeg(source_url, destination, "0" * 64)
+                self.assertFalse(destination.exists())
+
+    def test_ffmpeg_workflow_verifies_archive_before_provision_and_validation(self):
+        workflow_path = APP_ROOT.parent / ".github" / "workflows" / "build-windows.yml"
         workflow = workflow_path.read_text(encoding="utf-8")
-        checksum = workflow.index("Get-FileHash -LiteralPath $download")
+        download = workflow.index("python packaging/download_ffmpeg.py")
         provision = workflow.index("python packaging/provision_ffmpeg.py")
         validation = workflow.index("python packaging/validate_ffmpeg.py $candidate")
-        self.assertLess(checksum, provision)
+        self.assertLess(download, provision)
         self.assertLess(provision, validation)
-        self.assertIn("-MaximumRedirection 0", workflow)
+        self.assertIn("packaging/ffmpeg_source.json", workflow[download:provision])
 
     def test_build_requires_ffmpeg_and_validates_frozen_assets(self):
         build = (APP_ROOT / "packaging" / "build_windows.bat").read_text(
@@ -332,15 +462,15 @@ class PackagingReadinessTests(unittest.TestCase):
         spec = (APP_ROOT / "packaging" / "phone_controller.spec").read_text(
             encoding="utf-8"
         )
-        validator = (
-            APP_ROOT / "packaging" / "validate_windows_bundle.py"
-        ).read_text(encoding="utf-8")
+        validator = (APP_ROOT / "packaging" / "validate_windows_bundle.py").read_text(
+            encoding="utf-8"
+        )
         self.assertLess(
             build.index("build_protected_modules.py"),
             build.index("python -m PyInstaller"),
         )
         self.assertIn("ordinary source/bytecode packaging is disabled", spec)
-        self.assertIn('pathex=[str(protected_stage)]', spec)
+        self.assertIn("pathex=[str(protected_stage)]", spec)
         self.assertIn("unexpectedly fell back to Python bytecode", spec)
         self.assertIn("unexpectedly entered the PYZ archive", spec)
         self.assertIn("protected_analysis_excludes", spec)

@@ -132,26 +132,29 @@ through **Actions → Build Windows test distribution → Run workflow**. It use
 GitHub-hosted `windows-2022` x64 runner and calls this same
 `packaging\build_windows.bat`; it does not maintain a second packaging path.
 
-Before running it, configure these repository Actions variables:
+No FFmpeg GitHub variables are required for a normal build. The reviewed source
+is pinned in `packaging/ffmpeg_source.json` to the dated GitHub release tag
+`autobuild-2026-11-11-12-39`, FFmpeg revision
+`n9.0.2-49-gc179411bbb`, Windows x64 LGPL static archive. Its complete ZIP
+SHA-256 is
+`9ccd65428fb0e60a0d574b76145df41f402b754edd2d06c2e24fa506fc1c2b02`.
 
-- `PHONE_CONTROLLER_FFMPEG_URL` — a direct HTTPS URL for either the reviewed
-  Windows x64 FFmpeg ZIP archive or the reviewed, self-contained Windows x64
-  `ffmpeg.exe`. Redirects are rejected.
-- `PHONE_CONTROLLER_FFMPEG_SHA256` — the 64-character SHA-256 digest of the
-  entire object at that URL: the ZIP archive when using a ZIP URL, or the
-  executable when using a direct-EXE URL.
+Administrators may optionally set both `PHONE_CONTROLLER_FFMPEG_URL` and
+`PHONE_CONTROLLER_FFMPEG_SHA256` as Actions variables or secrets to test a
+different reviewed, version-pinned GitHub release asset. Supplying only one
+override fails closed. Mutable `/latest/` URLs, non-HTTPS URLs, and non-GitHub
+release URLs are rejected.
 
-If the URL contains credentials or a time-limited token, configure both values
-as repository Actions secrets instead and do not also define conflicting
-variables. Do not store the executable itself in a secret. The workflow
-downloads to a temporary path and verifies the whole-object SHA-256 before
-inspecting it. For a ZIP, every entry path is checked, exactly one
-`ffmpeg.exe` must exist, and only that entry is extracted. A direct executable
-remains supported. The candidate then runs through `validate_ffmpeg.py` to
-verify PE architecture, standalone execution and DirectShow support before it
-is moved into `packaging\vendor\ffmpeg.exe`. Missing values, redirects, digest
-mismatch, unsafe or ambiguous archives, or binary validation failure stop the
-job before the application build.
+The workflow permits at most three HTTPS redirects and accepts only
+`github.com` and `release-assets.githubusercontent.com`. It downloads to a
+temporary path and verifies the whole-archive SHA-256 before inspecting it.
+Every ZIP entry path is checked, exactly one `ffmpeg.exe` must exist, and only
+that entry is extracted. A reviewed direct executable remains supported by the
+provisioner. The candidate then runs through `validate_ffmpeg.py` to verify PE
+architecture, standalone execution and DirectShow support before it is moved
+into `packaging\vendor\ffmpeg.exe`. HTTP failures, disallowed or excessive
+redirects, digest mismatch, unsafe or ambiguous archives, or binary validation
+failure stop the job before the application build.
 
 After all protected-build, frozen-application and focused regression checks
 pass, the workflow uploads

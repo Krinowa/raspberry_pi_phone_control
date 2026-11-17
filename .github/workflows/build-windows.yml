@@ -76,43 +76,17 @@ jobs:
       - name: Provision approved FFmpeg
         shell: pwsh
         env:
-          APPROVED_FFMPEG_URL: ${{ secrets.PHONE_CONTROLLER_FFMPEG_URL || vars.PHONE_CONTROLLER_FFMPEG_URL }}
-          APPROVED_FFMPEG_SHA256: ${{ secrets.PHONE_CONTROLLER_FFMPEG_SHA256 || vars.PHONE_CONTROLLER_FFMPEG_SHA256 }}
+          PHONE_CONTROLLER_FFMPEG_URL: ${{ secrets.PHONE_CONTROLLER_FFMPEG_URL || vars.PHONE_CONTROLLER_FFMPEG_URL }}
+          PHONE_CONTROLLER_FFMPEG_SHA256: ${{ secrets.PHONE_CONTROLLER_FFMPEG_SHA256 || vars.PHONE_CONTROLLER_FFMPEG_SHA256 }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:APPROVED_FFMPEG_URL)) {
-            throw "Approved FFmpeg URL is missing. Configure PHONE_CONTROLLER_FFMPEG_URL as a repository/environment variable, or as a secret when the URL is sensitive."
-          }
-          if ($env:APPROVED_FFMPEG_SHA256 -notmatch '^[A-Fa-f0-9]{64}$') {
-            throw "Approved FFmpeg SHA-256 is missing or invalid. Configure PHONE_CONTROLLER_FFMPEG_SHA256 as exactly 64 hexadecimal characters."
-          }
-          $uri = $null
-          if (-not [Uri]::TryCreate($env:APPROVED_FFMPEG_URL, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne "https") {
-            throw "Approved FFmpeg URL must be an absolute HTTPS URL."
-          }
-
           $nonce = [IO.Path]::GetRandomFileName()
           $download = Join-Path $env:RUNNER_TEMP "phone-controller-ffmpeg-$nonce.download"
           $candidate = Join-Path $env:RUNNER_TEMP "phone-controller-ffmpeg-$nonce.exe"
           try {
-            try {
-              Invoke-WebRequest `
-                -Uri $uri `
-                -OutFile $download `
-                -MaximumRedirection 0 `
-                -TimeoutSec 120 `
-                -ErrorAction Stop
-            } catch {
-              throw "Approved FFmpeg download failed. Configure a direct HTTPS URL that does not redirect."
-            }
-            if (-not (Test-Path -LiteralPath $download -PathType Leaf)) {
-              throw "Approved FFmpeg download did not create a file."
-            }
-
-            $expected = $env:APPROVED_FFMPEG_SHA256.ToLowerInvariant()
-            $actual = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actual -ne $expected) {
-              throw "Approved FFmpeg SHA-256 verification failed. The downloaded file will not be used."
+            python packaging/download_ffmpeg.py packaging/ffmpeg_source.json $download
+            if ($LASTEXITCODE -ne 0) {
+              throw "Approved FFmpeg download or checksum verification failed."
             }
 
             python packaging/provision_ffmpeg.py $download $candidate
@@ -125,6 +99,8 @@ jobs:
             }
             $destination = Join-Path $PWD "packaging\vendor\ffmpeg.exe"
             Move-Item -LiteralPath $candidate -Destination $destination -Force
+            $sourceHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
+            "PHONE_CONTROLLER_FFMPEG_SOURCE_SHA256=$sourceHash" >> $env:GITHUB_ENV
           } finally {
             Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
@@ -156,8 +132,6 @@ jobs:
       - name: Create complete onedir ZIP and build metadata
         id: package
         shell: pwsh
-        env:
-          APPROVED_FFMPEG_SHA256: ${{ secrets.PHONE_CONTROLLER_FFMPEG_SHA256 || vars.PHONE_CONTROLLER_FFMPEG_SHA256 }}
         run: |
           $ErrorActionPreference = "Stop"
           $distribution = Join-Path $PWD "dist\PhoneController"
@@ -179,7 +153,7 @@ jobs:
             python = "3.13.13-x64"
             app_version = $env:APP_VERSION
             protected_build_id = $attestation.build_id
-            ffmpeg_sha256 = $env:APPROVED_FFMPEG_SHA256.ToLowerInvariant()
+            ffmpeg_sha256 = $env:PHONE_CONTROLLER_FFMPEG_SOURCE_SHA256
           } | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding utf8NoBOM
 
           $zipPath = Join-Path $artifactDirectory "PhoneController-windows-x64-${{ github.sha }}.zip"
