@@ -3,6 +3,12 @@ __pycache__/
 .env
 venv/
 .venv/
-tests/*
+.venv-packaging/
+/build/
+/dist/
+/installer/
 automation/job_data/
 automation/auth_data/users.json
+automation/camera_data/
+automation/workflow_data/*.json
+*.secret

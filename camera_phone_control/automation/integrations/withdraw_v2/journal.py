@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from automation.jobs.storage import RecordConflict, _JsonStore
+from automation.transfer_methods import validate_stored_transfer_method
 from automation.workflows.models import now
 
 TERMINAL = {"CONFIRMED", "RELEASED", "CANCELLED", "LOCK_REJECTED"}
@@ -50,6 +51,11 @@ class WithdrawJournal(_JsonStore):
                         "assigned_device_id",
                         "operator_id",
                         "final_amount",
+                        "transfer_method",
+                        "transfer_method_profile",
+                        "transfer_method_fingerprint",
+                        "workflow_id",
+                        "account_id",
                         "updated_at",
                     )
                 }
@@ -58,6 +64,56 @@ class WithdrawJournal(_JsonStore):
     def current(self, device_id):
         with self.lock:
             return deepcopy(self._read().get(device_id, {}).get("current", {}))
+
+    def find_job_record(
+        self,
+        device_id,
+        *,
+        job_ids,
+        withdraw_id,
+        tx_id,
+        operator_id=None,
+        account_id=None,
+        workflow_id=None,
+    ):
+        """Find the exact current or archived withdrawal associated with a job."""
+        if not tx_id or not job_ids:
+            return None
+
+        with self.lock:
+            device = self._read().get(device_id, {})
+            records = []
+            current = device.get("current", {})
+            if current:
+                records.append(current)
+            records.extend(reversed(device.get("history", [])))
+
+            for item in records:
+                if item.get("assigned_device_id") != device_id:
+                    continue
+                if item.get("tx_id") != tx_id:
+                    continue
+                if withdraw_id is not None and item.get("withdraw_id") != withdraw_id:
+                    continue
+                if not (
+                    item.get("job_id") in job_ids
+                    or item.get("retry_of_job_id") in job_ids
+                ):
+                    continue
+                expected = {
+                    "operator_id": operator_id,
+                    "account_id": account_id,
+                    "workflow_id": workflow_id,
+                }
+                if any(
+                    value is not None
+                    and item.get(key) is not None
+                    and item.get(key) != value
+                    for key, value in expected.items()
+                ):
+                    continue
+                return deepcopy(item)
+        return None
 
     def update(self, device_id, **changes):
         with self.lock:
@@ -109,7 +165,18 @@ class WithdrawJournal(_JsonStore):
         with self.lock:
             return self._identity_conflict(self._read(), withdraw_id, tx_id)
 
-    def claim(self, device_id, *, withdraw_id, tx_id, operator_id, final_amount):
+    def claim(
+        self,
+        device_id,
+        *,
+        withdraw_id,
+        tx_id,
+        operator_id,
+        final_amount,
+        transfer_method=None,
+        transfer_method_profile=None,
+        transfer_method_fingerprint=None,
+    ):
         """Atomically persist a dashboard-wide LOCK_INTENT assigned to a phone."""
         with self.lock:
             data = self._read()
@@ -125,17 +192,39 @@ class WithdrawJournal(_JsonStore):
                 return False, ("device_unresolved", device_id)
 
             self._archive(device)
-            device["current"] = {
+            record = {
                 "phase": "LOCK_INTENT",
                 "withdraw_id": withdraw_id,
                 "tx_id": tx_id,
                 "assigned_device_id": device_id,
                 "operator_id": operator_id,
                 "final_amount": final_amount,
+                "transfer_method": transfer_method,
                 "updated_at": now(),
             }
+            if transfer_method_profile is not None:
+                record["transfer_method_profile"] = transfer_method_profile
+            if transfer_method_fingerprint is not None:
+                record["transfer_method_fingerprint"] = transfer_method_fingerprint
+            device["current"] = record
             self._write(data)
             return True, None
+
+    def validate_transfer_method_compatibility(self):
+        """Reject changed/removed semantics for unresolved local withdrawals."""
+        with self.lock:
+            data = self._read()
+            for _, item, current in self._entries(data):
+                if not current or item.get("phase") in TERMINAL:
+                    continue
+                method = item.get("transfer_method")
+                if method is None:
+                    continue  # Legacy records remain manual-reconciliation only.
+                validate_stored_transfer_method(
+                    method,
+                    item.get("transfer_method_profile"),
+                    item.get("transfer_method_fingerprint"),
+                )
 
     def was_confirmed_anywhere(self, tx_id):
         with self.lock:

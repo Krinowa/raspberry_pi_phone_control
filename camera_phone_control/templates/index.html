@@ -4,7 +4,7 @@
   <head>
     <meta charset="utf-8" />
 
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scal pe=1" />
 
     <meta name="control-token" content="{{ control_token }}" />
 
@@ -28,6 +28,8 @@
       src="{{ url_for('static', filename='phone_gestures.js') }}"
     ></script>
 
+    <script defer src="{{ url_for('static', filename='i18n.js') }}"></script>
+
     <script defer src="{{ url_for('static', filename='app.js') }}"></script>
 
     <script
@@ -48,9 +50,16 @@
           <h1>Local control</h1>
         </div>
 
-        <span id="controller-tag" class="local-tag"
-          >● Checking controller…</span
-        >
+        <div class="header-controls">
+          <label for="language-selector">Language</label>
+          <select id="language-selector" aria-label="Language">
+            <option value="en">English</option>
+            <option value="zh-HK">繁體中文（香港）</option>
+          </select>
+          <span id="controller-tag" class="local-tag"
+            >● Checking controller…</span
+          >
+        </div>
       </header>
 
       <nav class="dashboard-tabs" aria-label="Dashboard mode">
@@ -273,6 +282,14 @@
         <p id="jobs-state" role="status" aria-live="polite">Loading jobs…</p>
 
         <div id="jobs-list" class="jobs-list"></div>
+
+        <h3>Remote Control</h3>
+
+        <p id="remote-history-state" role="status" aria-live="polite">
+          Loading remote control history…
+        </p>
+
+        <div id="remote-history" class="jobs-list"></div>
       </section>
 
       <section
@@ -583,20 +600,22 @@ Select Refresh Logs to load recent activity.</pre
           </label>
 
           <label>
-            Google 2FA Secret
+            Google 2FA Code
 
             <input
               id="withdraw-settings-totp"
-              type="password"
-              autocomplete="off"
-              maxlength="256"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              maxlength="6"
+              pattern="[0-9]{6}"
+              placeholder="123456"
               required
             />
           </label>
 
           <p class="small">
-            The current verification code is generated securely by the server.
-            Saved credentials are never shown in the dashboard.
+            Enter the current 6-digit code shown in Google Authenticator.
           </p>
 
           <p
@@ -673,6 +692,41 @@ Select Refresh Logs to load recent activity.</pre
             </button>
           </div>
         </form>
+      </div>
+
+      <div
+        id="withdraw-cancel-final-dialog"
+        class="modal-backdrop"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="withdraw-cancel-final-title"
+        hidden
+      >
+        <div class="modal-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">MANUAL RECOVERY</p>
+
+              <h2 id="withdraw-cancel-final-title">Cancel this withdrawal?</h2>
+            </div>
+          </div>
+
+          <p>
+            This will cancel the withdrawal externally and cannot be undone.
+          </p>
+
+          <div class="flow-buttons">
+            <button id="withdraw-cancel-final-back" type="button">Back</button>
+
+            <button
+              id="withdraw-cancel-final-confirm"
+              class="stop"
+              type="button"
+            >
+              Yes, Cancel Withdrawal
+            </button>
+          </div>
+        </div>
       </div>
 
       <div
@@ -870,6 +924,10 @@ Select Refresh Logs to load recent activity.</pre
 
                   <button id="record-wait-here" type="button">Wait</button>
 
+                  <button id="record-verify-text-here" type="button">
+                    Verify Text
+                  </button>
+
                   <button id="record-read-value" type="button">
                     Read Balance
                   </button>
@@ -886,6 +944,8 @@ Select Refresh Logs to load recent activity.</pre
                 </div>
 
                 <div id="record-wait-live-slot" hidden></div>
+
+                <div id="record-verify-live-slot" hidden></div>
 
                 <div
                   id="alternate-screen-active"
@@ -962,6 +1022,20 @@ Select Refresh Logs to load recent activity.</pre
                     <p>Lowercase QWERTY keys are included.</p>
 
                     <label class="check"
+                      ><input
+                        id="keyboard-alphabetic-include-digits"
+                        type="checkbox"
+                      />
+
+                      Include digits (0–9)</label
+                    >
+
+                    <p class="small">
+                      Enable only when digits remain visible on the same
+                      keyboard layout. Layout switching is not supported.
+                    </p>
+
+                    <label class="check"
                       ><input id="keyboard-include-space" type="checkbox" />
 
                       Include space</label
@@ -1031,9 +1105,21 @@ Select Refresh Logs to load recent activity.</pre
                     <select id="record-variable-name">
                       <option value="account_number">Account Number</option>
 
+                      <option value="mobile_no">Mobile Number</option>
+
+                      <option value="fps_phone_number">FPS Phone Number</option>
+
+                      <option value="fps_email">FPS Email Address</option>
+
+                      <option value="fps_id">FPS ID</option>
+
                       <option value="amount">Amount</option>
 
                       <option value="bank_name">Bank Name</option>
+
+                      <option value="account_name">Account Name</option>
+
+                      <option value="holder_name">Holder Name</option>
 
                       <option value="__custom__">
                         Custom workflow variable…
@@ -1178,44 +1264,71 @@ Select Refresh Logs to load recent activity.</pre
               <h3>Special Case</h3>
 
               <p class="small">
-                Sometimes something extra appears here. Record what to do when
-                it does.
+                Branch on visible screen text or the validated withdrawal API
+                transfer method.
               </p>
 
               <label>
-                When this appears
-
-                <input
-                  id="condition-text-value"
-                  maxlength="500"
-                  autocomplete="off"
-                />
+                Condition source
+                <select id="condition-source">
+                  <option value="screen_text">Screen Text</option>
+                  <option value="withdrawal_api">Withdrawal API</option>
+                </select>
               </label>
 
-              <label class="duration-field">
-                Check for up to
+              <div id="condition-screen-text-fields">
+                <label>
+                  When this appears
 
-                <span>
                   <input
-                    id="condition-text-timeout"
-                    type="number"
-                    min="0.1"
-                    max="300"
-                    step="any"
-                    value="2"
+                    id="condition-text-value"
+                    maxlength="500"
+                    autocomplete="off"
                   />
+                </label>
 
-                  seconds
-                </span>
-              </label>
+                <label class="duration-field">
+                  Check for up to
 
-              <details id="condition-text-advanced" class="advanced-options">
-                <summary>Advanced options</summary>
+                  <span>
+                    <input
+                      id="condition-text-timeout"
+                      type="number"
+                      min="0.1"
+                      max="300"
+                      step="any"
+                      value="2"
+                    />
 
-                <div id="condition-roi-picker"></div>
-              </details>
+                    seconds
+                  </span>
+                </label>
 
-              <p class="small">If not found: Continue normally</p>
+                <details id="condition-text-advanced" class="advanced-options">
+                  <summary>Advanced options</summary>
+
+                  <div id="condition-roi-picker"></div>
+                </details>
+
+                <p class="small">If not found: Continue normally</p>
+              </div>
+
+              <div id="condition-api-fields" hidden>
+                <label>
+                  API field
+                  <select id="condition-api-field" disabled>
+                    <option value="transfer_method">Transfer Method</option>
+                  </select>
+                </label>
+                <label>
+                  Branch to record
+                  <select id="condition-transfer-method"></select>
+                </label>
+                <p class="small">
+                  Real withdrawals always use the validated API value. There is
+                  no default branch.
+                </p>
+              </div>
 
               <div class="flow-buttons">
                 <button id="alternate-screen-start" type="button">
@@ -1697,6 +1810,27 @@ Select Refresh Logs to load recent activity.</pre
               </details>
             </div>
 
+            <div id="step-verify-options" hidden>
+              <label>
+                Verify field
+                <select id="step-verify-field">
+                  <option value="account_name">Account Name</option>
+                  <option value="holder_name">Holder Name</option>
+                  <option value="account_number">Account Number</option>
+                  <option value="mobile_no">Mobile Number</option>
+                  <option value="fps_phone_number">FPS Phone Number</option>
+                  <option value="fps_email">FPS Email Address</option>
+                  <option value="fps_id">FPS ID</option>
+                  <option value="bank_name">Bank Name</option>
+                  <option value="amount">Amount</option>
+                </select>
+              </label>
+              <div id="step-verify-roi-picker"></div>
+              <p class="small">
+                Verification must pass before the workflow continues.
+              </p>
+            </div>
+
             <div id="step-input-options" hidden>
               <label>
                 Use this input as
@@ -1725,9 +1859,21 @@ Select Refresh Logs to load recent activity.</pre
                   <select id="variable-name">
                     <option value="account_number">Account Number</option>
 
+                    <option value="mobile_no">Mobile Number</option>
+
+                    <option value="fps_phone_number">FPS Phone Number</option>
+
+                    <option value="fps_email">FPS Email Address</option>
+
+                    <option value="fps_id">FPS ID</option>
+
                     <option value="amount">Amount</option>
 
                     <option value="bank_name">Bank Name</option>
+
+                    <option value="account_name">Account Name</option>
+
+                    <option value="holder_name">Holder Name</option>
 
                     <option value="__custom__">
                       Custom workflow variable…
@@ -1844,6 +1990,13 @@ Select Refresh Logs to load recent activity.</pre
                   </button>
                   <button
                     type="button"
+                    data-add-step-type="verify_text"
+                    aria-pressed="false"
+                  >
+                    Verify Text
+                  </button>
+                  <button
+                    type="button"
                     data-add-step-type="capture_screen"
                     aria-pressed="false"
                   >
@@ -1927,6 +2080,40 @@ Select Refresh Logs to load recent activity.</pre
                     <button id="record-text" class="primary" type="button">
                       Insert Step
                     </button>
+                  </div>
+                </section>
+
+                <section id="add-step-verify" hidden>
+                  <div id="record-verify-review-slot">
+                    <div id="record-verify-controls">
+                      <h4>Verify Text</h4>
+                      <label>
+                        Verify field
+                        <select id="verify-field">
+                          <option value="account_name">Account Name</option>
+                          <option value="holder_name">Holder Name</option>
+                          <option value="account_number">Account Number</option>
+                          <option value="mobile_no">Mobile Number</option>
+                          <option value="fps_phone_number">
+                            FPS Phone Number
+                          </option>
+                          <option value="fps_email">FPS Email Address</option>
+                          <option value="fps_id">FPS ID</option>
+                          <option value="bank_name">Bank Name</option>
+                          <option value="amount">Amount</option>
+                        </select>
+                      </label>
+                      <div id="verify-roi-picker"></div>
+                      <p class="small">
+                        Verification must pass before the workflow continues.
+                      </p>
+                      <div class="flow-buttons">
+                        <button id="verify-cancel" type="button">Cancel</button>
+                        <button id="verify-add" class="primary" type="button">
+                          Insert Step
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </section>
 
@@ -2043,20 +2230,30 @@ Select Refresh Logs to load recent activity.</pre
         <template id="region-ocr-template">
           <div class="region-ocr-picker">
             <label
-              ><input data-roi-control="enabled" type="checkbox" /> Use Region
-              OCR</label
+              ><input data-roi-control="enabled" type="checkbox" />
+              <span data-roi-i18n="workflow.roi.enable"
+                >Use Region OCR</span
+              ></label
             >
 
-            <p>
+            <p data-roi-i18n="workflow.roi.instructions">
               Select on the calibrated current screen snapshot; refresh after
               the phone screen changes.
             </p>
 
-            <button data-roi-control="refresh" type="button">
+            <button
+              data-roi-control="refresh"
+              data-roi-i18n="workflow.roi.selectCurrent"
+              type="button"
+            >
               Select on Current Screen
             </button>
 
-            <button data-roi-control="clear" type="button">
+            <button
+              data-roi-control="clear"
+              data-roi-i18n="workflow.roi.clear"
+              type="button"
+            >
               Clear OCR Region
             </button>
 
@@ -2069,7 +2266,7 @@ Select Refresh Logs to load recent activity.</pre
 
             <div class="row">
               <label
-                >x
+                >X
 
                 <input
                   data-roi-control="x"
@@ -2080,7 +2277,7 @@ Select Refresh Logs to load recent activity.</pre
               /></label>
 
               <label
-                >y
+                >Y
 
                 <input
                   data-roi-control="y"
@@ -2091,7 +2288,7 @@ Select Refresh Logs to load recent activity.</pre
               /></label>
 
               <label
-                >width
+                ><span data-roi-i18n="workflow.roi.width">Width</span>
 
                 <input
                   data-roi-control="width"
@@ -2102,7 +2299,7 @@ Select Refresh Logs to load recent activity.</pre
               /></label>
 
               <label
-                >height
+                ><span data-roi-i18n="workflow.roi.height">Height</span>
 
                 <input
                   data-roi-control="height"
@@ -2115,7 +2312,13 @@ Select Refresh Logs to load recent activity.</pre
 
             <output data-roi-control="values" aria-live="polite"></output>
 
-            <button data-roi-control="test" type="button">Test ROI OCR</button>
+            <button
+              data-roi-control="test"
+              data-roi-i18n="workflow.roi.test"
+              type="button"
+            >
+              Test ROI OCR
+            </button>
 
             <p data-roi-control="result" role="status"></p>
           </div>
@@ -2132,6 +2335,16 @@ Select Refresh Logs to load recent activity.</pre
 
           <form id="flow-run-form">
             <div id="run-variables"></div>
+
+            <div id="run-transfer-method-simulation" hidden>
+              <label>
+                Simulate transfer method
+                <select id="run-transfer-method"></select>
+              </label>
+              <p class="small">
+                Manual test only; never overrides a withdrawal.
+              </p>
+            </div>
 
             <button id="flow-run" class="primary" disabled>Start Run</button>
           </form>

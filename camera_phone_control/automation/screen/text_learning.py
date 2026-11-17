@@ -6,15 +6,35 @@ import re
 MIN_SUGGESTION_CONFIDENCE = 60.0
 
 
+def _is_cjk_letter(character):
+    """Return whether one letter belongs to a CJK unified ideograph block."""
+    codepoint = ord(character)
+    return any(
+        start <= codepoint <= end
+        for start, end in (
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xF900, 0xFAFF),
+            (0x20000, 0x2FA1F),
+            (0x30000, 0x323AF),
+        )
+    )
+
+
 def normalize_text(value):
     return " ".join(value.split()) if isinstance(value, str) else ""
 
 
 def is_good_anchor(value):
     value = normalize_text(value)
-    if not 4 <= len(value) <= 80:
+    if not value or len(value) > 80:
         return False
     letters = sum(c.isalpha() for c in value)
+    cjk_letters = sum(_is_cjk_letter(c) for c in value)
+    if len(value) < 4 and not (
+        2 <= len(value) <= 3 and cjk_letters >= 2 and letters == len(value)
+    ):
+        return False
     if letters / len(value) < 0.65 or sum(c.isdigit() for c in value) > letters:
         return False
     words = value.split()

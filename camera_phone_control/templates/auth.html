@@ -13,10 +13,18 @@
       rel="stylesheet"
       href="{{ url_for('static', filename='style.css') }}"
     />
+    <script defer src="{{ url_for('static', filename='i18n.js') }}"></script>
   </head>
   <body class="auth-page">
     <main class="auth-shell">
       <section class="card auth-card">
+        <div class="language-control auth-language-control">
+          <label for="language-selector">Language</label>
+          <select id="language-selector" aria-label="Language">
+            <option value="en">English</option>
+            <option value="zh-HK">繁體中文（香港）</option>
+          </select>
+        </div>
         <p class="eyebrow">PHONE CONTROLLER</p>
 
         {% if mode == "setup" %}

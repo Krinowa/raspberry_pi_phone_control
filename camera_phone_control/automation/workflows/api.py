@@ -13,9 +13,13 @@ from types import SimpleNamespace
 
 from flask import jsonify, request
 
+from automation.error_codes import error_fields
+from automation.transfer_methods import transfer_method_options
+
 from ..backends import backend_names, select_device
 from ..context import AutomationContext
 from ..coordinates import normalized_roi
+from ..coordinates import unit
 from .values import parse_currency
 from .timing import WorkflowTiming
 from ..input.base import UnsupportedOperation
@@ -36,6 +40,7 @@ from .runner import (
 from .service import WorkflowService
 from .storage import WorkflowStorage
 from hardware.raspberry_pi_input import PiControlTarget
+from diagnostic_logging import log_event
 
 LOG = logging.getLogger("workflow_api")
 
@@ -50,6 +55,7 @@ def register_workflows(
     device_id=None,
     ocr_settings_storage=None,
     ocr_resource_provider=None,
+    screenshot_store=None,
     admin_required,
     require_admin,
 ):
@@ -117,6 +123,7 @@ def register_workflows(
         screen_state_provider,
         device_id=device_id,
         screen_resolver=resolve_job_screen,
+        screenshot_store=screenshot_store,
     )
 
     app.extensions.update(
@@ -148,7 +155,7 @@ def register_workflows(
         try:
             return jsonify(ocr_settings.restart())
         except OCRPoolBusy as exc:
-            return jsonify(ok=False, error=str(exc)), 409
+            return jsonify(**error_fields(str(exc), "ocr_busy", ok=False)), 409
 
     # Bounded, short-lived calibrated snapshots: testing uses exactly the image
     # displayed in the picker, even if the live phone changes meanwhile.
@@ -368,11 +375,11 @@ def register_workflows(
 
     @app.errorhandler(FileNotFoundError)
     def missing_file(exc):
-        return jsonify(error="Workflow not found."), 404
+        return jsonify(**error_fields("Workflow not found.", "workflow_not_found")), 404
 
     @app.errorhandler(ScreenStateError)
     def screen_state_error(exc):
-        return jsonify(error=str(exc)), 503
+        return jsonify(**error_fields(str(exc), "workflow_screen_failed")), 503
 
     def run_snapshot(run_id):
         try:
@@ -420,6 +427,7 @@ def register_workflows(
             if state.pi_bridge is not None
             else (service.device_id or "phone_A")
         )
+
         allowed = app.extensions["device_workflow_assignment_store"].get(
             selected_device_id
         )
@@ -431,6 +439,10 @@ def register_workflows(
             allowed_workflow_ids=None if allowed is None else list(allowed),
             workflow_access_unrestricted=allowed is None,
         )
+
+    @app.get("/api/workflow-options/transfer-methods")
+    def transfer_method_workflow_options():
+        return jsonify(transfer_methods=transfer_method_options())
 
     @app.post("/api/workflows")
     @admin_required
@@ -481,8 +493,13 @@ def register_workflows(
         data = payload()
         client = client_id()
 
-        if set(data) - {"variables"}:
-            raise ValueError("Expected variables only.")
+        if set(data) - {"variables", "simulation"}:
+            raise ValueError("Expected variables and optional simulation only.")
+        simulation = data.get("simulation")
+        if simulation is not None and (
+            not isinstance(simulation, dict) or set(simulation) != {"transfer_method"}
+        ):
+            raise ValueError("Manual simulation requires transfer_method only.")
 
         selected_workflow = storage.read(workflow_id)
         target_device_id = (
@@ -518,6 +535,7 @@ def register_workflows(
                         selected_workflow,
                         data.get("variables"),
                         device_id=target_device_id,
+                        execution_context=simulation,
                     )
                 ),
                 202,
@@ -768,7 +786,15 @@ def register_workflows(
     @admin_required
     def start_recording_alternate_screen():
         data = payload()
-        if set(data) - {"text", "timeout_seconds", "roi", "after_step_id"}:
+        if set(data) - {
+            "text",
+            "timeout_seconds",
+            "roi",
+            "after_step_id",
+            "source",
+            "transfer_method",
+            "condition_id",
+        }:
             raise ValueError("Unexpected Special Case fields.")
         with lock:
             return jsonify(
@@ -778,6 +804,9 @@ def register_workflows(
                     data.get("timeout_seconds", 0.8),
                     data.get("roi"),
                     data.get("after_step_id"),
+                    data.get("source", "screen_text"),
+                    data.get("transfer_method"),
+                    data.get("condition_id"),
                 )
             )
 
@@ -816,7 +845,13 @@ def register_workflows(
     @admin_required
     def capture_keyboard_key():
         data = payload()
-        if set(data) - {"key", "point", "camera_point", "frame_id"}:
+        if set(data) - {
+            "key",
+            "point",
+            "camera_point",
+            "coordinate_space",
+            "frame_id",
+        }:
             raise ValueError("Unexpected keyboard capture fields.")
         if ("point" in data) == ("camera_point" in data):
             raise ValueError("Provide exactly one keyboard capture coordinate.")
@@ -829,7 +864,16 @@ def register_workflows(
                     raise ValueError(
                         "Calibrate the phone display before capturing keyboard keys."
                     )
-                point = state.calibration.map(data["camera_point"])
+                coordinate_space = data.get("coordinate_space", "camera_normalized")
+                if coordinate_space == "screen_normalized":
+                    source = data["camera_point"]
+                    if not isinstance(source, (list, tuple)) or len(source) != 2:
+                        raise ValueError("A keyboard key coordinate is required.")
+                    point = [unit(source[0]), unit(source[1])]
+                elif coordinate_space == "camera_normalized":
+                    point = state.calibration.map(data["camera_point"])
+                else:
+                    raise ValueError("Unsupported coordinate_space.")
             if not isinstance(point, (list, tuple)) or len(point) != 2:
                 raise ValueError("A keyboard key coordinate is required.")
             return jsonify(
@@ -993,8 +1037,18 @@ def register_workflows(
                         if state.owner == client:
                             state.renew_lease()
                 return jsonify(recorder.commit_recording(owner, candidate))
-        except Exception:
+        except Exception as exc:
             if action_started:
+                log_event(
+                    LOG,
+                    logging.ERROR,
+                    "recorder",
+                    "recorder_action_failed",
+                    device_id=device_id,
+                    error_code="recorder_action_uncertain",
+                    exception_type=type(exc).__name__,
+                    outcome="uncertain",
+                )
                 with lock:
                     recorder.fail_recording()
                     state.disable(
@@ -1031,6 +1085,7 @@ def register_workflows(
             "frame_id",
             "camera_start",
             "camera_end",
+            "coordinate_space",
             "capture",
         }:
             raise ValueError("Unexpected recorded " "step fields.")
@@ -1060,7 +1115,18 @@ def register_workflows(
                         "preview gestures."
                     )
 
-                start = state.calibration.map(data["camera_start"])
+                coordinate_space = data.get("coordinate_space", "camera_normalized")
+
+                def recorded_point(value):
+                    if coordinate_space == "screen_normalized":
+                        if not isinstance(value, (list, tuple)) or len(value) != 2:
+                            raise ValueError("A normalized coordinate is required.")
+                        return [unit(value[0]), unit(value[1])]
+                    if coordinate_space == "camera_normalized":
+                        return state.calibration.map(value)
+                    raise ValueError("Unsupported coordinate_space.")
+
+                start = recorded_point(data["camera_start"])
 
                 if step.get("type") == "tap":
                     step.update(
@@ -1071,7 +1137,7 @@ def register_workflows(
                 elif step.get("type") == "swipe":
                     step.update(
                         start=start,
-                        end=(state.calibration.map(data.get("camera_end"))),
+                        end=recorded_point(data.get("camera_end")),
                     )
 
                 else:
@@ -1242,7 +1308,17 @@ def register_workflows(
                             ):
                                 state.renew_lease()
 
-                except Exception:
+                except Exception as exc:
+                    log_event(
+                        LOG,
+                        logging.ERROR,
+                        "recorder",
+                        "recorder_action_failed",
+                        device_id=device_id,
+                        error_code="recorder_action_uncertain",
+                        exception_type=type(exc).__name__,
+                        outcome="uncertain",
+                    )
                     recorder.fail_recording()
 
                     state.disable(

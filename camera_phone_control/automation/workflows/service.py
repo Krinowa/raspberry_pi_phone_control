@@ -3,16 +3,58 @@
 import logging
 import threading
 import uuid
+import time
 from collections import deque
 from copy import deepcopy
 from dataclasses import asdict
 
 from ..backends import backend_names
+from diagnostic_logging import diagnostic_context, log_event
 from ..runner import Runner
 from .runner import WorkflowRunner
 from .screenshots import WorkflowScreenshotStore
 from .timing import WorkflowTiming
-from .validation import validate_workflow, resolve_variables
+from .validation import (
+    require_transfer_method_branch,
+    resolve_variables,
+    validate_workflow,
+)
+from automation.transfer_methods import (
+    validate_stored_transfer_method,
+    validate_transfer_method,
+)
+
+
+class RemoteTakeoverRefused(Exception):
+    """A remote takeover may not stop the run on this device right now."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def critical_step_numbers(workflow):
+    """1-based numbers of top-level steps that are, or contain, a critical step."""
+
+    def critical(step):
+        if step.get("critical") is True:
+            return True
+        if step.get("type") == "if_text":
+            return any(
+                critical(child)
+                for child in step.get("then_steps", []) + step.get("else_steps", [])
+            )
+        if step.get("type") == "switch_transfer_method":
+            return any(
+                critical(child)
+                for branch in step.get("branches", {}).values()
+                for child in branch
+            )
+        return False
+
+    return {
+        number for number, step in enumerate(workflow["steps"], 1) if critical(step)
+    }
 
 
 class RunLog(logging.Handler):
@@ -46,6 +88,9 @@ class WorkflowService:
         self.lock = threading.RLock()
         self.runs = {}
         self.completion_listeners = []
+        # device_id -> details of the remote session holding it. A run on a held
+        # device stops at its next input, but never inside a critical step.
+        self.remote_holds = {}
 
     def add_completion_listener(self, listener):
         """Observe immutable completion snapshots without affecting run status."""
@@ -87,10 +132,22 @@ class WorkflowService:
         device_id=None,
         cancel_event=None,
         start_step_index=0,
+        job_id=None,
+        execution_context=None,
     ):
         workflow = validate_workflow(workflow)
+        execution_context = deepcopy(execution_context or {})
+        if set(execution_context) - {"transfer_method"}:
+            raise ValueError("Unsupported workflow execution context.")
+        if "transfer_method" in execution_context:
+            execution_context["transfer_method"] = validate_transfer_method(
+                execution_context["transfer_method"]
+            )
+            require_transfer_method_branch(
+                workflow, execution_context["transfer_method"]
+            )
         variables = deepcopy(variables)
-        resolve_variables(workflow, variables)
+        resolve_variables(workflow, variables, execution_context=execution_context)
         backend_names()
         target_device_id = self.device_id if device_id is None else device_id
         with self.lock:
@@ -110,21 +167,40 @@ class WorkflowService:
             cancel = cancel_event or threading.Event()
             resume = threading.Event()
             completed = threading.Event()
+            critical_steps = critical_step_numbers(workflow)
+            remote_hold = self.remote_holds.get(target_device_id)
             item = {
                 "runner": runner,
                 "cancel": cancel,
                 "resume": resume,
                 "workflow_id": workflow["id"],
                 "device_id": target_device_id,
+                "job_id": job_id,
                 "logs": handler,
                 "backend": backend_names()[0],
                 "steps": self.preview_steps(workflow),
                 "timing": WorkflowTiming(),
                 "completed": completed,
+                "critical_steps": critical_steps,
+                "remote_stop": threading.Event(),
+                "remote_takeover": deepcopy(remote_hold),
                 "active": True,
                 "screenshots": [],
                 "outputs": {},
+                "diagnostic_failure": None,
             }
+            if remote_hold is not None:
+                item["remote_stop"].set()
+
+            def remote_stop_due():
+                # Defer the stop while the current step is critical; the run
+                # stops at the first check after that step has finished.
+                if not item["remote_stop"].is_set():
+                    return False
+                state = runner.state
+                return state is None or state.step_index not in critical_steps
+
+            runner.remote_stop = remote_stop_due
 
             external_screen = self.external_screen
             screen_state_provider = self.screen_state_provider
@@ -154,26 +230,47 @@ class WorkflowService:
                 with self.lock:
                     item["outputs"][name] = value
 
+            def store_diagnostic_failure(failure):
+                with self.lock:
+                    if item["diagnostic_failure"] is None:
+                        item["diagnostic_failure"] = dict(failure)
+
             def execute():
+                started_at = time.monotonic()
                 try:
-                    runner.run_task(
-                        workflow["id"],
-                        lambda ctx: WorkflowRunner(
-                            ctx,
-                            external_screen,
-                            screen_state_provider,
-                            timing=item["timing"],
-                            capture_screen=capture_screen,
-                            output_callback=store_output,
-                        ).run(
-                            workflow,
-                            variables,
-                            start_step_index=start_step_index,
-                        ),
-                        cancel_event=cancel,
-                        resume_event=resume,
+                    with diagnostic_context(
                         device_id=target_device_id,
-                    )
+                        job_id=job_id,
+                        workflow_id=workflow["id"],
+                        workflow_run_id=run_id,
+                    ):
+                        log_event(
+                            logging.getLogger("workflow"),
+                            logging.INFO,
+                            "workflow",
+                            "workflow_started",
+                            retry_count=1 if start_step_index else 0,
+                        )
+                        runner.run_task(
+                            workflow["id"],
+                            lambda ctx: WorkflowRunner(
+                                ctx,
+                                external_screen,
+                                screen_state_provider,
+                                timing=item["timing"],
+                                capture_screen=capture_screen,
+                                output_callback=store_output,
+                                diagnostic_failure_callback=store_diagnostic_failure,
+                                execution_context=execution_context,
+                            ).run(
+                                workflow,
+                                variables,
+                                start_step_index=start_step_index,
+                            ),
+                            cancel_event=cancel,
+                            resume_event=resume,
+                            device_id=target_device_id,
+                        )
                 finally:
                     if isinstance(variables, dict):
                         variables.clear()
@@ -183,7 +280,46 @@ class WorkflowService:
                     with self.lock:
                         item["active"] = False
                     try:
-                        self._notify_completion(self.snapshot(run_id))
+                        snapshot = self.snapshot(run_id)
+                        diagnostic_failure = item.get("diagnostic_failure") or {}
+                        status = snapshot.get("status")
+                        event = {
+                            "passed": "workflow_completed",
+                            "cancelled": "workflow_cancelled",
+                        }.get(status, "workflow_failed")
+                        level = (
+                            logging.INFO
+                            if status in {"passed", "cancelled"}
+                            else logging.ERROR
+                        )
+                        with diagnostic_context(
+                            device_id=target_device_id,
+                            job_id=job_id,
+                            workflow_id=workflow["id"],
+                            workflow_run_id=run_id,
+                        ):
+                            log_event(
+                                logging.getLogger("workflow"),
+                                level,
+                                "workflow",
+                                event,
+                                step_id=diagnostic_failure.get("step_id")
+                                or snapshot.get("step_id"),
+                                error_code=diagnostic_failure.get("error_code")
+                                or snapshot.get("error_code")
+                                or (
+                                    "workflow_failed"
+                                    if status not in {"passed", "cancelled"}
+                                    else None
+                                ),
+                                exception_type=diagnostic_failure.get("exception_type"),
+                                duration_ms=round(
+                                    (time.monotonic() - started_at) * 1000
+                                ),
+                                outcome=status,
+                                retry_count=1 if start_step_index else 0,
+                            )
+                        self._notify_completion(snapshot)
                     finally:
                         completed.set()
 
@@ -195,11 +331,77 @@ class WorkflowService:
             thread.start()
             return self.snapshot(run_id)
 
+    def _active_item(self, device_id):
+        for run_id, item in self.runs.items():
+            if item.get("active", item["thread"].is_alive()) and (
+                item.get("device_id") == device_id
+            ):
+                return run_id, item
+        return None, None
+
+    def hold_for_remote(self, device_id, details, *, allow_during_job, job_pending):
+        """Mark device_id as held by a remote session and stop its run, if any.
+
+        job_pending: a job is claimed for the device but its run may not have
+        started yet. Raises RemoteTakeoverRefused("critical_step" or
+        "job_running"). Returns None, or {"run_id", "workflow", "step_index"}
+        (0-based index of the step the run was in).
+        """
+        with self.lock:
+            run_id, item = self._active_item(device_id)
+            if item is not None:
+                state = item["runner"].state
+                number = state.step_index if state is not None else 0
+                if number in item["critical_steps"]:
+                    raise RemoteTakeoverRefused("critical_step")
+            if (item is not None or job_pending) and not allow_during_job:
+                raise RemoteTakeoverRefused("job_running")
+            self.remote_holds[device_id] = deepcopy(details)
+            if item is None:
+                return None
+            item["remote_takeover"] = deepcopy(details)
+            item["remote_stop"].set()
+            item["runner"].logger.info("Remote takeover requested.")
+            return {
+                "run_id": run_id,
+                "workflow": item["workflow_id"],
+                "step_index": max(number - 1, 0),
+            }
+
+    def critical_step_running(self, device_id):
+        """True while a run on device_id is inside a critical step.
+
+        Covers a manual checkpoint in a critical step, during which the run
+        releases the device lock but must not lose the phone.
+        """
+        with self.lock:
+            _, item = self._active_item(device_id)
+            if item is None:
+                return False
+            state = item["runner"].state
+            return state is not None and state.step_index in item["critical_steps"]
+
+    def release_remote(self, device_id):
+        with self.lock:
+            self.remote_holds.pop(device_id, None)
+
+    def is_remote_held(self, device_id):
+        with self.lock:
+            return device_id in self.remote_holds
+
     def start_for_job(self, job, workflow, *, cancel_event=None):
         """Worker entry point with a device fixed at job creation."""
         if workflow.get("id") != job.workflow:
             raise ValueError("Job workflow does not match the loaded workflow.")
-        options = {"device_id": job.device_id}
+        options = {"device_id": job.device_id, "job_id": job.job_id}
+        if job.action == "withdraw_v2":
+            metadata = job.protected_metadata
+            definition = validate_stored_transfer_method(
+                metadata.get("transfer_method"),
+                metadata.get("transfer_method_profile"),
+                metadata.get("transfer_method_fingerprint"),
+            )
+            options["execution_context"] = {"transfer_method": definition["value"]}
         options["start_step_index"] = job.start_step_index
         if cancel_event is not None:
             options["cancel_event"] = cancel_event
@@ -288,6 +490,7 @@ class WorkflowService:
                 timing=item["timing"].snapshot(),
                 screenshots=deepcopy(item["screenshots"]),
                 outputs=deepcopy(item["outputs"]),
+                remote_takeover=deepcopy(item.get("remote_takeover")),
             )
             index = result.get("step_index", 0)
             result["preview"] = deepcopy(item["steps"][index - 1]) if index else None

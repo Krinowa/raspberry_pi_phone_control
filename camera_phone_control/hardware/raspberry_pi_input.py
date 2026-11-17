@@ -148,7 +148,11 @@ class RaspberryPiInputBridge:
         try:
             connected = self.status()["connected"]
         except PiApiError as exc:
-            return {"api": "offline", "phone": "unknown", "message": str(exc)}
+            result = {"api": "offline", "phone": "unknown", "message": str(exc)}
+            if exc.error_code:
+                result["error_code"] = exc.error_code
+                result["error_params"] = exc.error_params
+            return result
         return {
             "api": "online",
             "phone": "connected" if connected else "waiting",

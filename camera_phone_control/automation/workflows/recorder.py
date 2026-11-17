@@ -4,6 +4,7 @@ from copy import deepcopy
 import re
 import uuid
 
+from automation.transfer_methods import TRANSFER_METHODS, validate_transfer_method
 from .models import new_workflow, now
 from ..coordinates import unit
 from .validation import (
@@ -14,6 +15,38 @@ from .validation import (
     validate_workflow,
 )
 
+VERIFY_VARIABLE_LABELS = {
+    "account_name": "Account Name",
+    "account_number": "Account Number",
+    "mobile_no": "Mobile Number",
+    "fps_phone_number": "FPS Phone Number",
+    "fps_email": "FPS Email Address",
+    "fps_id": "FPS ID",
+    "holder_name": "Holder Name",
+    "bank_name": "Bank Name",
+    "amount": "Amount",
+}
+
+
+def ensure_verify_variable(workflow, step):
+    if step.get("type") != "verify_text" or step.get("source") != "variable":
+        return
+    name = step.get("variable")
+    if name not in VERIFY_VARIABLE_LABELS or any(
+        definition.get("name") == name for definition in workflow["variables"]
+    ):
+        return
+    workflow["variables"].append(
+        {
+            "name": name,
+            "label": VERIFY_VARIABLE_LABELS[name],
+            "type": "text",
+            "required": True,
+            "default": None,
+            "ask_when_running": True,
+        }
+    )
+
 
 def iter_workflow_steps(steps):
     for step in steps:
@@ -21,6 +54,9 @@ def iter_workflow_steps(steps):
         if step.get("type") == "if_text":
             yield from iter_workflow_steps(step.get("then_steps", []))
             yield from iter_workflow_steps(step.get("else_steps", []))
+        elif step.get("type") == "switch_transfer_method":
+            for branch in step.get("branches", {}).values():
+                yield from iter_workflow_steps(branch)
 
 
 def find_step_location(steps, step_id):
@@ -30,6 +66,11 @@ def find_step_location(steps, step_id):
         if step.get("type") == "if_text":
             for branch in ("then_steps", "else_steps"):
                 found = find_step_location(step.get(branch, []), step_id)
+                if found is not None:
+                    return found
+        elif step.get("type") == "switch_transfer_method":
+            for branch_steps_value in step.get("branches", {}).values():
+                found = find_step_location(branch_steps_value, step_id)
                 if found is not None:
                     return found
     return None
@@ -44,12 +85,16 @@ def branch_steps(workflow, parent_step_id=None, branch=None):
     if location is None:
         raise ValueError("Condition step not found.")
     parent = location[0][location[1]]
-    if parent.get("type") != "if_text" or branch not in {
+    if parent.get("type") == "if_text" and branch in {
         "then_steps",
         "else_steps",
     }:
-        raise ValueError("Choose a valid condition branch.")
-    return parent[branch]
+        return parent[branch]
+    if parent.get("type") == "switch_transfer_method":
+        method = validate_transfer_method(branch)
+        if method in parent.get("branches", {}):
+            return parent["branches"][method]
+    raise ValueError("Choose a valid condition branch.")
 
 
 class Recorder:
@@ -74,9 +119,17 @@ class Recorder:
         if location is None:
             raise ValueError("The Special Case is no longer available.")
         condition = location[0][location[1]]
-        if condition.get("type") != "if_text":
+        if condition.get("type") == "if_text":
+            return condition["then_steps"]
+        if condition.get("type") == "switch_transfer_method":
+            method = validate_transfer_method(
+                self.active_alternate_screen.get("branch")
+            )
+            if method in condition.get("branches", {}):
+                return condition["branches"][method]
+        if condition.get("type") not in {"if_text", "switch_transfer_method"}:
             raise ValueError("The Special Case is no longer available.")
-        return condition["then_steps"]
+        raise ValueError("The Special Case branch is no longer available.")
 
     def _clear_annotation_state(self):
         self.pending_expected_text = None
@@ -257,10 +310,11 @@ class Recorder:
                 candidate["variables"].append(variable)
 
         self._recording_steps(candidate).append(step)
+        ensure_verify_variable(candidate, step)
         # A financial draft may be incomplete until Save; validate other fields now.
         check = deepcopy(candidate)
         check["financial"] = False
-        validate_workflow(check)
+        validate_workflow(check, allow_empty=True)
         return candidate
 
     def undo(self, owner):
@@ -327,7 +381,7 @@ class Recorder:
             self._recording_steps(candidate).pop()
         check = deepcopy(candidate)
         check["financial"] = False
-        validate_workflow(check)
+        validate_workflow(check, allow_empty=True)
         return candidate
 
     def require_expected_text_action(self, step_id):
@@ -459,7 +513,7 @@ class Recorder:
             self._recording_steps(candidate)[-1]["value"] += step["value"]
             check = deepcopy(candidate)
             check["financial"] = False
-            validate_workflow(check)
+            validate_workflow(check, allow_empty=True)
             return candidate
         return self.prepare(owner, step)
 
@@ -470,6 +524,9 @@ class Recorder:
         timeout_seconds=0.8,
         roi=None,
         after_step_id=None,
+        source="screen_text",
+        transfer_method=None,
+        condition_id=None,
     ):
         self.require_owner(owner)
         self._require_not_annotating()
@@ -480,8 +537,17 @@ class Recorder:
         return_mode = "recording" if self.active else "review"
         if return_mode == "recording" and after_step_id is not None:
             raise ValueError("Finish recording before choosing a review position.")
+        if source not in {"screen_text", "withdrawal_api"}:
+            raise ValueError("Choose Screen Text or Withdrawal API.")
+        if source == "withdrawal_api":
+            transfer_method = validate_transfer_method(transfer_method)
+        elif condition_id is not None:
+            raise ValueError(
+                "Only Withdrawal API branches can edit an existing condition."
+            )
+
         insertion_index = len(self.workflow["steps"])
-        if return_mode == "review":
+        if return_mode == "review" and condition_id is None:
             location = find_step_location(self.workflow["steps"], after_step_id)
             if location is None:
                 raise ValueError("Choose a workflow step for this Special Case.")
@@ -490,18 +556,40 @@ class Recorder:
                     "Finish editing the current Special Case before adding another one here."
                 )
             insertion_index = location[1] + 1
-        condition = {
-            "id": "step_" + uuid.uuid4().hex,
-            "type": "if_text",
-            "text": text,
-            "timeout_seconds": timeout_seconds,
-            "then_steps": [],
-            "else_steps": [],
-        }
-        if roi is not None:
-            condition["roi"] = deepcopy(roi)
         candidate = deepcopy(self.workflow)
-        candidate["steps"].insert(insertion_index, condition)
+        original_branch = None
+        created_condition = condition_id is None
+        if condition_id is not None:
+            location = find_step_location(candidate["steps"], condition_id)
+            if (
+                location is None
+                or location[0][location[1]].get("type") != "switch_transfer_method"
+            ):
+                raise ValueError(
+                    "The Transfer Method condition is no longer available."
+                )
+            condition = location[0][location[1]]
+            original_branch = deepcopy(condition["branches"].get(transfer_method, []))
+            condition["branches"].setdefault(transfer_method, [])
+        elif source == "withdrawal_api":
+            condition = {
+                "id": "step_" + uuid.uuid4().hex,
+                "type": "switch_transfer_method",
+                "branches": {method: [] for method in TRANSFER_METHODS},
+            }
+            candidate["steps"].insert(insertion_index, condition)
+        else:
+            condition = {
+                "id": "step_" + uuid.uuid4().hex,
+                "type": "if_text",
+                "text": text,
+                "timeout_seconds": timeout_seconds,
+                "then_steps": [],
+                "else_steps": [],
+            }
+            if roi is not None:
+                condition["roi"] = deepcopy(roi)
+            candidate["steps"].insert(insertion_index, condition)
         check = deepcopy(candidate)
         check["financial"] = False
         candidate = validate_workflow(check, allow_empty=True)
@@ -512,6 +600,9 @@ class Recorder:
             "condition_id": condition["id"],
             "return_mode": return_mode,
             "after_step_id": after_step_id,
+            "branch": transfer_method if source == "withdrawal_api" else "then_steps",
+            "created_condition": created_condition,
+            "original_branch": original_branch,
         }
         self.input_target = None
         return self.snapshot()
@@ -521,6 +612,9 @@ class Recorder:
         if self.active_alternate_screen is None:
             raise ValueError("No Special Case recording is active.")
         self._require_not_annotating()
+        branch = self.active_alternate_screen.get("branch")
+        if branch in TRANSFER_METHODS and not self._recording_steps():
+            raise ValueError("A Transfer Method branch must not be empty.")
         return_mode = self.active_alternate_screen["return_mode"]
         self.active_alternate_screen = None
         self.active = return_mode == "recording"
@@ -535,7 +629,13 @@ class Recorder:
         condition_id = self.active_alternate_screen["condition_id"]
         location = find_step_location(self.workflow["steps"], condition_id)
         if location is not None:
-            location[0].pop(location[1])
+            condition = location[0][location[1]]
+            if self.active_alternate_screen.get("created_condition", True):
+                location[0].pop(location[1])
+            elif condition.get("type") == "switch_transfer_method":
+                condition["branches"][self.active_alternate_screen["branch"]] = (
+                    deepcopy(self.active_alternate_screen.get("original_branch") or [])
+                )
         return_mode = self.active_alternate_screen["return_mode"]
         self.active_alternate_screen = None
         self.active = return_mode == "recording"
@@ -579,7 +679,9 @@ class Recorder:
                 "wait",
                 "wait_until_stable",
                 "wait_for_text",
+                "verify_text",
                 "if_text",
+                "switch_transfer_method",
                 "capture_screen",
                 "ocr_value",
                 "manual_checkpoint",
@@ -643,7 +745,18 @@ class Recorder:
                     "wait": {"seconds"},
                     "wait_until_stable": {"stable_ms", "timeout_seconds"},
                     "wait_for_text": {"text", "timeout_seconds", "roi"},
+                    "verify_text": {
+                        "label",
+                        "source",
+                        "text",
+                        "variable",
+                        "match_mode",
+                        "last_n",
+                        "timeout_seconds",
+                        "roi",
+                    },
                     "if_text": {"text", "timeout_seconds", "roi"},
+                    "switch_transfer_method": set(),
                     "capture_screen": {"output_key"},
                     "ocr_value": {"roi", "parser", "output"},
                     "manual_checkpoint": {"message"},
@@ -651,9 +764,12 @@ class Recorder:
                 changes = data.get("fields")
                 if not isinstance(changes, dict) or set(changes) - allowed:
                     raise ValueError("Unsupported fields for this step.")
+                if old["type"] == "verify_text":
+                    for field in ("text", "variable", "last_n"):
+                        old.pop(field, None)
                 old.update(deepcopy(changes))
                 if (
-                    old["type"] in {"wait_for_text", "if_text"}
+                    old["type"] in {"wait_for_text", "if_text", "verify_text"}
                     and changes.get("roi", False) is None
                 ):
                     old.pop("roi", None)
@@ -841,6 +957,8 @@ class Recorder:
                 raise ValueError("Unknown review operation.")
 
         all_steps = list(iter_workflow_steps(candidate["steps"]))
+        for step in all_steps:
+            ensure_verify_variable(candidate, step)
         used = {s.get("variable") for s in all_steps}
 
         candidate["variables"] = [
@@ -876,8 +994,14 @@ class Recorder:
                 condition = location[0][location[1]]
                 alternate_screen = {
                     "condition_id": condition["id"],
-                    "text": condition["text"],
-                    "step_count": len(condition["then_steps"]),
+                    "source": (
+                        "withdrawal_api"
+                        if condition.get("type") == "switch_transfer_method"
+                        else "screen_text"
+                    ),
+                    "text": condition.get("text"),
+                    "branch": self.active_alternate_screen.get("branch"),
+                    "step_count": len(self._recording_steps(workflow)),
                     "return_mode": self.active_alternate_screen["return_mode"],
                     "after_step_id": self.active_alternate_screen.get("after_step_id"),
                 }
