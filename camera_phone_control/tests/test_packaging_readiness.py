@@ -5,6 +5,7 @@ import importlib.util
 import tempfile
 import unittest
 import struct
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -31,6 +32,9 @@ validate_models = _models._validate
 _ffmpeg = _load_packaging_module("validate_ffmpeg")
 FFmpegValidationError = _ffmpeg.FFmpegValidationError
 validate_ffmpeg = _ffmpeg.validate_ffmpeg
+_provision = _load_packaging_module("provision_ffmpeg")
+FFmpegProvisioningError = _provision.FFmpegProvisioningError
+provision_ffmpeg = _provision.provision_ffmpeg
 _workflows = _load_packaging_module("validate_workflow_seeds")
 WorkflowSeedError = _workflows.WorkflowSeedError
 validate_seed_directory = _workflows.validate_seed_directory
@@ -210,6 +214,61 @@ class PackagingReadinessTests(unittest.TestCase):
             with patch.object(_ffmpeg.subprocess, "run", side_effect=[version, devices]), \
                     self.assertRaisesRegex(FFmpegValidationError, "DirectShow"):
                 validate_ffmpeg(executable)
+
+    def test_ffmpeg_provisioning_supports_direct_exe_and_single_zip_entry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            direct = root / "approved.exe"
+            direct.write_bytes(b"MZdirect-approved")
+            direct_target = root / "direct" / "ffmpeg.exe"
+            direct_target.parent.mkdir()
+            self.assertEqual(
+                provision_ffmpeg(direct, direct_target), direct_target
+            )
+            self.assertEqual(direct_target.read_bytes(), b"MZdirect-approved")
+
+            archive = root / "approved.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("approved-ffmpeg/bin/ffmpeg.exe", b"MZzip-approved")
+                bundle.writestr("approved-ffmpeg/LICENSE.txt", b"license")
+            zip_target = root / "zip" / "ffmpeg.exe"
+            zip_target.parent.mkdir()
+            self.assertEqual(provision_ffmpeg(archive, zip_target), zip_target)
+            self.assertEqual(zip_target.read_bytes(), b"MZzip-approved")
+
+    def test_ffmpeg_provisioning_rejects_unsafe_missing_and_ambiguous_zips(self):
+        cases = {
+            "unsafe": [("../ffmpeg.exe", b"MZunsafe")],
+            "missing": [("bin/ffprobe.exe", b"MZprobe")],
+            "ambiguous": [
+                ("one/ffmpeg.exe", b"MZone"),
+                ("two/FFMPEG.EXE", b"MZtwo"),
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, entries in cases.items():
+                with self.subTest(name=name):
+                    archive = root / f"{name}.zip"
+                    with zipfile.ZipFile(archive, "w") as bundle:
+                        for entry, payload in entries:
+                            bundle.writestr(entry, payload)
+                    target = root / f"{name}.exe"
+                    with self.assertRaises(FFmpegProvisioningError):
+                        provision_ffmpeg(archive, target)
+                    self.assertFalse(target.exists())
+
+    def test_ffmpeg_workflow_verifies_archive_before_provision_and_validation(self):
+        workflow_path = (
+            APP_ROOT.parent / ".github" / "workflows" / "build-windows.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        checksum = workflow.index("Get-FileHash -LiteralPath $download")
+        provision = workflow.index("python packaging/provision_ffmpeg.py")
+        validation = workflow.index("python packaging/validate_ffmpeg.py $candidate")
+        self.assertLess(checksum, provision)
+        self.assertLess(provision, validation)
+        self.assertIn("-MaximumRedirection 0", workflow)
 
     def test_build_requires_ffmpeg_and_validates_frozen_assets(self):
         build = (APP_ROOT / "packaging" / "build_windows.bat").read_text(

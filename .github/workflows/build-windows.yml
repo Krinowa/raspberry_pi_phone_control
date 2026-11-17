@@ -91,32 +91,43 @@ jobs:
             throw "Approved FFmpeg URL must be an absolute HTTPS URL."
           }
 
-          $temporary = Join-Path $env:RUNNER_TEMP "phone-controller-approved-ffmpeg.exe"
+          $nonce = [IO.Path]::GetRandomFileName()
+          $download = Join-Path $env:RUNNER_TEMP "phone-controller-ffmpeg-$nonce.download"
+          $candidate = Join-Path $env:RUNNER_TEMP "phone-controller-ffmpeg-$nonce.exe"
           try {
-            Invoke-WebRequest `
-              -Uri $uri `
-              -OutFile $temporary `
-              -MaximumRedirection 0 `
-              -TimeoutSec 120 `
-              -ErrorAction Stop
-          } catch {
-            throw "Approved FFmpeg download failed. Configure a direct HTTPS URL that does not redirect."
-          }
-          if (-not (Test-Path -LiteralPath $temporary -PathType Leaf)) {
-            throw "Approved FFmpeg download did not create a file."
-          }
+            try {
+              Invoke-WebRequest `
+                -Uri $uri `
+                -OutFile $download `
+                -MaximumRedirection 0 `
+                -TimeoutSec 120 `
+                -ErrorAction Stop
+            } catch {
+              throw "Approved FFmpeg download failed. Configure a direct HTTPS URL that does not redirect."
+            }
+            if (-not (Test-Path -LiteralPath $download -PathType Leaf)) {
+              throw "Approved FFmpeg download did not create a file."
+            }
 
-          $expected = $env:APPROVED_FFMPEG_SHA256.ToLowerInvariant()
-          $actual = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) {
-            throw "Approved FFmpeg SHA-256 verification failed. The downloaded file will not be used."
-          }
+            $expected = $env:APPROVED_FFMPEG_SHA256.ToLowerInvariant()
+            $actual = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) {
+              throw "Approved FFmpeg SHA-256 verification failed. The downloaded file will not be used."
+            }
 
-          $destination = Join-Path $PWD "packaging\vendor\ffmpeg.exe"
-          Move-Item -LiteralPath $temporary -Destination $destination -Force
-          python packaging/validate_ffmpeg.py packaging/vendor/ffmpeg.exe
-          if ($LASTEXITCODE -ne 0) {
-            throw "Approved FFmpeg failed the existing Windows x64/DirectShow validation."
+            python packaging/provision_ffmpeg.py $download $candidate
+            if ($LASTEXITCODE -ne 0) {
+              throw "Approved FFmpeg download could not be provisioned safely."
+            }
+            python packaging/validate_ffmpeg.py $candidate
+            if ($LASTEXITCODE -ne 0) {
+              throw "Approved FFmpeg failed the existing Windows x64/DirectShow validation."
+            }
+            $destination = Join-Path $PWD "packaging\vendor\ffmpeg.exe"
+            Move-Item -LiteralPath $candidate -Destination $destination -Force
+          } finally {
+            Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
           }
 
       - name: Build and validate protected Windows distribution

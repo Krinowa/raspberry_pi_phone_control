@@ -134,19 +134,24 @@ GitHub-hosted `windows-2022` x64 runner and calls this same
 
 Before running it, configure these repository Actions variables:
 
-- `PHONE_CONTROLLER_FFMPEG_URL` — a direct HTTPS URL for the reviewed,
-  self-contained Windows x64 FFmpeg binary. Redirects are rejected.
-- `PHONE_CONTROLLER_FFMPEG_SHA256` — the approved binary's 64-character SHA-256
-  digest.
+- `PHONE_CONTROLLER_FFMPEG_URL` — a direct HTTPS URL for either the reviewed
+  Windows x64 FFmpeg ZIP archive or the reviewed, self-contained Windows x64
+  `ffmpeg.exe`. Redirects are rejected.
+- `PHONE_CONTROLLER_FFMPEG_SHA256` — the 64-character SHA-256 digest of the
+  entire object at that URL: the ZIP archive when using a ZIP URL, or the
+  executable when using a direct-EXE URL.
 
 If the URL contains credentials or a time-limited token, configure both values
 as repository Actions secrets instead and do not also define conflicting
 variables. Do not store the executable itself in a secret. The workflow
-downloads to a temporary path, verifies SHA-256 before moving the file into
-`packaging\vendor\ffmpeg.exe`, and then runs `validate_ffmpeg.py` to verify the
-PE architecture, standalone execution and DirectShow support. Missing values,
-redirects, digest mismatch or binary validation failure stop the job before the
-application build.
+downloads to a temporary path and verifies the whole-object SHA-256 before
+inspecting it. For a ZIP, every entry path is checked, exactly one
+`ffmpeg.exe` must exist, and only that entry is extracted. A direct executable
+remains supported. The candidate then runs through `validate_ffmpeg.py` to
+verify PE architecture, standalone execution and DirectShow support before it
+is moved into `packaging\vendor\ffmpeg.exe`. Missing values, redirects, digest
+mismatch, unsafe or ambiguous archives, or binary validation failure stop the
+job before the application build.
 
 After all protected-build, frozen-application and focused regression checks
 pass, the workflow uploads
