@@ -21,48 +21,81 @@ from automation.screen.state import ScreenStateError
 
 def protocol_worker(connection, config):
     """Small spawned worker used to test the production parent protocol."""
-    with config["initializations"].get_lock():
-        config["initializations"].value += 1
-    connection.send(("ready", os.getpid(), 0.001))
-    while True:
-        message = connection.recv()
-        if message[0] == "shutdown":
-            connection.close()
+    try:
+        with config["initializations"].get_lock():
+            config["initializations"].value += 1
+        try:
+            connection.send(("ready", os.getpid(), 0.001))
+        except (BrokenPipeError, EOFError, OSError):
             return
-        _, request_id, image = message
-        command = int(image.flat[0])
-        if command == 250:
-            connection.send(("error", request_id, "RuntimeError", "test failure", os.getpid()))
-        elif command == 251:
-            os._exit(7)
-        elif command == 252:
-            time.sleep(5)
-        else:
-            if command >= 200:
-                time.sleep(0.2)
-            text = "Log In" if command in {0, 1} else f"Value {command}"
-            connection.send((
-                "result",
-                request_id,
-                [{"res": {"rec_texts": [text], "rec_scores": [0.9],
-                           "rec_boxes": [[0, 0, 10, 10]]}}],
-                0.002,
-                os.getpid(),
-            ))
+        while True:
+            try:
+                message = connection.recv()
+            except (BrokenPipeError, EOFError, OSError):
+                return
+            if message[0] == "shutdown":
+                return
+            _, request_id, image = message
+            command = int(image.flat[0])
+            try:
+                if command == 250:
+                    connection.send(
+                        (
+                            "error",
+                            request_id,
+                            "RuntimeError",
+                            "test failure",
+                            os.getpid(),
+                        )
+                    )
+                elif command == 251:
+                    os._exit(7)
+                elif command == 252:
+                    time.sleep(5)
+                else:
+                    if command >= 200:
+                        time.sleep(0.2)
+                    text = "Log In" if command in {0, 1} else f"Value {command}"
+                    connection.send(
+                        (
+                            "result",
+                            request_id,
+                            [
+                                {
+                                    "res": {
+                                        "rec_texts": [text],
+                                        "rec_scores": [0.9],
+                                        "rec_boxes": [[0, 0, 10, 10]],
+                                    }
+                                }
+                            ],
+                            0.002,
+                            os.getpid(),
+                        )
+                    )
+            except (BrokenPipeError, EOFError, OSError):
+                return
+    finally:
+        stopped = config.get("stopped")
+        if stopped is not None:
+            stopped.set()
+        connection.close()
 
 
 def startup_error_worker(connection, config):
-    connection.send((
-        "startup_error",
-        os.getpid(),
-        "OSError",
-        "model unavailable",
-        {
-            "exception_detail": "native DLL unavailable",
-            "exception_chain": "TextDetectionUnavailable <- OSError",
-            "traceback_summary": "camera_ocr.py:123:_build_paddle_engine",
-        },
-    ))
+    connection.send(
+        (
+            "startup_error",
+            os.getpid(),
+            "OSError",
+            "model unavailable",
+            {
+                "exception_detail": "native DLL unavailable",
+                "exception_chain": "TextDetectionUnavailable <- OSError",
+                "traceback_summary": "camera_ocr.py:123:_build_paddle_engine",
+            },
+        )
+    )
     connection.close()
 
 
@@ -70,11 +103,17 @@ class PaddleWorkerClientTests(unittest.TestCase):
     def setUp(self):
         self.context = multiprocessing.get_context("spawn")
         self.initializations = self.context.Value("i", 0)
+        self.stopped = self.context.Event()
 
     def client(self, timeout=2):
         return _PaddleWorkerClient(
-            {"language": "en", "textline_orientation": False,
-             "cpu_threads": 1, "initializations": self.initializations},
+            {
+                "language": "en",
+                "textline_orientation": False,
+                "cpu_threads": 1,
+                "initializations": self.initializations,
+                "stopped": self.stopped,
+            },
             timeout,
             context=self.context,
             target=protocol_worker,
@@ -133,7 +172,11 @@ class PaddleWorkerClientTests(unittest.TestCase):
         self.assertEqual(self.initializations.value, 1)
 
     def test_request_timeout_stops_failed_worker(self):
-        client = self.client(timeout=0.15)
+        client = self.client(timeout=2)
+        self.addCleanup(client.close)
+        client.start()
+        self.assertIsNotNone(client.pid)
+        client.timeout = 0.15
         with self.assertRaisesRegex(ScreenStateError, "timed out during inference"):
             client.request(np.full((2, 2), 252, np.uint8))
         self.assertIsNone(client.pid)
@@ -150,8 +193,7 @@ class PaddleWorkerClientTests(unittest.TestCase):
         worker_pid = client.pid
         client.close()
         self.assertIsNone(client.pid)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(worker_pid, 0)
+        self.assertTrue(self.stopped.wait(1), f"worker {worker_pid} did not stop")
 
     def paddle_options(self, language, *, packaged_models=None):
         paddleocr = Mock()
@@ -263,10 +305,22 @@ class CameraOCRCacheTests(unittest.TestCase):
         worker = Mock()
         worker.pid = 7654
         worker.request.return_value = (
-            [{"res": {"rec_texts": ["Accounts"], "rec_scores": [0.95],
-                       "rec_boxes": [[0, 0, 20, 10]]}}],
-            {"worker_start": 0, "ipc_send": 0, "ipc_wait": 0,
-             "inference": 0, "worker_pid": 7654},
+            [
+                {
+                    "res": {
+                        "rec_texts": ["Accounts"],
+                        "rec_scores": [0.95],
+                        "rec_boxes": [[0, 0, 20, 10]],
+                    }
+                }
+            ],
+            {
+                "worker_start": 0,
+                "ipc_send": 0,
+                "ipc_wait": 0,
+                "inference": 0,
+                "worker_pid": 7654,
+            },
         )
         return worker
 
@@ -316,7 +370,8 @@ class CameraOCRCacheTests(unittest.TestCase):
     def test_failed_ocr_is_not_cached(self):
         worker = self.worker()
         worker.request.side_effect = [
-            ScreenStateError("failed"), worker.request.return_value,
+            ScreenStateError("failed"),
+            worker.request.return_value,
         ]
         provider = self.provider(worker)
         image = np.zeros((300, 180), np.uint8)
