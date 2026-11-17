@@ -379,6 +379,20 @@ def _forbidden_bundle_inputs(distribution):
     return forbidden
 
 
+def _validate_cython_runtime_data(resources):
+    cpp_support = Path(resources) / "Cython" / "Utility" / "CppSupport.cpp"
+    if (
+        not cpp_support.is_file()
+        or cpp_support.is_symlink()
+        or cpp_support.stat().st_size == 0
+    ):
+        raise RuntimeError(
+            "Frozen Cython runtime utility data is missing or invalid: "
+            f"{cpp_support}"
+        )
+    return cpp_support
+
+
 def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
     distribution = Path(distribution).resolve()
     executable = distribution / "PhoneController.exe"
@@ -389,6 +403,7 @@ def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
         raise RuntimeError(f"Frozen resource directory is missing: {resources}")
     validate_ffmpeg(resources / "tools" / "ffmpeg.exe")
     validate_models(resources / "paddle_models")
+    _validate_cython_runtime_data(resources)
     manifest_path = manifest_path or os.environ.get(
         "PHONE_CONTROLLER_PROTECTED_MANIFEST", ""
     )

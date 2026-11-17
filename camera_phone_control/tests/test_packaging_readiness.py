@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from hardware.camera_identity import resolve_ffmpeg_executable
 from windows_runtime import RuntimePaths
-s
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -554,6 +554,8 @@ class PackagingReadinessTests(unittest.TestCase):
         self.assertIn("clean_protected_build.py", build)
         self.assertIn("PYINSTALLER_CONFIG_DIR", build)
         self.assertIn('environment["CAMERA_OCR_LANGUAGE"] = "zh-HK"', validator)
+        self.assertIn('collect_data_files("Cython", subdir="Utility")', spec)
+        self.assertIn('"Cython" / "Utility" / "CppSupport.cpp"', validator)
         launcher = (APP_ROOT / "windows_launcher.py").read_text(encoding="utf-8")
         self.assertIn('report["ocr_worker_status"]', launcher)
         self.assertIn('report["ocr_language_statuses"]', launcher)

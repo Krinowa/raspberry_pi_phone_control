@@ -111,6 +111,11 @@ binaries.append((str(ffmpeg), "tools"))
 # Bundle certifi's cacert.pem so that path also exists in the installed onedir app.
 datas += collect_data_files("certifi")
 
+# PaddleX imports Cython.Compiler while initializing OCR. Cython loads code
+# templates from this directory by path at runtime, so ModuleGraph cannot infer
+# them from imports alone.
+datas += collect_data_files("Cython", subdir="Utility")
+
 for model_name in model_names:
     model = model_root / model_name
     if not all(
