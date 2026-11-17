@@ -168,6 +168,24 @@ def _safe_clean(path: Path):
     path.mkdir(parents=True)
 
 
+def _build_relative_path(path):
+    path = Path(path)
+    try:
+        return path.resolve().relative_to(APP_ROOT.resolve())
+    except ValueError as exc:
+        raise ProtectedBuildError(
+            f"Protected build path escaped the application root: {path}"
+        ) from exc
+
+
+def _compiler_source_path(source):
+    """Keep generated compiler inputs relative so MSVC does not mirror APP_ROOT."""
+    source = Path(source)
+    if not source.is_absolute():
+        return str(source)
+    return str(_build_relative_path(source))
+
+
 def compile_plan(plan, stage: Path, temp: Path):
     try:
         from Cython.Build import cythonize
@@ -192,12 +210,16 @@ def compile_plan(plan, stage: Path, temp: Path):
         )
     ]
     generated = temp / "generated"
+    objects = temp / "objects"
+    generated.mkdir(parents=True, exist_ok=True)
+    objects.mkdir(parents=True, exist_ok=True)
+    generated_build_dir = _build_relative_path(generated)
     previous_directory = Path.cwd()
     os.chdir(APP_ROOT)
     try:
         extension_modules = cythonize(
             extensions,
-            build_dir=str(generated),
+            build_dir=str(generated_build_dir),
             compiler_directives={
                 "language_level": 3,
                 "binding": True,
@@ -207,6 +229,10 @@ def compile_plan(plan, stage: Path, temp: Path):
             force=True,
             nthreads=max(1, min(4, os.cpu_count() or 1)),
         )
+        for extension in extension_modules:
+            extension.sources = [
+                _compiler_source_path(source) for source in extension.sources
+            ]
         setup(
             name="phone-controller-protected-modules",
             ext_modules=extension_modules,
@@ -215,7 +241,7 @@ def compile_plan(plan, stage: Path, temp: Path):
                 "--build-lib",
                 str(stage),
                 "--build-temp",
-                str(temp / "objects"),
+                str(objects),
             ],
         )
     finally:

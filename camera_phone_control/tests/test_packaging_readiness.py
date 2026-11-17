@@ -9,12 +9,12 @@ import tempfile
 import unittest
 import struct
 import zipfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import Mock, patch
 
 from hardware.camera_identity import resolve_ffmpeg_executable
 from windows_runtime import RuntimePaths
-
+s
 APP_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -410,9 +410,7 @@ class PackagingReadinessTests(unittest.TestCase):
                     ),
                 ):
                     destination = root / f"blocked-{index}.zip"
-                    with self.assertRaisesRegex(
-                        FFmpegDownloadError, error_pattern
-                    ):
+                    with self.assertRaisesRegex(FFmpegDownloadError, error_pattern):
                         download_approved_ffmpeg(source_url, destination, "0" * 64)
                     self.assertFalse(destination.exists())
 
@@ -494,6 +492,41 @@ class PackagingReadinessTests(unittest.TestCase):
                 "hardware",
             },
         )
+
+    def test_protected_cython_sources_keep_msvc_intermediates_short(self):
+        generated = APP_ROOT / "build" / "protected-temp" / "generated"
+        absolute_source = generated / "android_control.c"
+        self.assertEqual(
+            _protected._build_relative_path(generated),
+            Path("build/protected-temp/generated"),
+        )
+        relative_source = _protected._compiler_source_path(absolute_source)
+        self.assertEqual(
+            Path(relative_source),
+            Path("build/protected-temp/generated/android_control.c"),
+        )
+        self.assertFalse(Path(relative_source).is_absolute())
+
+        ci_root = PureWindowsPath(
+            "D:/a/raspberry_pi_phone_control/raspberry_pi_phone_control/"
+            "camera_phone_control"
+        )
+        import_library = (
+            ci_root
+            / "build/protected-temp/objects/Release"
+            / PureWindowsPath(relative_source).parent
+            / "android_control.cp313-win_amd64.lib"
+        )
+        self.assertLess(len(str(import_library)), 260)
+        self.assertNotIn(str(ci_root), relative_source)
+        duplicated_absolute_library = (
+            ci_root
+            / "build/protected-temp/objects/Release"
+            / PureWindowsPath(*ci_root.parts[1:])
+            / "build/protected-temp/generated"
+            / "android_control.cp313-win_amd64.lib"
+        )
+        self.assertEqual(len(str(duplicated_absolute_library)), 260)
 
     def test_pyinstaller_requires_protected_stage_without_fallback(self):
         build = (APP_ROOT / "packaging" / "build_windows.bat").read_text(
