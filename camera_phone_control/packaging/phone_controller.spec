@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 
 APP_ROOT = Path(SPECPATH).parent
@@ -130,6 +130,18 @@ for package in ("chardet", "paddle", "paddleocr", "paddlex", "cv2", "numpy"):
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_hidden
+
+# PaddleX checks OCR-core availability through importlib.metadata rather than
+# imports, so retain the metadata for every distribution in that extra.
+for distribution in (
+    "imagesize",
+    "opencv-contrib-python",
+    "pyclipper",
+    "pypdfium2",
+    "python-bidi",
+    "shapely",
+):
+    datas += copy_metadata(distribution)
 
 # Local Android tooling remains optional because Raspberry Pi control is the
 # application default. FFmpeg is required above for stable DirectShow identity

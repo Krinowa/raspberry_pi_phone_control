@@ -560,9 +560,21 @@ class PackagingReadinessTests(unittest.TestCase):
             '("chardet", "paddle", "paddleocr", "paddlex", "cv2", "numpy")',
             spec,
         )
+        for distribution in (
+            "imagesize",
+            "opencv-contrib-python",
+            "pyclipper",
+            "pypdfium2",
+            "python-bidi",
+            "shapely",
+        ):
+            self.assertIn(f'"{distribution}"', spec)
+        self.assertIn("datas += copy_metadata(distribution)", spec)
         self.assertIn('"Cython" / "Utility" / "CppSupport.cpp"', validator)
         self.assertIn("CHARDET_MYPYC_MODULES", validator)
         self.assertIn("_validate_chardet_runtime_extensions(resources)", validator)
+        self.assertIn("PADDLEX_OCR_CORE_METADATA", validator)
+        self.assertIn("_validate_paddlex_ocr_core_metadata(resources)", validator)
         launcher = (APP_ROOT / "windows_launcher.py").read_text(encoding="utf-8")
         self.assertIn('report["ocr_worker_status"]', launcher)
         self.assertIn('report["ocr_language_statuses"]', launcher)

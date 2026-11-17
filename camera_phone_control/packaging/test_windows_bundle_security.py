@@ -12,13 +12,40 @@ sys.path.insert(0, str(PACKAGING))
 
 from validate_windows_bundle import (  # noqa: E402
     CHARDET_MYPYC_MODULES,
+    PADDLEX_OCR_CORE_METADATA,
     _forbidden_bundle_inputs,
     _validate_chardet_runtime_extensions,
     _validate_cython_runtime_data,
+    _validate_paddlex_ocr_core_metadata,
 )
 
 
 class WindowsBundleSecurityTests(unittest.TestCase):
+    def test_all_paddlex_ocr_core_distribution_metadata_is_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            resources = Path(temporary)
+
+            with self.assertRaisesRegex(RuntimeError, "python-bidi"):
+                _validate_paddlex_ocr_core_metadata(resources)
+
+            prefixes = {
+                "opencv-contrib-python": "opencv_contrib_python",
+                "python-bidi": "python_bidi",
+            }
+            for distribution in PADDLEX_OCR_CORE_METADATA:
+                prefix = prefixes.get(distribution, distribution)
+                metadata = resources / f"{prefix}-1.0.dist-info" / "METADATA"
+                metadata.parent.mkdir()
+                metadata.write_text(
+                    f"Name: {distribution}\nVersion: 1.0\n", encoding="utf-8"
+                )
+            self.assertEqual(_validate_paddlex_ocr_core_metadata(resources), resources)
+
+            metadata = resources / "python_bidi-1.0.dist-info" / "METADATA"
+            metadata.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "python-bidi"):
+                _validate_paddlex_ocr_core_metadata(resources)
+
     def test_all_chardet_mypyc_runtime_extensions_are_required(self):
         with tempfile.TemporaryDirectory() as temporary:
             resources = Path(temporary)
@@ -29,8 +56,10 @@ class WindowsBundleSecurityTests(unittest.TestCase):
 
             for module in CHARDET_MYPYC_MODULES:
                 relative = Path(*module.split("."))
-                extension = chardet_root / relative.parent / (
-                    f"{relative.name}__mypyc.cp313-win_amd64.pyd"
+                extension = (
+                    chardet_root
+                    / relative.parent
+                    / (f"{relative.name}__mypyc.cp313-win_amd64.pyd")
                 )
                 extension.parent.mkdir(parents=True, exist_ok=True)
                 extension.write_bytes(b"test extension")
@@ -39,9 +68,7 @@ class WindowsBundleSecurityTests(unittest.TestCase):
             )
 
             (
-                chardet_root
-                / "pipeline"
-                / "orchestrator__mypyc.cp313-win_amd64.pyd"
+                chardet_root / "pipeline" / "orchestrator__mypyc.cp313-win_amd64.pyd"
             ).write_bytes(b"")
             with self.assertRaisesRegex(RuntimeError, "pipeline.orchestrator"):
                 _validate_chardet_runtime_extensions(resources)

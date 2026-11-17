@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -12,7 +13,6 @@ from pathlib import Path
 
 from prepare_ocr_models import _validate as validate_models
 from validate_ffmpeg import validate_ffmpeg
-
 
 CHARDET_MYPYC_MODULES = (
     "models._format",
@@ -29,6 +29,15 @@ CHARDET_MYPYC_MODULES = (
     "pipeline.utf1632",
     "pipeline.utf8",
     "pipeline.validity",
+)
+
+PADDLEX_OCR_CORE_METADATA = (
+    "imagesize",
+    "opencv-contrib-python",
+    "pyclipper",
+    "pypdfium2",
+    "python-bidi",
+    "shapely",
 )
 
 
@@ -434,6 +443,31 @@ def _validate_chardet_runtime_extensions(resources):
     return chardet_root
 
 
+def _validate_paddlex_ocr_core_metadata(resources):
+    resources = Path(resources)
+    discovered = {}
+    for dist in importlib.metadata.distributions(path=[os.fspath(resources)]):
+        name = dist.metadata.get("Name")
+        if name:
+            discovered.setdefault(name.casefold(), []).append(dist)
+    invalid = []
+    for distribution in PADDLEX_OCR_CORE_METADATA:
+        matches = discovered.get(distribution.casefold(), ())
+        if (
+            len(matches) != 1
+            or not matches[0].version
+            or not (Path(matches[0]._path) / "METADATA").is_file()
+            or (Path(matches[0]._path) / "METADATA").is_symlink()
+        ):
+            invalid.append(distribution)
+    if invalid:
+        raise RuntimeError(
+            "Frozen PaddleX OCR-core distribution metadata is missing, empty, "
+            "symlinked, or ambiguous: " + ", ".join(invalid)
+        )
+    return resources
+
+
 def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
     distribution = Path(distribution).resolve()
     executable = distribution / "PhoneController.exe"
@@ -446,6 +480,7 @@ def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
     validate_models(resources / "paddle_models")
     _validate_cython_runtime_data(resources)
     _validate_chardet_runtime_extensions(resources)
+    _validate_paddlex_ocr_core_metadata(resources)
     manifest_path = manifest_path or os.environ.get(
         "PHONE_CONTROLLER_PROTECTED_MANIFEST", ""
     )
