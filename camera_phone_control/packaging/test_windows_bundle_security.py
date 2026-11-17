@@ -11,12 +11,41 @@ PACKAGING = Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGING))
 
 from validate_windows_bundle import (  # noqa: E402
+    CHARDET_MYPYC_MODULES,
     _forbidden_bundle_inputs,
+    _validate_chardet_runtime_extensions,
     _validate_cython_runtime_data,
 )
 
 
 class WindowsBundleSecurityTests(unittest.TestCase):
+    def test_all_chardet_mypyc_runtime_extensions_are_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            resources = Path(temporary)
+            chardet_root = resources / "chardet"
+
+            with self.assertRaisesRegex(RuntimeError, "pipeline.orchestrator"):
+                _validate_chardet_runtime_extensions(resources)
+
+            for module in CHARDET_MYPYC_MODULES:
+                relative = Path(*module.split("."))
+                extension = chardet_root / relative.parent / (
+                    f"{relative.name}__mypyc.cp313-win_amd64.pyd"
+                )
+                extension.parent.mkdir(parents=True, exist_ok=True)
+                extension.write_bytes(b"test extension")
+            self.assertEqual(
+                _validate_chardet_runtime_extensions(resources), chardet_root
+            )
+
+            (
+                chardet_root
+                / "pipeline"
+                / "orchestrator__mypyc.cp313-win_amd64.pyd"
+            ).write_bytes(b"")
+            with self.assertRaisesRegex(RuntimeError, "pipeline.orchestrator"):
+                _validate_chardet_runtime_extensions(resources)
+
     def test_cython_runtime_utility_data_is_required_and_nonempty(self):
         with tempfile.TemporaryDirectory() as temporary:
             resources = Path(temporary)

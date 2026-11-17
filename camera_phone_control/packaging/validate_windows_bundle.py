@@ -14,6 +14,24 @@ from prepare_ocr_models import _validate as validate_models
 from validate_ffmpeg import validate_ffmpeg
 
 
+CHARDET_MYPYC_MODULES = (
+    "models._format",
+    "pipeline.ascii",
+    "pipeline.confusion",
+    "pipeline.escape",
+    "pipeline.language",
+    "pipeline.magic",
+    "pipeline.markup",
+    "pipeline.orchestrator",
+    "pipeline.postprocess",
+    "pipeline.statistical",
+    "pipeline.structural",
+    "pipeline.utf1632",
+    "pipeline.utf8",
+    "pipeline.validity",
+)
+
+
 def _validate_installer_definition():
     definition = (
         Path(__file__).with_name("PhoneController.iss").read_text(encoding="utf-8")
@@ -393,6 +411,29 @@ def _validate_cython_runtime_data(resources):
     return cpp_support
 
 
+def _validate_chardet_runtime_extensions(resources):
+    chardet_root = Path(resources) / "chardet"
+    invalid = []
+    for module in CHARDET_MYPYC_MODULES:
+        relative = Path(*module.split("."))
+        matches = tuple(
+            (chardet_root / relative.parent).glob(f"{relative.name}__mypyc*.pyd")
+        )
+        if (
+            len(matches) != 1
+            or not matches[0].is_file()
+            or matches[0].is_symlink()
+            or matches[0].stat().st_size == 0
+        ):
+            invalid.append(module)
+    if invalid:
+        raise RuntimeError(
+            "Frozen chardet mypyc runtime extensions are missing, empty, "
+            "symlinked, or ambiguous: " + ", ".join(invalid)
+        )
+    return chardet_root
+
+
 def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
     distribution = Path(distribution).resolve()
     executable = distribution / "PhoneController.exe"
@@ -404,6 +445,7 @@ def validate_bundle(distribution, *, manifest_path=None, run_smoke_test=True):
     validate_ffmpeg(resources / "tools" / "ffmpeg.exe")
     validate_models(resources / "paddle_models")
     _validate_cython_runtime_data(resources)
+    _validate_chardet_runtime_extensions(resources)
     manifest_path = manifest_path or os.environ.get(
         "PHONE_CONTROLLER_PROTECTED_MANIFEST", ""
     )

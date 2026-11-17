@@ -125,7 +125,7 @@ for model_name in model_names:
         raise SystemExit(f"Required offline OCR model is missing or incomplete: {model}")
     datas.append((str(model), f"paddle_models/{model_name}"))
 
-for package in ("paddle", "paddleocr", "paddlex", "cv2", "numpy"):
+for package in ("chardet", "paddle", "paddleocr", "paddlex", "cv2", "numpy"):
     package_datas, package_binaries, package_hidden = collect_all(package)
     datas += package_datas
     binaries += package_binaries

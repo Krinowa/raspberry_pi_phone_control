@@ -89,6 +89,7 @@ class PackagingReadinessTests(unittest.TestCase):
 
         for requirement in (
             "numpy==2.1.3",
+            "chardet==7.7.0",
             "opencv-contrib-python==4.10.0.84",
             "paddleocr==3.5.0",
             "paddlepaddle==3.3.0",
@@ -555,7 +556,13 @@ class PackagingReadinessTests(unittest.TestCase):
         self.assertIn("PYINSTALLER_CONFIG_DIR", build)
         self.assertIn('environment["CAMERA_OCR_LANGUAGE"] = "zh-HK"', validator)
         self.assertIn('collect_data_files("Cython", subdir="Utility")', spec)
+        self.assertIn(
+            '("chardet", "paddle", "paddleocr", "paddlex", "cv2", "numpy")',
+            spec,
+        )
         self.assertIn('"Cython" / "Utility" / "CppSupport.cpp"', validator)
+        self.assertIn("CHARDET_MYPYC_MODULES", validator)
+        self.assertIn("_validate_chardet_runtime_extensions(resources)", validator)
         launcher = (APP_ROOT / "windows_launcher.py").read_text(encoding="utf-8")
         self.assertIn('report["ocr_worker_status"]', launcher)
         self.assertIn('report["ocr_language_statuses"]', launcher)
