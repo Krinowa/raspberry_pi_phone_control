@@ -125,6 +125,36 @@ development retains PATH lookup. DirectShow alternative monikers remain the
 authoritative join to stable Windows PnP camera identities; packaging does not
 add an arbitrary numeric-index fallback.
 
+### Manual GitHub Actions test build
+
+The repository workflow `.github/workflows/build-windows.yml` is triggered only
+through **Actions → Build Windows test distribution → Run workflow**. It uses a
+GitHub-hosted `windows-2022` x64 runner and calls this same
+`packaging\build_windows.bat`; it does not maintain a second packaging path.
+
+Before running it, configure these repository Actions variables:
+
+- `PHONE_CONTROLLER_FFMPEG_URL` — a direct HTTPS URL for the reviewed,
+  self-contained Windows x64 FFmpeg binary. Redirects are rejected.
+- `PHONE_CONTROLLER_FFMPEG_SHA256` — the approved binary's 64-character SHA-256
+  digest.
+
+If the URL contains credentials or a time-limited token, configure both values
+as repository Actions secrets instead and do not also define conflicting
+variables. Do not store the executable itself in a secret. The workflow
+downloads to a temporary path, verifies SHA-256 before moving the file into
+`packaging\vendor\ffmpeg.exe`, and then runs `validate_ffmpeg.py` to verify the
+PE architecture, standalone execution and DirectShow support. Missing values,
+redirects, digest mismatch or binary validation failure stop the job before the
+application build.
+
+After all protected-build, frozen-application and focused regression checks
+pass, the workflow uploads
+`PhoneController-windows-x64-<commit-sha>.zip`. The ZIP contains the complete
+`dist\PhoneController` onedir directory plus `build-metadata.json`; its SHA-256
+sidecar is uploaded in the same Actions artifact. The workflow never publishes
+a GitHub Release or deploys the artifact.
+
 The embedded Paddle models and runtime selection are:
 
 | OCR language        | `CAMERA_OCR_LANGUAGE`           | Recognition model           |

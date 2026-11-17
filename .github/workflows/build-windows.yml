@@ -1,0 +1,192 @@
+name: Build Windows test distribution
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phone-controller-windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Windows x64 protected build
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: camera_phone_control
+    env:
+      APP_VERSION: ci-${{ github.run_number }}-${{ github.sha }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up CPython 3.13.13 x64
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.13.13"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: camera_phone_control/packaging/requirements-windows.txt
+
+      - name: Verify Python selected by the build script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -c "import struct,sys; assert sys.version_info[:3] == (3,13,13) and struct.calcsize('P') == 8; print(sys.executable)"
+          py -3.13 -c "import struct,sys; assert sys.version_info[:3] == (3,13,13) and struct.calcsize('P') == 8; print(sys.executable)"
+
+      - name: Verify MSVC x64 compiler toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "Visual Studio vswhere.exe is unavailable on this runner."
+          }
+          $installation = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1).Trim()
+          if (-not $installation) {
+            throw "MSVC x64 compiler tools are not installed on this runner."
+          }
+          $compiler = Get-ChildItem -LiteralPath "$installation\VC\Tools\MSVC" -Filter cl.exe -File -Recurse |
+            Where-Object { $_.FullName -match '[\\/]bin[\\/]Hostx64[\\/]x64[\\/]cl\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $compiler) {
+            throw "The MSVC Hostx64/x64 compiler could not be located."
+          }
+          Write-Host "MSVC x64 compiler found."
+
+      - name: Run focused frontend regressions
+        shell: pwsh
+        run: |
+          node --test `
+            tests/test_dashboard_modes.js `
+            tests/test_devices_ui.js `
+            tests/test_i18n.js `
+            tests/test_keyboard.js `
+            tests/test_workflow_ui.js
+
+      - name: Provision approved FFmpeg
+        shell: pwsh
+        env:
+          APPROVED_FFMPEG_URL: ${{ secrets.PHONE_CONTROLLER_FFMPEG_URL || vars.PHONE_CONTROLLER_FFMPEG_URL }}
+          APPROVED_FFMPEG_SHA256: ${{ secrets.PHONE_CONTROLLER_FFMPEG_SHA256 || vars.PHONE_CONTROLLER_FFMPEG_SHA256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:APPROVED_FFMPEG_URL)) {
+            throw "Approved FFmpeg URL is missing. Configure PHONE_CONTROLLER_FFMPEG_URL as a repository/environment variable, or as a secret when the URL is sensitive."
+          }
+          if ($env:APPROVED_FFMPEG_SHA256 -notmatch '^[A-Fa-f0-9]{64}$') {
+            throw "Approved FFmpeg SHA-256 is missing or invalid. Configure PHONE_CONTROLLER_FFMPEG_SHA256 as exactly 64 hexadecimal characters."
+          }
+          $uri = $null
+          if (-not [Uri]::TryCreate($env:APPROVED_FFMPEG_URL, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne "https") {
+            throw "Approved FFmpeg URL must be an absolute HTTPS URL."
+          }
+
+          $temporary = Join-Path $env:RUNNER_TEMP "phone-controller-approved-ffmpeg.exe"
+          try {
+            Invoke-WebRequest `
+              -Uri $uri `
+              -OutFile $temporary `
+              -MaximumRedirection 0 `
+              -TimeoutSec 120 `
+              -ErrorAction Stop
+          } catch {
+            throw "Approved FFmpeg download failed. Configure a direct HTTPS URL that does not redirect."
+          }
+          if (-not (Test-Path -LiteralPath $temporary -PathType Leaf)) {
+            throw "Approved FFmpeg download did not create a file."
+          }
+
+          $expected = $env:APPROVED_FFMPEG_SHA256.ToLowerInvariant()
+          $actual = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Approved FFmpeg SHA-256 verification failed. The downloaded file will not be used."
+          }
+
+          $destination = Join-Path $PWD "packaging\vendor\ffmpeg.exe"
+          Move-Item -LiteralPath $temporary -Destination $destination -Force
+          python packaging/validate_ffmpeg.py packaging/vendor/ffmpeg.exe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Approved FFmpeg failed the existing Windows x64/DirectShow validation."
+          }
+
+      - name: Build and validate protected Windows distribution
+        shell: cmd
+        run: call packaging\build_windows.bat
+
+      - name: Run focused backend and packaging regressions
+        shell: cmd
+        run: |
+          set "PYTHONPATH=%CD%;%CD%\tests"
+          .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_packaging_readiness
+          if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_camera_identity
+          if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_screen_keyboard
+          if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_transfer_method_config tests.test_transfer_method_switch tests.test_workflow_values tests.test_withdraw_dispatcher tests.test_withdraw_recovery_safety tests.test_if_text
+          if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_verify_text
+          if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_text_suggestions
+          if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_camera_ocr_worker tests.test_capture_screen
+          if errorlevel 1 exit /b 1
+
+      - name: Create complete onedir ZIP and build metadata
+        id: package
+        shell: pwsh
+        env:
+          APPROVED_FFMPEG_SHA256: ${{ secrets.PHONE_CONTROLLER_FFMPEG_SHA256 || vars.PHONE_CONTROLLER_FFMPEG_SHA256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $distribution = Join-Path $PWD "dist\PhoneController"
+          $executable = Join-Path $distribution "PhoneController.exe"
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "Validated PhoneController onedir distribution is missing."
+          }
+          $attestationPath = Join-Path $distribution "_internal\protected-attestation.json"
+          $attestation = Get-Content -LiteralPath $attestationPath -Raw | ConvertFrom-Json
+          $artifactDirectory = Join-Path $PWD "artifacts"
+          New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+          $metadataPath = Join-Path $artifactDirectory "build-metadata.json"
+          [ordered]@{
+            commit_sha = "${{ github.sha }}"
+            repository = "${{ github.repository }}"
+            workflow_run_id = "${{ github.run_id }}"
+            workflow_run_number = "${{ github.run_number }}"
+            runner = "windows-2022"
+            python = "3.13.13-x64"
+            app_version = $env:APP_VERSION
+            protected_build_id = $attestation.build_id
+            ffmpeg_sha256 = $env:APPROVED_FFMPEG_SHA256.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding utf8NoBOM
+
+          $zipPath = Join-Path $artifactDirectory "PhoneController-windows-x64-${{ github.sha }}.zip"
+          Compress-Archive -LiteralPath @($distribution, $metadataPath) -DestinationPath $zipPath -CompressionLevel Optimal
+          $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $hashPath = "$zipPath.sha256"
+          "$zipHash  $(Split-Path -Leaf $zipPath)" | Set-Content -LiteralPath $hashPath -Encoding ascii
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "hash_path=$hashPath" >> $env:GITHUB_OUTPUT
+          "### Windows build artifact`n`nCommit: ``${{ github.sha }}```n`nZIP SHA-256: ``$zipHash``" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload validated Windows onedir ZIP
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: PhoneController-windows-x64-${{ github.sha }}
+          path: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ steps.package.outputs.hash_path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
