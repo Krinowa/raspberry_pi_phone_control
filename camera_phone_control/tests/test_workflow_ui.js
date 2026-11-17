@@ -17,6 +17,12 @@ const styleSource = readFileSync(
   "utf8",
 );
 
+function extractFunctionSource(sourceText, pattern, trailingPattern) {
+  const match = sourceText.replace(/\r\n?/g, "\n").match(pattern);
+  assert.notEqual(match, null, `Expected function source to match ${pattern}`);
+  return match[0].replace(trailingPattern, "");
+}
+
 function setup(pi = false, options = {}) {
   const nodes = new Map(),
     calls = [],
@@ -1756,9 +1762,19 @@ test("Expect Current Screen adds a standalone wait and keeps recording active", 
 });
 
 test("Traditional Chinese expected-text suggestions are not keyboard noise", () => {
-  const functionSource = source.match(
-    /function isUsefulExpectedText\(text\) \{[\s\S]*?\n  \}\n\n  async function openExpectedText/,
-  )[0].replace(/\n\n  async function openExpectedText[\s\S]*$/, "");
+  const pattern =
+    /function isUsefulExpectedText\(text\) \{[\s\S]*?\r?\n  \}\r?\n\r?\n  async function openExpectedText/;
+  const trailingPattern =
+    /\r?\n\r?\n  async function openExpectedText[\s\S]*$/;
+  const functionSource = extractFunctionSource(source, pattern, trailingPattern);
+  assert.equal(
+    extractFunctionSource(
+      source.replace(/\r?\n/g, "\r\n"),
+      pattern,
+      trailingPattern,
+    ),
+    functionSource,
+  );
   const isUsefulExpectedText = vm.runInNewContext(`(${functionSource})`);
   for (const text of ["確認", "取消", "轉賬成功", "可用餘額", "收款人"])
     assert.equal(isUsefulExpectedText(text), true, text);
@@ -1840,9 +1856,18 @@ test("keyboard key generation preserves Numeric, Alphabetic digit option, and Cu
     ["keyboard-alphabetic-backspace", { checked: false }],
     ["keyboard-custom-keys", { value: "A,1,-" }],
   ]);
-  const functionSource = source.match(
-    /function keyboardCaptureKeys\(kind\) \{[\s\S]*?\n  \}\n\n  function canExpectText/,
-  )[0].replace(/\n\n  function canExpectText[\s\S]*$/, "");
+  const pattern =
+    /function keyboardCaptureKeys\(kind\) \{[\s\S]*?\r?\n  \}\r?\n\r?\n  function canExpectText/;
+  const trailingPattern = /\r?\n\r?\n  function canExpectText[\s\S]*$/;
+  const functionSource = extractFunctionSource(source, pattern, trailingPattern);
+  assert.equal(
+    extractFunctionSource(
+      source.replace(/\r?\n/g, "\r\n"),
+      pattern,
+      trailingPattern,
+    ),
+    functionSource,
+  );
   const keyboardCaptureKeys = vm.runInNewContext(`(${functionSource})`, {
     $: (id) => fields.get(id),
   });
