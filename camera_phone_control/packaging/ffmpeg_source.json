@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
   "release": "autobuild-2026-11-11-12-39 / n9.0.2-49-gc179411bbb",
-  "url": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-9.0.zip",
-  "sha256": "c18565c35e298f9856b6559634e2fbd0663cfcacb6f60958e7c9f63383e95313"
+  "url": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-11-12-39/ffmpeg-n9.0.2-49-gc179411bbb-win64-lgpl-9.0.zip",
+  "sha256": "9ccd65428fb0e60a0d574b76145df41f402b754edd2d06c2e24fa506fc1c2b02"
 }
