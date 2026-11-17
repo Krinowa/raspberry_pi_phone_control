@@ -141,10 +141,8 @@ Legacy playback accepts these keys through its existing keyboard transport.
 No transport names, URLs, request payloads, or camera coordinates enter steps.
 
 Pi recording has no UI hierarchy or secure-field detection. It records text sent
-through the manual controls as entered. For private input, use the phone directly
-and insert a manual checkpoint during review. Legacy input privacy checks remain
-unchanged. Playback uses its independently configured input backend, including
-Pi when `PHONE_INPUT_BACKEND=raspberry_pi`.
+through the manual controls as entered. Playback uses its independently configured
+input backend, including Pi when `PHONE_INPUT_BACKEND=raspberry_pi`.
 
 Review supports step names, fixed/variable/manual text, wait duration, deletion,
 and reordering. **Save Workflow** uses the bank name field; an empty name shows
@@ -158,21 +156,13 @@ node --test tests/test_keyboard.js tests/test_workflow_ui.js
 ### Input privacy and target previews
 
 Before capturing legacy Appium input, the recorder inspects the current UI
-through `context.screen.inspect()`. Password flags and security-related UI labels
-cause a manual checkpoint instead of a replayable tap/key/text action. Text also
-requires one focused, non-password editable field with a recognized ordinary
-label (such as search, customer name, reference or email). Unknown, unlabelled or
-custom fields fall back to a manual checkpoint. The typed value is discarded and
-is not sent, logged, shown in review or included in saved JSON. Complete that part
-directly on the phone and continue recording on the next screen. Multiple attempts
-on the same protected screen do not create a checkpoint for every keystroke.
+through `context.screen.inspect()`. A single focused editable field can be recorded,
+including fields marked as passwords or labeled as PIN, OTP or credentials.
+Unknown, unlabelled or custom fields still fall back to a manual checkpoint because
+the recorder cannot associate consecutive text with a stable target. The mock
+preview is a synthetic ordinary input surface and has no real field classification.
 
-This is conservative UI metadata classification, not a guarantee that every app
-marks secrets correctly. Keep PINs, OTPs and credentials on the physical phone;
-custom controls can lack reliable metadata. The mock preview is a synthetic
-ordinary input surface and has no real field classification.
-
-When a non-sensitive tap has a usable UI hierarchy, the recorder optionally takes
+When a tap has a usable UI hierarchy, the recorder optionally takes
 a pre-action screenshot through the screen provider. All recognized editable
 regions are masked before a 96×96 PNG target crop is saved with the step. Secure
 or unknown screens are skipped, as are unavailable captures. The review timeline
@@ -354,27 +344,21 @@ the present validator rejects unsupported visual selectors instead of silently
 executing fallback coordinates. No vision, branches, loops, generated variables
 or external webhooks are implemented.
 
-## Sensitive input and financial boundaries
+## Input and financial boundaries
 
-Non-sensitive input steps are captured automatically during recording and reviewed before saving. Variables marked
-`sensitive: true`, or named/labeled as PIN, OTP, password, passcode, secret,
-biometric or approval code, are rejected; manually supplied sensitive fixed steps
-are also rejected when marked sensitive. Ordinary browser keystrokes outside recording are never retained; active recording
-only captures preview-directed input classified as non-sensitive. Authentication and approval values belong in manual checkpoints and
-must be entered directly by the operator, not saved in fixed values/defaults.
-No runtime input values are added to logs or status responses; execution values
-are cleared from the service's runtime copy after completion.
+Input steps and variables may use sensitive names or the legacy `sensitive: true`
+annotation without requiring a manual checkpoint. Recorded fixed values and variable
+defaults remain part of workflow JSON by design. No runtime input values are added
+to logs or status responses; execution values are cleared from the service's runtime
+copy after completion.
 
 For a financial preparation flow, set `financial: true` (the recorder checkbox).
 Validation requires its **last** step to be a manual checkpoint. The engine does
 not supply a transfer/cash-out final-confirm action. Humans must complete final
 authorization on the phone at that checkpoint, then resume only to finish the run.
 
-Coordinate taps and arbitrary strings have no app semantics. The engine cannot
-recognize that a screen coordinate is a banking confirmation, or that an innocuous
-variable name contains a secret. Flow authors must mark those boundaries and omit
-such taps/values; keyword checks are not a security classifier. Camera viewing
-may show what is on the phone, as before, but frames are not saved by the recorder.
+Coordinate taps and arbitrary strings have no app semantics. Camera viewing may
+show what is on the phone, as before, but frames are not saved by the recorder.
 
 ## Local API
 

@@ -199,7 +199,7 @@ def validate_keyboard_map(keyboard_id, keyboard):
     name = text(keyboard["name"], "Keyboard name", 160).strip()
     if not name:
         raise ValueError("Keyboard name is required.")
-    if SENSITIVE.search(name) or PROTECTED_SCREEN_INPUT.search(name):
+    if PROTECTED_SCREEN_INPUT.search(name):
         raise ValueError("Protected or randomized keyboards must remain manual.")
     kind = keyboard["kind"]
     if not isinstance(kind, str) or kind not in KEYBOARD_KINDS:
@@ -303,10 +303,8 @@ def validate_workflow(workflow, *, allow_empty=False):
             raise ValueError("Duplicate variable name.")
         names.add(name)
 
-        if definition.get("sensitive", False) is not False or SENSITIVE.search(
-            name + " " + definition["label"]
-        ):
-            raise ValueError("Sensitive input must use a manual checkpoint.")
+        if type(definition.get("sensitive", False)) is not bool:
+            raise ValueError("Variable sensitive flag must be a boolean.")
         if (
             not isinstance(definition["type"], str)
             or definition["type"] not in VARIABLE_TYPES
@@ -608,8 +606,8 @@ def validate_workflow(workflow, *, allow_empty=False):
             text(step.get("message"), "Checkpoint message", 500)
         elif kind == "input":
             source = step.get("source")
-            if step.get("sensitive", False) is not False:
-                raise ValueError("Sensitive input must use a manual checkpoint.")
+            if type(step.get("sensitive", False)) is not bool:
+                raise ValueError("Input sensitive flag must be a boolean.")
             if source == "fixed":
                 text(step.get("value"))
                 if "variable" in step or "message" in step:
@@ -669,9 +667,7 @@ def validate_workflow(workflow, *, allow_empty=False):
                         ),
                     )
                 )
-                if SENSITIVE.search(protected) or PROTECTED_SCREEN_INPUT.search(
-                    protected
-                ):
+                if PROTECTED_SCREEN_INPUT.search(protected):
                     raise ValueError("Protected input must use a manual checkpoint.")
             else:
                 raise ValueError("Input method must be hid or screen_keyboard.")

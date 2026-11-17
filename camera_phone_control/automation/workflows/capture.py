@@ -1,7 +1,4 @@
-"""Conservative UI hints for recording; no device-specific data enters actions.
-
-Unknown/secure input is left to the operator. UI labels are hints, not selectors.
-"""
+"""Conservative UI hints for recording; no device-specific data enters actions."""
 
 import cv2
 import base64
@@ -71,9 +68,9 @@ def inspect_target(context, step):
             node.get(key, "") for key in ("resource-id", "content-desc", "hint")
         )
         result["safe_input"] = (
-            not result["secure"]
-            and node.get("password") == "false"
-            and bool(SAFE_FIELD.search(labels))
+            node.get("password") == "true"
+            or bool(SENSITIVE.search(labels))
+            or bool(SAFE_FIELD.search(labels))
         )
         result["target"] = (node.get("resource-id"), node.get("bounds"))
         # Hints are stable field names; editable content-desc can contain its value.

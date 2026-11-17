@@ -505,7 +505,7 @@ class RecorderSuggestionTests(unittest.TestCase):
         )
         snapshot = recorder.commit_recording("owner", checkpoint)
         self.assertFalse(snapshot["expected_text_pending"])
-        with self.assertRaisesRegex(ValueError, "secure or manual checkpoint"):
+        with self.assertRaisesRegex(ValueError, "manual checkpoint"):
             recorder.begin_current_screen_annotation("owner")
 
     def test_review_insert_change_remove_and_standalone(self):
@@ -538,18 +538,30 @@ class RecorderSuggestionTests(unittest.TestCase):
         r.review('owner', 'fields', dict(step_id=unrelated['id'], fields=dict(text='Edited standalone')))
         self.assertEqual(r.workflow['steps'][-1]['text'], 'Edited standalone')
 
-    def test_sensitive_steps_reject_shortcut(self):
+    def test_non_navigation_and_authorization_steps_reject_shortcut(self):
         for step in [dict(type='manual_checkpoint', message='Authorize payment manually'),
                      dict(type='input', source='fixed', value='hello'),
                      dict(type='key', key='ENTER'),
-                     dict(type='tap', x=.5, y=.5, label='Confirm payment'),
-                     dict(type='tap', x=.5, y=.5, label='Password')]:
+                     dict(type='tap', x=.5, y=.5, label='Confirm payment')]:
             r = Recorder()
             r.start('owner', 'Review')
             r.workflow = r.prepare('owner', step)
             r.stop('owner')
             with self.assertRaises(ValueError):
                 r.review('owner', 'expected_text', dict(step_id=r.workflow['steps'][0]['id'], text='Ready'))
+
+    def test_sensitive_navigation_label_allows_expected_text(self):
+        recorder = Recorder()
+        recorder.start("owner", "Review")
+        recorder.workflow = recorder.prepare(
+            "owner", {"type": "tap", "x": 0.5, "y": 0.5, "label": "Password"}
+        )
+        recorder.stop("owner")
+        step_id = recorder.workflow["steps"][0]["id"]
+        result = recorder.review(
+            "owner", "expected_text", {"step_id": step_id, "text": "Ready"}
+        )
+        self.assertEqual(result["workflow"]["steps"][1]["type"], "wait_for_text")
 
 
 class EndpointTests(unittest.TestCase):

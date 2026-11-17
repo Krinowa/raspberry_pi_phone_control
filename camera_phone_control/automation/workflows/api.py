@@ -1243,16 +1243,14 @@ def register_workflows(
                             )
 
                             if (
-                                target["secure"]
-                                or not target["known"]
+                                not target["known"]
                                 or (typing and not target["safe_input"])
                             ):
                                 step = {
                                     "type": ("manual_checkpoint"),
-                                    "label": ("Secure input"),
+                                    "label": ("Unrecognized input"),
                                     "message": (
-                                        "Complete secure or "
-                                        "unrecognized input "
+                                        "Complete unrecognized input "
                                         "manually on the phone."
                                     ),
                                 }
@@ -1260,11 +1258,9 @@ def register_workflows(
                                 execute = False
 
                                 notice = (
-                                    "Complete this part "
-                                    "directly on the phone. "
-                                    "A manual checkpoint "
-                                    "was recorded; no input "
-                                    "value was saved."
+                                    "Complete this unrecognized input "
+                                    "directly on the phone. A manual checkpoint "
+                                    "was recorded; no input value was saved."
                                 )
 
                             else:

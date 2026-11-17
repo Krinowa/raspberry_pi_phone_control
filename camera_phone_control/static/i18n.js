@@ -1120,8 +1120,6 @@
     "Recorded value": "已錄製數值",
     "Run Flow": "執行流程",
     Screenshot: "螢幕截圖",
-    "Secure input belongs on the phone. Avoid typing sensitive values while recording.":
-      "敏感資料應在手機上安全輸入；錄製期間請避免輸入敏感資料。",
     "Select issue": "選擇問題",
     "Select on Current Screen": "在目前畫面上選取",
     "Select on the calibrated current screen snapshot; refresh after the phone screen changes.":

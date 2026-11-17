@@ -366,13 +366,38 @@ class ScreenKeyboardPlaybackTests(unittest.TestCase):
             ctx.input.type_text.assert_called_once_with("12")
             ctx.input.tap.assert_not_called()
 
+    def test_sensitive_metadata_uses_normal_hid_workflow_execution(self):
+        workflow = new_workflow("Credential input")
+        workflow["variables"] = [
+            {
+                "name": "password",
+                "label": "Password",
+                "type": "text",
+                "required": True,
+                "default": None,
+                "sensitive": True,
+            }
+        ]
+        workflow["steps"] = [
+            {
+                "id": "credential_input",
+                "type": "input",
+                "source": "variable",
+                "variable": "password",
+                "sensitive": True,
+            }
+        ]
+        ctx = FakeContext()
+
+        WorkflowRunner(ctx).run(workflow, {"password": "AbC123"})
+
+        ctx.input.type_text.assert_called_once_with("AbC123")
+        ctx.input.tap.assert_not_called()
+
     def test_malformed_and_protected_keyboard_data_is_rejected(self):
         for mutate in (
             lambda flow: flow["keyboards"]["keyboard_numeric"]["keys"]["1"].update(
                 x=1.1
-            ),
-            lambda flow: flow["keyboards"]["keyboard_numeric"].update(
-                name="PIN keypad"
             ),
             lambda flow: flow["keyboards"]["keyboard_numeric"].update(keys={}),
             lambda flow: flow["keyboards"]["keyboard_numeric"].update(
@@ -384,6 +409,15 @@ class ScreenKeyboardPlaybackTests(unittest.TestCase):
             mutate(workflow)
             with self.subTest(workflow=workflow), self.assertRaises(ValueError):
                 validate_workflow(workflow)
+
+    def test_sensitive_keyboard_names_and_input_labels_are_supported(self):
+        workflow = screen_keyboard_flow("1")
+        workflow["keyboards"]["keyboard_numeric"]["name"] = "PIN keypad"
+        workflow["steps"][0]["label"] = "Enter OTP"
+        validated = validate_workflow(workflow)
+        self.assertEqual(
+            validated["keyboards"]["keyboard_numeric"]["name"], "PIN keypad"
+        )
 
     def test_custom_map_rejects_empty_control_and_oversized_labels(self):
         for label in ("", "   ", "line\nfeed", "control\x01", "x" * 33):

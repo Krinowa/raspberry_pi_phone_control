@@ -552,8 +552,8 @@ character/fixed keyevent limits. Use fixed diagnostic labels and never log typed
 values or credentials in custom scripts.
 
 Triggers, runner, and controller remain separate. The local workflow execution API
-is documented in [WORKFLOWS.md](WORKFLOWS.md). Authentication and final financial
-authorization belong in manual checkpoints. Pi workflow input is available with
+is documented in [WORKFLOWS.md](WORKFLOWS.md). Final financial authorization for
+financial workflows remains a manual checkpoint. Pi workflow input is available with
 `PHONE_INPUT_BACKEND=raspberry_pi`; screen handling remains separately configured.
 See [Pi workflow playback](WORKFLOWS.md#pi-workflow-playback). External/public
 webhooks, scheduling, ESP32 input and visual automation are not implemented.
@@ -616,7 +616,7 @@ adb -s SERIAL shell input swipe X Y1 X Y2 300
 - OpenCV captures/encodes the external camera feed. Workflow recording stores
   actions, not camera video. On-demand screen capture is available through
   `context.screen.capture()` as PNG bytes; no screenshots are saved automatically.
-  Use manual checkpoints for authentication and final financial authorization.
+  Financial workflows retain their final manual authorization checkpoint.
   Coordinate taps cannot determine an app action's meaning.
 
 ### Developer tools configuration

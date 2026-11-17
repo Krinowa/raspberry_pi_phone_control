@@ -9,7 +9,6 @@ from .models import new_workflow, now
 from ..coordinates import unit
 from .validation import (
     PROTECTED_SCREEN_INPUT,
-    SENSITIVE,
     normalize_capture_keyboard_labels,
     validate_keyboard_map,
     validate_workflow,
@@ -148,11 +147,10 @@ class Recorder:
         previous = recording_steps[-1] if recording_steps else None
         if previous and (
             previous["type"] == "manual_checkpoint"
-            or SENSITIVE.search(previous.get("label") or "")
             or PROTECTED_SCREEN_INPUT.search(previous.get("label") or "")
         ):
             raise ValueError(
-                "Keyboard capture is unavailable after a secure or manual checkpoint."
+                "Keyboard capture is unavailable after a protected or manual checkpoint."
             )
         keys = normalize_capture_keyboard_labels(kind, keys)
         existing_names = {
@@ -376,7 +374,7 @@ class Recorder:
         if (
             previous
             and step["type"] == "manual_checkpoint"
-            and previous.get("label") == "Secure input"
+            and previous.get("label") in {"Secure input", "Unrecognized input"}
         ):
             self._recording_steps(candidate).pop()
         check = deepcopy(candidate)
@@ -393,12 +391,12 @@ class Recorder:
             step["type"] == "key" and step.get("key", "").upper() in {"HOME", "BACK"}
         )
         label = step.get("label") or ""
-        sensitive = SENSITIVE.search(label) or re.search(
+        protected = re.search(
             r"authoriz|authoris|confirm.*(?:pay|transfer)|final.*(?:pay|transfer)",
             label,
             re.I,
         )
-        if not navigation or sensitive:
+        if not navigation or protected:
             raise ValueError("Expected text requires a navigation action.")
         return step
 
@@ -424,12 +422,9 @@ class Recorder:
         current_steps = self._recording_steps()
         previous = current_steps[-1] if current_steps else None
 
-        if previous and (
-            previous["type"] == "manual_checkpoint"
-            or SENSITIVE.search(previous.get("label") or "")
-        ):
+        if previous and previous["type"] == "manual_checkpoint":
             raise ValueError(
-                "Expected text is unavailable after a secure or manual checkpoint."
+                "Expected text is unavailable after a manual checkpoint."
             )
 
         self.pending_expected_text = "current"
@@ -781,15 +776,9 @@ class Recorder:
                 label = data.get("label")
                 if (
                     isinstance(label, str)
-                    and (
-                        SENSITIVE.search(label)
-                        or (
-                            old["type"] == "input"
-                            and old.get("input_method") == "screen_keyboard"
-                            and PROTECTED_SCREEN_INPUT.search(label)
-                        )
-                    )
-                    and old["type"] != "manual_checkpoint"
+                    and old["type"] == "input"
+                    and old.get("input_method") == "screen_keyboard"
+                    and PROTECTED_SCREEN_INPUT.search(label)
                 ):
                     siblings[index] = {
                         "id": old["id"],
@@ -916,41 +905,25 @@ class Recorder:
                     if existing is not None:
                         variable = {**existing, **variable}
 
-                    sensitive_label = (
-                        str(variable.get("name", ""))
-                        + " "
-                        + str(variable.get("label", ""))
-                    )
-
-                    if variable.get(
-                        "sensitive", False
-                    ) is not False or SENSITIVE.search(sensitive_label):
-                        siblings[index] = {
-                            "id": old["id"],
-                            "type": "manual_checkpoint",
-                            "label": "Secure input",
-                            "message": "Complete secure authentication manually.",
-                        }
+                    if existing is not None:
+                        existing.clear()
+                        existing.update(variable)
                     else:
-                        if existing is not None:
-                            existing.clear()
-                            existing.update(variable)
-                        else:
-                            candidate["variables"].append(variable)
-                        # Remove the captured value and preview on conversion.
-                        siblings[index] = {
-                            "id": old["id"],
-                            "type": "input",
-                            "source": "variable",
-                            "variable": variable.get("name"),
-                            "label": old.get("label", ""),
-                            **(
-                                {"amount_format": data.get("amount_format", "raw")}
-                                if variable.get("name") == "amount"
-                                else {}
-                            ),
-                            **method_fields,
-                        }
+                        candidate["variables"].append(variable)
+                    # Remove the captured value and preview on conversion.
+                    siblings[index] = {
+                        "id": old["id"],
+                        "type": "input",
+                        "source": "variable",
+                        "variable": variable.get("name"),
+                        "label": old.get("label", ""),
+                        **(
+                            {"amount_format": data.get("amount_format", "raw")}
+                            if variable.get("name") == "amount"
+                            else {}
+                        ),
+                        **method_fields,
+                    }
                 else:
                     raise ValueError("Choose fixed, variable or manual input.")
             else:

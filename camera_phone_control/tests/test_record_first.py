@@ -152,11 +152,18 @@ class RecordFirstTests(unittest.TestCase):
         self.assertEqual(len(result["workflow"]["steps"]), 1)
         self.controller.send_key.assert_called_with(DEVICE, "key", "backspace")
 
-    def test_secure_unknown_and_unlabelled_fields_become_manual_without_input_or_values(
-        self,
-    ):
+    def test_secure_field_input_is_recorded_and_sent_normally(self):
+        self.controller.dump_ui.return_value = SECURE
+        result = self.capture(
+            {"type": "input", "source": "fixed", "value": "record-this"}
+        )
+        step = result["workflow"]["steps"][0]
+        self.assertEqual(step["type"], "input")
+        self.assertEqual(step["value"], "record-this")
+        self.assertEqual(self.controller.send_key.call_count, len("record-this"))
+
+    def test_unknown_and_unlabelled_fields_remain_manual_without_input_or_values(self):
         for xml in [
-            SECURE,
             "<hierarchy/>",
             "bad xml",
             NORMAL.replace("customer_name", "field").replace("Customer Name", "Field"),
@@ -173,11 +180,14 @@ class RecordFirstTests(unittest.TestCase):
         self.controller.send_key.assert_not_called()
         self.controller.screenshot.assert_not_called()
 
-    def test_secure_keypad_taps_not_recorded_as_replayable_coordinates(self):
+    def test_secure_screen_tap_is_recorded_without_a_preview(self):
         self.controller.dump_ui.return_value = SECURE
         result = self.capture({"type": "tap", "x": 0.5, "y": 0.8})
-        self.assertEqual(result["workflow"]["steps"][0]["type"], "manual_checkpoint")
-        self.controller.send.assert_not_called()
+        step = result["workflow"]["steps"][0]
+        self.assertEqual(step["type"], "tap")
+        self.assertEqual((step["x"], step["y"]), (0.5, 0.8))
+        self.assertNotIn("preview", step)
+        self.controller.send.assert_called_once()
         self.controller.screenshot.assert_not_called()
 
     def test_input_target_change_prevents_coalescing(self):
@@ -210,7 +220,7 @@ class RecordFirstTests(unittest.TestCase):
         )
         validate_workflow(result["workflow"])
 
-    def test_sensitive_rename_purges_recorded_value(self):
+    def test_sensitive_rename_preserves_recorded_input(self):
         step = self.capture(
             {"type": "input", "source": "fixed", "value": "hidden-value"}
         )["workflow"]["steps"][0]
@@ -218,8 +228,37 @@ class RecordFirstTests(unittest.TestCase):
         result = self.review(
             operation="rename_step", step_id=step["id"], label="Banking password"
         )
-        self.assertNotIn("hidden-value", json.dumps(result))
-        self.assertEqual(result["workflow"]["steps"][0]["type"], "manual_checkpoint")
+        renamed = result["workflow"]["steps"][0]
+        self.assertEqual(renamed["type"], "input")
+        self.assertEqual(renamed["label"], "Banking password")
+        self.assertEqual(renamed["value"], "hidden-value")
+
+    def test_sensitive_variable_and_input_flags_remain_json_compatible(self):
+        step = self.capture(
+            {"type": "input", "source": "fixed", "value": "123456"}
+        )["workflow"]["steps"][0]
+        self.post("/api/recorder/stop", {})
+        variable = {
+            "name": "otp",
+            "label": "OTP",
+            "type": "text",
+            "required": True,
+            "default": None,
+            "sensitive": True,
+            "ask_when_running": True,
+        }
+        result = self.review(
+            operation="input",
+            step_id=step["id"],
+            source="variable",
+            variable=variable,
+        )
+        self.assertEqual(result["workflow"]["variables"], [variable])
+        converted = result["workflow"]["steps"][0]
+        self.assertEqual(converted["type"], "input")
+        self.assertEqual(converted["variable"], "otp")
+        converted["sensitive"] = True
+        validate_workflow(result["workflow"])
 
     def test_thumbnail_masks_editable_field_and_skips_secure_screen(self):
         import cv2
