@@ -1609,6 +1609,7 @@
     "No text read": "未讀取到文字",
     SPACE: "空格鍵",
     BACKSPACE: "退格鍵",
+    SHIFT: "大寫切換鍵",
     "Implied cents": "隱含仙位",
     "Whole amount only": "只輸入整數金額",
     "Loading recent logs…": "正在載入近期記錄…",

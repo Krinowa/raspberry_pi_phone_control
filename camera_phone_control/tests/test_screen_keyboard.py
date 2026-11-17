@@ -20,6 +20,7 @@ from automation.workflows.storage import WorkflowStorage
 from automation.workflows.validation import validate_workflow
 from device_lock import DeviceLocks
 from hardware.pi_api_client import PiApiClient
+from hardware.raspberry_pi_input import RaspberryPiInputBridge
 from test_control import CORNERS, FakeCamera, authenticate_admin
 
 DEVICE = Device("usb-test", 1080, 1920, 0)
@@ -220,12 +221,54 @@ class ScreenKeyboardPlaybackTests(unittest.TestCase):
     def test_alphabetic_uppercase_fails_before_first_tap_without_shift(self):
         ctx = FakeContext()
         with self.assertRaisesRegex(
-            UnsupportedOperation, "no Shift/caps support.*'H'.*No input sent"
+            UnsupportedOperation, "no captured Shift/case-toggle key.*'H'.*No input sent"
         ):
             WorkflowRunner(ctx).run(
                 mapped_flow("alphabetic", {"h": {"x": 0.1, "y": 0.2}}, "Hello")
             )
         ctx.input.tap.assert_not_called()
+
+    def test_alphabetic_case_toggle_taps_preserve_mixed_case_order(self):
+        keys = {
+            "a": {"x": 0.1, "y": 0.7},
+            "b": {"x": 0.2, "y": 0.7},
+            "c": {"x": 0.3, "y": 0.7},
+            "d": {"x": 0.4, "y": 0.7},
+            "shift": {"x": 0.05, "y": 0.8},
+        }
+        for value in ("abc", "Abc", "abC", "AbC", "ABC", "aBcD"):
+            with self.subTest(value=value):
+                labels = []
+                for character in value:
+                    if "A" <= character <= "Z":
+                        labels.extend(("shift", character.lower()))
+                    else:
+                        labels.append(character)
+                ctx = FakeContext()
+                WorkflowRunner(ctx).run(mapped_flow("alphabetic", keys, value))
+                self.assertEqual(
+                    ctx.input.tap.call_args_list,
+                    [call(keys[label]["x"], keys[label]["y"]) for label in labels],
+                )
+
+    def test_alphabetic_case_toggle_replay_uses_pi_tap_api(self):
+        pi = Mock(spec=PiApiClient)
+        pi.base_url = "http://pi.test:8766"
+        ctx = FakeContext()
+        ctx.input = RaspberryPiInputBridge(pi)
+        keys = {
+            "a": {"x": 0.1, "y": 0.7},
+            "b": {"x": 0.2, "y": 0.7},
+            "shift": {"x": 0.05, "y": 0.8},
+        }
+
+        WorkflowRunner(ctx).run(mapped_flow("alphabetic", keys, "Ab"))
+
+        self.assertEqual(
+            pi.tap.call_args_list,
+            [call(0.05, 0.8), call(0.1, 0.7), call(0.2, 0.7)],
+        )
+        pi.type_text.assert_not_called()
 
     def test_alphabetic_mapping_with_digits_types_mixed_values(self):
         labels = set("abcuser120236")
@@ -603,18 +646,19 @@ class ScreenKeyboardCaptureTests(unittest.TestCase):
             {
                 "name": "App keyboard",
                 "kind": "alphabetic",
-                "keys": ["a", "b", "1", " ", "BACKSPACE"],
+                "keys": ["a", "b", "1", " ", "BACKSPACE", "SHIFT"],
             },
         )
         self.assertEqual(
             started["keyboard_capture"]["requested_keys"],
-            ["a", "b", "1", " ", "backspace"],
+            ["a", "b", "1", " ", "backspace", "shift"],
         )
         points = {
             "b": [0.2, 0.3],
             "1": [0.3, 0.3],
             " ": [0.5, 0.9],
             "backspace": [0.9, 0.8],
+            "shift": [0.05, 0.8],
         }
         self.post(
             "/api/recorder/keyboard-capture/key",
@@ -632,6 +676,7 @@ class ScreenKeyboardCaptureTests(unittest.TestCase):
         self.assertAlmostEqual(captured["keys"]["a"]["y"], 0.2)
         self.assertEqual(captured["keys"][" "], {"x": 0.5, "y": 0.9})
         self.assertEqual(captured["keys"]["backspace"], {"x": 0.9, "y": 0.8})
+        self.assertEqual(captured["keys"]["shift"], {"x": 0.05, "y": 0.8})
         self.assertTrue(result["active"])
         self.controller.send.assert_not_called()
         self.controller.send_key.assert_not_called()

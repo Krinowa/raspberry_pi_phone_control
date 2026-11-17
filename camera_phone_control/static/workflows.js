@@ -346,6 +346,7 @@
   function displayKeyboardKey(key) {
     if (key === " ") return workflowLiteral("SPACE");
     if (key.toLowerCase() === "backspace") return workflowLiteral("BACKSPACE");
+    if (key.toLowerCase() === "shift") return workflowLiteral("SHIFT");
     return key;
   }
 
@@ -371,6 +372,7 @@
         keys.push(...Array.from("0123456789"));
       if ($("keyboard-include-space").checked) keys.push(" ");
       if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
+      if ($("keyboard-alphabetic-shift").checked) keys.push("shift");
 
       return keys;
     }

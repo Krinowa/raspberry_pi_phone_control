@@ -57,21 +57,33 @@ def format_input_value(step, value):
 
 def screen_keyboard_points(keyboard, value):
     """Validate a complete value before returning any physical tap targets."""
+    key_labels = []
     if keyboard["kind"] == "alphabetic":
-        uppercase = sorted({character for character in value if character.isupper()})
-        if uppercase:
+        uppercase = sorted(
+            {character for character in value if "A" <= character <= "Z"}
+        )
+        if uppercase and "shift" not in keyboard["keys"]:
             labels = ", ".join(repr(character) for character in uppercase)
             raise UnsupportedOperation(
-                "Alphabetic captured keyboard has no Shift/caps support for "
+                "Alphabetic captured keyboard has no captured "
+                "Shift/case-toggle key for "
                 f"uppercase: {labels}. No input sent."
             )
-    missing = sorted(set(value) - set(keyboard["keys"]))
+        for character in value:
+            if "A" <= character <= "Z":
+                # Android Shift is a calibrated screen tap, not an HID modifier.
+                key_labels.extend(("shift", character.lower()))
+            else:
+                key_labels.append(character)
+    else:
+        key_labels = list(value)
+    missing = sorted(set(key_labels) - set(keyboard["keys"]))
     if missing:
         labels = ", ".join(repr(character) for character in missing)
         raise UnsupportedOperation(
             f"Captured keyboard does not support: {labels}. No input sent."
         )
-    return [keyboard["keys"][character] for character in value]
+    return [keyboard["keys"][label] for label in key_labels]
 
 
 def type_with_screen_keyboard(input_bridge, wait, keyboard, value):

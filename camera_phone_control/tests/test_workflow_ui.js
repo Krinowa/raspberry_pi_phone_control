@@ -1825,7 +1825,7 @@ test("keyboard capture cancel keeps the active workflow unchanged", async () => 
   assert.equal(ui.$("record-live").hidden, false);
 });
 
-test("alphabetic capture UI requests lowercase letters with optional space and backspace", async () => {
+test("alphabetic capture UI requests optional space, backspace, and case toggle", async () => {
   const ui = setup();
   await start(ui);
   await ui.fire("record-capture-keyboard", "click");
@@ -1834,14 +1834,15 @@ test("alphabetic capture UI requests lowercase letters with optional space and b
   await ui.fire("keyboard-capture-kind", "change");
   ui.$("keyboard-include-space").checked = true;
   ui.$("keyboard-alphabetic-backspace").checked = true;
+  ui.$("keyboard-alphabetic-shift").checked = true;
   await ui.fire("keyboard-capture-start", "click");
   const request = ui.calls.find(
     (entry) => entry.url === "/api/recorder/keyboard-capture/start",
   );
   assert.equal(request.data.kind, "alphabetic");
   assert.deepEqual(request.data.keys.slice(0, 3), ["q", "w", "e"]);
-  assert.deepEqual(request.data.keys.slice(-2), [" ", "backspace"]);
-  assert.equal(new Set(request.data.keys).size, 28);
+  assert.deepEqual(request.data.keys.slice(-3), [" ", "backspace", "shift"]);
+  assert.equal(new Set(request.data.keys).size, 29);
   assert.equal(ui.$("keyboard-alphabetic-options").hidden, false);
   assert.equal(ui.$("keyboard-numeric-options").hidden, true);
   assert.equal(ui.context.window.phoneRecorder.blocksInput(), true);
@@ -1854,6 +1855,7 @@ test("keyboard key generation preserves Numeric, Alphabetic digit option, and Cu
     ["keyboard-alphabetic-include-digits", { checked: false }],
     ["keyboard-include-space", { checked: false }],
     ["keyboard-alphabetic-backspace", { checked: false }],
+    ["keyboard-alphabetic-shift", { checked: false }],
     ["keyboard-custom-keys", { value: "A,1,-" }],
   ]);
   const pattern =
@@ -1877,6 +1879,9 @@ test("keyboard key generation preserves Numeric, Alphabetic digit option, and Cu
     Array.from(keyboardCaptureKeys("alphabetic")),
     Array.from("qwertyuiopasdfghjklzxcvbnm"),
   );
+  fields.get("keyboard-alphabetic-shift").checked = true;
+  assert.equal(keyboardCaptureKeys("alphabetic").at(-1), "shift");
+  fields.get("keyboard-alphabetic-shift").checked = false;
   fields.get("keyboard-alphabetic-include-digits").checked = true;
   assert.deepEqual(
     Array.from(keyboardCaptureKeys("alphabetic").slice(-10)),
@@ -1887,6 +1892,10 @@ test("keyboard key generation preserves Numeric, Alphabetic digit option, and Cu
     /id="keyboard-alphabetic-include-digits"[\s\S]*?type="checkbox"/.test(
       templateSource,
     ),
+    true,
+  );
+  assert.equal(
+    /id="keyboard-alphabetic-shift"[\s\S]*?type="checkbox"/.test(templateSource),
     true,
   );
 });
