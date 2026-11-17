@@ -73,11 +73,20 @@ jobs:
             tests/test_keyboard.js `
             tests/test_workflow_ui.js
 
+      - name: Report pinned FFmpeg source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "Git commit SHA: $env:GITHUB_SHA"
+          python packaging/download_ffmpeg.py `
+            packaging/ffmpeg_source.json `
+            --show-effective-source
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned FFmpeg configuration validation failed."
+          }
+
       - name: Provision approved FFmpeg
         shell: pwsh
-        env:
-          PHONE_CONTROLLER_FFMPEG_URL: ${{ secrets.PHONE_CONTROLLER_FFMPEG_URL || vars.PHONE_CONTROLLER_FFMPEG_URL }}
-          PHONE_CONTROLLER_FFMPEG_SHA256: ${{ secrets.PHONE_CONTROLLER_FFMPEG_SHA256 || vars.PHONE_CONTROLLER_FFMPEG_SHA256 }}
         run: |
           $ErrorActionPreference = "Stop"
           $nonce = [IO.Path]::GetRandomFileName()

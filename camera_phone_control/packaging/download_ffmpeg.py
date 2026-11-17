@@ -40,17 +40,20 @@ def _validated_url(value, *, initial=False):
         port = parsed.port
     except ValueError as exc:
         raise FFmpegDownloadError("Approved FFmpeg URL has an invalid port.") from exc
-    if (
-        parsed.scheme.lower() != "https"
-        or parsed.username is not None
-        or parsed.password is not None
-        or hostname not in ALLOWED_HOSTS
-        or port not in (None, 443)
-        or not parsed.path.startswith("/")
-        or parsed.fragment
-    ):
-        expected = INITIAL_HOST if initial else "an approved GitHub release host"
-        raise FFmpegDownloadError(f"Approved FFmpeg URL must use HTTPS on {expected}.")
+    if parsed.scheme.lower() != "https":
+        raise FFmpegDownloadError("Approved FFmpeg URL must use HTTPS.")
+    if parsed.username is not None or parsed.password is not None:
+        raise FFmpegDownloadError("Approved FFmpeg URL must not contain credentials.")
+    if hostname not in ALLOWED_HOSTS:
+        raise FFmpegDownloadError(
+            f"Approved FFmpeg URL host {hostname or '<missing>'!r} is not allowed."
+        )
+    if port not in (None, 443):
+        raise FFmpegDownloadError("Approved FFmpeg URL must use HTTPS port 443.")
+    if not parsed.path.startswith("/"):
+        raise FFmpegDownloadError("Approved FFmpeg URL must contain an absolute path.")
+    if parsed.fragment:
+        raise FFmpegDownloadError("Approved FFmpeg URL must not contain a fragment.")
     if initial:
         if hostname != INITIAL_HOST:
             raise FFmpegDownloadError("Approved FFmpeg URL must begin on github.com.")
@@ -66,7 +69,9 @@ def _validated_url(value, *, initial=False):
     return value
 
 
-def resolve_source(config_path, environment=None):
+def resolve_source_details(
+    config_path, environment=None, *, allow_environment_override=False
+):
     environment = os.environ if environment is None else environment
     try:
         config = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -87,20 +92,43 @@ def resolve_source(config_path, environment=None):
     ):
         raise FFmpegDownloadError("Pinned FFmpeg configuration is unsupported.")
 
-    override_url = environment.get(URL_OVERRIDE, "").strip()
-    override_sha256 = environment.get(SHA256_OVERRIDE, "").strip()
-    if bool(override_url) != bool(override_sha256):
-        raise FFmpegDownloadError(
-            "FFmpeg administrator overrides must provide both URL and SHA-256."
-        )
-    url = override_url or config["url"]
-    sha256 = override_sha256 or config["sha256"]
+    override_url = ""
+    override_sha256 = ""
+    if allow_environment_override:
+        override_url = environment.get(URL_OVERRIDE, "").strip()
+        override_sha256 = environment.get(SHA256_OVERRIDE, "").strip()
+        if bool(override_url) != bool(override_sha256):
+            raise FFmpegDownloadError(
+                "FFmpeg administrator overrides must provide both URL and SHA-256."
+            )
+    override_active = bool(override_url)
+    url = override_url if override_active else config["url"]
+    sha256 = override_sha256 if override_active else config["sha256"]
     _validated_url(url, initial=True)
     if not isinstance(sha256, str) or _SHA256.fullmatch(sha256) is None:
         raise FFmpegDownloadError(
             "Approved FFmpeg SHA-256 must be exactly 64 hexadecimal characters."
         )
-    return url, sha256.lower()
+    return {
+        "url": url,
+        "sha256": sha256.lower(),
+        "source": "explicit environment override" if override_active else "pinned JSON",
+        "override_active": override_active,
+    }
+
+
+def resolve_source(config_path, environment=None, *, allow_environment_override=False):
+    details = resolve_source_details(
+        config_path,
+        environment,
+        allow_environment_override=allow_environment_override,
+    )
+    return details["url"], details["sha256"]
+
+
+def _safe_display_url(value):
+    parsed = urlsplit(value)
+    return parsed._replace(query="", fragment="").geturl()
 
 
 def _request_once(opener, url, timeout):
@@ -214,11 +242,31 @@ def download_approved_ffmpeg(source_url, destination, expected_sha256, timeout=1
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
-    parser.add_argument("destination", type=Path)
+    parser.add_argument("destination", type=Path, nargs="?")
+    parser.add_argument(
+        "--allow-environment-override",
+        action="store_true",
+        help="explicitly allow paired PHONE_CONTROLLER_FFMPEG_* overrides",
+    )
+    parser.add_argument("--show-effective-source", action="store_true")
     args = parser.parse_args(argv)
     try:
-        url, sha256 = resolve_source(args.config)
-        downloaded = download_approved_ffmpeg(url, args.destination, sha256)
+        details = resolve_source_details(
+            args.config,
+            allow_environment_override=args.allow_environment_override,
+        )
+        if args.show_effective_source:
+            print(f"FFmpeg configuration: {args.config.resolve()}")
+            print(f"FFmpeg source: {details['source']}")
+            print(f"FFmpeg override mode active: {details['override_active']}")
+            print(f"FFmpeg release asset: {_safe_display_url(details['url'])}")
+        if args.destination is None:
+            if args.show_effective_source:
+                return
+            parser.error("destination is required unless --show-effective-source is used")
+        downloaded = download_approved_ffmpeg(
+            details["url"], args.destination, details["sha256"]
+        )
     except FFmpegDownloadError as exc:
         parser.error(str(exc))
     print(f"Approved FFmpeg archive downloaded and verified: {downloaded.resolve()}")

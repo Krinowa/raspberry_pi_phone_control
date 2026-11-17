@@ -139,11 +139,14 @@ is pinned in `packaging/ffmpeg_source.json` to the dated GitHub release tag
 SHA-256 is
 `9ccd65428fb0e60a0d574b76145df41f402b754edd2d06c2e24fa506fc1c2b02`.
 
-Administrators may optionally set both `PHONE_CONTROLLER_FFMPEG_URL` and
-`PHONE_CONTROLLER_FFMPEG_SHA256` as Actions variables or secrets to test a
-different reviewed, version-pinned GitHub release asset. Supplying only one
-override fails closed. Mutable `/latest/` URLs, non-HTTPS URLs, and non-GitHub
-release URLs are rejected.
+The standard GitHub Actions workflow deliberately ignores
+`PHONE_CONTROLLER_FFMPEG_URL` and `PHONE_CONTROLLER_FFMPEG_SHA256`; stale
+repository settings cannot replace the checked-in pin. An administrator testing
+a different reviewed, version-pinned asset must use a separate explicit command
+or custom workflow that sets both variables and passes
+`--allow-environment-override` to `packaging/download_ffmpeg.py`. Supplying only
+one override fails closed. Mutable `/latest/` URLs, non-HTTPS URLs, and
+non-GitHub release URLs are rejected.
 
 The workflow permits at most three HTTPS redirects and accepts only
 `github.com` and `release-assets.githubusercontent.com`. It downloads to a
