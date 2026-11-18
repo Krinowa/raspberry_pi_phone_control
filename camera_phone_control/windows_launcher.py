@@ -524,6 +524,13 @@ def _run_camera_diagnostics(output_path):
 
 def _run_package_smoke_test():
     """Exercise the frozen import graph and core Flask UI/API without a server."""
+    # CI may supply inherited handles, and imported libraries may replace streams.
+    # Establish the requested windowed condition explicitly in smoke mode only.
+    if (
+        os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_TEST") == "1"
+        and os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_ABSENT_STREAMS") == "1"
+    ):
+        sys.stdout = sys.stderr = None
     report_path_value = os.environ.get(
         "PHONE_CONTROLLER_PACKAGE_SMOKE_REPORT", ""
     ).strip()
@@ -642,6 +649,12 @@ def _run_package_smoke_test():
         import cv2
         import numpy as np
 
+        if (
+            os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_TEST") == "1"
+            and os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_ABSENT_STREAMS") == "1"
+        ):
+            sys.stdout = sys.stderr = None
+        report["console_streams_absent"] = sys.stdout is None and sys.stderr is None
         if not report["console_streams_absent"]:
             raise RuntimeError("Frozen OCR must be validated with absent console streams.")
         fixtures = _package_smoke_fixtures(paths.resources)

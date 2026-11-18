@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import tempfile
+import os
+import sys
+import runpy
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -22,6 +25,57 @@ from windows_runtime import RuntimePaths
 
 
 class FrozenLauncherSmokeTests(unittest.TestCase):
+    def test_absent_stream_smoke_hook_does_not_redirect_to_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "early.json"
+            output = Path(temporary) / "stdout.txt"
+            with patch.dict(os.environ, {
+                "PHONE_CONTROLLER_PACKAGE_SMOKE_TEST": "1",
+                "PHONE_CONTROLLER_PACKAGE_SMOKE_ABSENT_STREAMS": "1",
+                "PHONE_CONTROLLER_PACKAGE_SMOKE_EARLY_REPORT": str(report),
+                "PHONE_CONTROLLER_PACKAGE_SMOKE_STDOUT": str(output),
+                "PHONE_CONTROLLER_PACKAGE_SMOKE_STDERR": str(output),
+            }), patch.object(sys, "stdout", sys.stdout), patch.object(sys, "stderr", sys.stderr), patch.object(sys, "excepthook", sys.excepthook):
+                runpy.run_path(str(Path(__file__).with_name("pyi_rth_phone_controller.py")))
+                self.assertIsNone(sys.stdout)
+                self.assertIsNone(sys.stderr)
+                self.assertFalse(output.exists())
+
+    def test_real_worker_entry_point_initializes_and_predicts_with_absent_streams(self):
+        from automation.screen.camera_ocr import _paddle_worker
+
+        connection = Mock()
+        connection.recv.side_effect = [
+            ("ocr", "request-one", np.zeros((10, 20, 3), np.uint8)),
+            ("shutdown",),
+        ]
+        observed = []
+        engine = Mock()
+
+        def build(*args):
+            observed.append((sys.stdout, sys.stderr))
+            # Simulate a dependency replacing streams during initialization.
+            sys.stdout = sys.stderr = Mock()
+            return engine
+
+        def predict(**kwargs):
+            observed.append((sys.stdout, sys.stderr))
+            return [{"rec_texts": ["Ready"], "rec_scores": [.99]}]
+
+        engine.predict.side_effect = predict
+        with patch.dict(os.environ, {
+            "PHONE_CONTROLLER_PACKAGE_SMOKE_TEST": "1",
+            "PHONE_CONTROLLER_PACKAGE_SMOKE_ABSENT_STREAMS": "1",
+        }), patch.object(sys, "stdout", sys.stdout), patch.object(sys, "stderr", sys.stderr), patch(
+            "automation.screen.camera_ocr._build_paddle_engine", side_effect=build
+        ):
+            _paddle_worker(connection, {"language": "en", "textline_orientation": False, "cpu_threads": 1})
+        self.assertEqual(observed, [(None, None), (None, None)])
+        result = connection.send.call_args_list[1].args[0]
+        self.assertEqual(result[0:2], ("result", "request-one"))
+        self.assertTrue(result[-1]["console_streams_absent"])
+        connection.close.assert_called_once()
+
     def test_language_fixtures_decode_and_expected_text_is_required(self):
         fixtures = _package_smoke_fixtures(Path(__file__).parent)
         self.assertEqual(set(fixtures), {"en", "zh-HK", "ms"})

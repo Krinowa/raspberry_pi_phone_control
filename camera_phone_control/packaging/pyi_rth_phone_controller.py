@@ -13,9 +13,15 @@ def _install_package_smoke_diagnostics():
     if not report:
         return
 
-    if stdout_path:
+    absent_streams = (
+        os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_TEST") == "1"
+        and os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_ABSENT_STREAMS") == "1"
+    )
+    if absent_streams:
+        sys.stdout = sys.stderr = None
+    elif stdout_path:
         sys.stdout = open(stdout_path, "a", encoding="utf-8", buffering=1)
-    if stderr_path:
+    if stderr_path and not absent_streams:
         sys.stderr = open(stderr_path, "a", encoding="utf-8", buffering=1)
 
     def write_unhandled(exception_type, exception, tb):

@@ -425,6 +425,7 @@ def _run_frozen_smoke_test(executable, compiled_modules):
         environment = os.environ.copy()
         environment["PHONE_CONTROLLER_DATA_DIR"] = data
         environment["PHONE_CONTROLLER_PACKAGE_SMOKE_TEST"] = "1"
+        environment["PHONE_CONTROLLER_PACKAGE_SMOKE_ABSENT_STREAMS"] = "1"
         environment["PHONE_CONTROLLER_PACKAGE_SMOKE_REPORT"] = os.fspath(report_path)
         environment["PHONE_CONTROLLER_PACKAGE_SMOKE_EARLY_REPORT"] = os.fspath(
             early_report_path

@@ -239,6 +239,12 @@ def _plain_result(result):
 def _paddle_worker(connection, config):
     """Persistent child entry point. The model is initialized exactly once."""
     configure_child_logging(config.get("_diagnostic_log_queue"))
+    absent_streams_test = (
+        os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_TEST") == "1"
+        and os.environ.get("PHONE_CONTROLLER_PACKAGE_SMOKE_ABSENT_STREAMS") == "1"
+    )
+    if absent_streams_test:
+        sys.stdout = sys.stderr = None
     worker_pid = os.getpid()
     try:
         started = time.monotonic()
@@ -288,6 +294,8 @@ def _paddle_worker(connection, config):
                 except (ImportError, OSError):
                     native_threads = None
                 started = time.monotonic()
+                if absent_streams_test:
+                    sys.stdout = sys.stderr = None
                 results = [_plain_result(item) for item in engine.predict(input=image)]
                 inference = time.monotonic() - started
                 usage_after = _process_cpu_times()
