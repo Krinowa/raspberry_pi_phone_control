@@ -655,6 +655,8 @@
   document.querySelectorAll("[data-add-step-type]").forEach((button) => {
     button.addEventListener("click", () => {
       addStepType = button.dataset.addStepType;
+      if (addStepType === "verify_text")
+        populateVerifyFieldSelect($("verify-field"));
       renderAddStepType();
 
       const focusTarget = {
@@ -1415,9 +1417,14 @@
     $("step-text-advanced").open = !!step.roi;
 
     if (step.type === "verify_text") {
-      $("step-verify-field").value = verifyFieldConfig(step.variable)
+      const selectedVariable = verifyFieldConfig(step.variable)
         ? step.variable
         : "account_name";
+      populateVerifyFieldSelect(
+        $("step-verify-field"),
+        transferMethodForStep(step.id),
+        selectedVariable,
+      );
       stepVerifyROIPicker.reset(step.roi);
     }
 
@@ -2021,8 +2028,74 @@
     amount: Object.freeze({ label: "Amount", match_mode: "amount" }),
   });
 
+  const AUTHORABLE_VERIFY_FIELDS = Object.freeze(
+    Object.keys(VERIFY_FIELDS).filter((variable) => variable !== "mobile_no"),
+  );
+
   function verifyFieldConfig(variable) {
     return VERIFY_FIELDS[variable] || null;
+  }
+
+  function stepsContainId(steps, stepId) {
+    return (steps || []).some(
+      (step) =>
+        step.id === stepId ||
+        stepsContainId(step.then_steps, stepId) ||
+        stepsContainId(step.else_steps, stepId) ||
+        Object.values(step.branches || {}).some((branch) =>
+          stepsContainId(branch, stepId),
+        ),
+    );
+  }
+
+  function transferMethodForStep(
+    stepId,
+    steps = recording.workflow?.steps || [],
+  ) {
+    for (const step of steps) {
+      if (step.type === "switch_transfer_method") {
+        for (const [method, branch] of Object.entries(step.branches || {})) {
+          if (stepsContainId(branch, stepId)) return method;
+        }
+      }
+      const nested =
+        transferMethodForStep(stepId, step.then_steps || []) ||
+        transferMethodForStep(stepId, step.else_steps || []) ||
+        Object.values(step.branches || {}).reduce(
+          (found, branch) =>
+            found || transferMethodForStep(stepId, branch || []),
+          null,
+        );
+      if (nested) return nested;
+    }
+    return null;
+  }
+
+  function populateVerifyFieldSelect(
+    select,
+    transferMethod = null,
+    selected = null,
+  ) {
+    const requiredVariable =
+      transferMethodDefinition(transferMethod)?.workflow_variable;
+    const requiredIsKnown = !!verifyFieldConfig(requiredVariable);
+    const values = requiredIsKnown
+      ? [requiredVariable]
+      : [...AUTHORABLE_VERIFY_FIELDS];
+    const preserved = selected || (!requiredIsKnown ? select.value : null);
+    if (
+      preserved &&
+      verifyFieldConfig(preserved) &&
+      !values.includes(preserved)
+    )
+      values.push(preserved);
+    select.replaceChildren(
+      ...values.map(
+        (variable) =>
+          new Option(verifyFieldConfig(variable).label, variable),
+      ),
+    );
+    select.value = values.includes(preserved) ? preserved : values[0];
   }
 
   function verifyTextFields(prefix, picker, existingROI = null) {
@@ -2600,6 +2673,10 @@
       await pendingManual;
       await flushText();
       await captureQueue;
+      populateVerifyFieldSelect(
+        $("verify-field"),
+        recording.alternate_screen?.branch,
+      );
       liveVerifyOpen = true;
       renderRecording();
       requestAnimationFrame(() => $("verify-field").focus());

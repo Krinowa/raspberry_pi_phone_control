@@ -106,10 +106,26 @@ function setup(pi = false, options = {}) {
             value: "bank_account",
             label: "Bank Account",
             identifier_field: "account_number",
+            workflow_variable: "account_number",
           },
-          { value: "phone_no", label: "FPS Phone Number", identifier_field: "mobile_no" },
-          { value: "email", label: "FPS Email Address", identifier_field: "mobile_no" },
-          { value: "fps_id", label: "FPS ID", identifier_field: "mobile_no" },
+          {
+            value: "phone_no",
+            label: "FPS Phone Number",
+            identifier_field: "mobile_no",
+            workflow_variable: "fps_phone_number",
+          },
+          {
+            value: "email",
+            label: "FPS Email Address",
+            identifier_field: "mobile_no",
+            workflow_variable: "fps_email",
+          },
+          {
+            value: "fps_id",
+            label: "FPS ID",
+            identifier_field: "mobile_no",
+            workflow_variable: "fps_id",
+          },
         ],
       };
     if (url === "/api/ocr/roi-preview") return {token: "snapshot", image: "data:image/png;base64,test", width: 200, height: 400};
@@ -1508,7 +1524,7 @@ test("Verify Text is available in edit and recording authoring with shared contr
   assert.match(source, /verifyTextFields\(\s*"step-verify"/);
 });
 
-test("Verify Text exposes all method-specific payment fields", () => {
+test("Verify Text exposes current payment fields without the legacy mobile alias", () => {
   const editor = templateSource.match(
     /<select id="step-verify-field">([\s\S]*?)<\/select>/,
   );
@@ -1521,7 +1537,6 @@ test("Verify Text exposes all method-specific payment fields", () => {
     ["account_name", "Account Name"],
     ["holder_name", "Holder Name"],
     ["account_number", "Account Number"],
-    ["mobile_no", "Mobile Number"],
     ["fps_phone_number", "FPS Phone Number"],
     ["fps_email", "FPS Email Address"],
     ["fps_id", "FPS ID"],
@@ -1552,6 +1567,32 @@ test("Verify Text exposes all method-specific payment fields", () => {
   assert.match(source, /account_number:[\s\S]*match_mode: "account_number"/);
   assert.match(source, /bank_name:[\s\S]*match_mode: "contains"/);
   assert.match(source, /amount:[\s\S]*match_mode: "amount"/);
+});
+
+test("Verify Text in a transfer branch uses the API-defined workflow variable", async () => {
+  const ui = setup();
+  await start(ui);
+  await ui.fire("record-alternate-screen", "click");
+  ui.$("condition-source").value = "withdrawal_api";
+  await ui.fire("condition-source", "change");
+  ui.$("condition-transfer-method").value = "phone_no";
+  await ui.fire("alternate-screen-start", "click");
+
+  await ui.fire("record-verify-text-here", "click");
+  assert.deepEqual(
+    ui.$("verify-field").children.map((option) => option.value),
+    ["fps_phone_number"],
+  );
+  assert.equal(ui.$("verify-field").value, "fps_phone_number");
+
+  await ui.fire("verify-add", "click");
+  const added = ui.calls.find(
+    (call) =>
+      call.url === "/api/recorder/step" &&
+      call.data.step.type === "verify_text",
+  );
+  assert.equal(added.data.step.variable, "fps_phone_number");
+  assert.equal(added.data.step.match_mode, "fps_phone");
 });
 
 test("normal Add Step keeps Read Balance alongside the existing simple steps", () => {
