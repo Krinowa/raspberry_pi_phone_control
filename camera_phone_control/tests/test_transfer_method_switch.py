@@ -2,6 +2,7 @@
 
 import unittest
 import threading
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -10,6 +11,7 @@ from automation.transfer_methods import TRANSFER_METHODS, transfer_method_option
 from automation.workflows.recorder import Recorder
 from automation.workflows.runner import WorkflowRunner
 from automation.workflows.service import WorkflowService
+from automation.workflows.storage import WorkflowStorage
 from automation.workflows.validation import resolve_variables, validate_workflow
 from automation.workflows.validation import require_transfer_method_branch
 from automation.screen.state import text_verification_matches
@@ -415,6 +417,51 @@ class TransferMethodSwitchTests(unittest.TestCase):
             ["fps_phone_number", "fps_phone_number"],
         )
         validate_workflow(recorder.workflow)
+
+    def test_recorder_can_save_only_the_phone_number_branch(self):
+        recorder = Recorder()
+        owner = "browser-1"
+        recorder.start(owner, "Phone transfer only")
+        recorder.start_alternate_screen(
+            owner,
+            None,
+            source="withdrawal_api",
+            transfer_method="phone_no",
+        )
+        recorder.workflow = recorder.prepare(
+            owner,
+            {
+                "type": "input",
+                "source": "variable",
+                "variable": "fps_phone_number",
+            },
+            variable("fps_phone_number"),
+        )
+        recorder.workflow = recorder.prepare(
+            owner,
+            {
+                "type": "verify_text",
+                "source": "variable",
+                "variable": "fps_phone_number",
+                "match_mode": "fps_phone",
+                "timeout_seconds": 2,
+            },
+        )
+        recorder.finish_alternate_screen(owner)
+        recorder.stop(owner)
+
+        switch = recorder.workflow["steps"][0]
+        self.assertEqual(set(switch["branches"]), {"phone_no"})
+        validate_workflow(recorder.workflow)
+        with tempfile.TemporaryDirectory() as temporary:
+            saved = WorkflowStorage(temporary).save(recorder.workflow, create=True)
+            self.assertEqual(
+                set(saved["steps"][0]["branches"]),
+                {"phone_no"},
+            )
+        require_transfer_method_branch(recorder.workflow, "phone_no")
+        with self.assertRaisesRegex(ValueError, "no explicit branch"):
+            require_transfer_method_branch(recorder.workflow, "bank_account")
 
 
 if __name__ == "__main__":

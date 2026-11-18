@@ -570,7 +570,10 @@ class Recorder:
             condition = {
                 "id": "step_" + uuid.uuid4().hex,
                 "type": "switch_transfer_method",
-                "branches": {method: [] for method in TRANSFER_METHODS},
+                # Store only methods that the operator actually records. The
+                # editor still offers every registered method and adds another
+                # branch through the existing-condition path above.
+                "branches": {transfer_method: []},
             }
             candidate["steps"].insert(insertion_index, condition)
         else:
