@@ -77,7 +77,7 @@ def env(tmp_path, monkeypatch):
     # Phone occupies the middle half of the camera picture.
     calibration = Calibration([[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]])
     flags = SimpleNamespace(
-        local=False, job=None, calibration=calibration, saved=[]
+        local=False, job=None, calibration=calibration, saved=[], workflow_texts=[]
     )
 
     def save_screen(device_id, new, changed_by):
@@ -94,6 +94,9 @@ def env(tmp_path, monkeypatch):
         open_input=lambda device_id: (bridge, flags.calibration),
         read_screen=lambda device_id: flags.calibration,
         save_screen=save_screen,
+        workflow_text_input=lambda device_id, input_bridge, value: (
+            flags.workflow_texts.append((device_id, input_bridge, value))
+        ),
         lease_seconds=0.6,
         input_wait_seconds=3.0,
     )
@@ -434,6 +437,15 @@ def test_text_is_passed_literally(env):
     assert env.bridge.calls == [("text", text)]
 
 
+def test_workflow_text_uses_the_assigned_keyboard_callback_without_direct_text(env):
+    assert takeover(env.client).status_code == 200
+    value = "00123.45"
+    assert send(env.client, type="workflow_text", text=value).status_code == 200
+    assert env.bridge.calls == []
+    assert env.flags.workflow_texts == [("phone_A", env.bridge, value)]
+    assert value not in Path(env.remote.history.path).read_text()
+
+
 def test_keys_and_buttons(env):
     assert takeover(env.client).status_code == 200
     for key in (
@@ -479,6 +491,8 @@ def test_keys_and_buttons(env):
         {"type": "text", "text": ""},
         {"type": "text", "text": "line\nbreak"},
         {"type": "text", "text": "x" * 201},
+        {"type": "workflow_text", "text": "line\nbreak"},
+        {"type": "workflow_text", "text": "x" * 201},
         {"type": "key", "key": "f1"},
         {"type": "home", "extra": 1},
         {"type": "launch"},

@@ -3416,9 +3416,11 @@
 
       workflowUiComputed(label, () => {
         const purpose =
-          flow.purpose === "balance_check"
-            ? workflowUi("balance.check", "Balance Check")
-            : workflowUi("ui.payment", "Payment");
+          flow.purpose === "remote_text"
+            ? "Remote Paste"
+            : flow.purpose === "balance_check"
+              ? workflowUi("balance.check", "Balance Check")
+              : workflowUi("ui.payment", "Payment");
         const created = flow.created_at
           ? new Date(flow.created_at).toLocaleString()
           : "—";

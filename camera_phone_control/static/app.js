@@ -472,12 +472,18 @@ const deviceService = {
       "GET",
       { monitor: false },
     ),
-  updateWorkflows: (deviceId, workflowIds, balanceWorkflowId) =>
+  updateWorkflows: (
+    deviceId,
+    workflowIds,
+    balanceWorkflowId,
+    remoteTextWorkflowId,
+  ) =>
     api(
       `/api/devices/${encodeURIComponent(deviceId)}/workflows`,
       {
         workflow_ids: workflowIds,
         balance_workflow_id: balanceWorkflowId,
+        remote_text_workflow_id: remoteTextWorkflowId,
       },
       "PUT",
     ),
@@ -2067,6 +2073,29 @@ function renderDevices({ presentationOnly = false } = {}) {
       openWorkflowSettings(device, "balance"),
     );
 
+    const remoteTextWorkflowHeading = document.createElement("strong");
+    uiLiteralText(remoteTextWorkflowHeading, "Remote Paste Workflow");
+    const remoteTextWorkflow = document.createElement("span");
+    remoteTextWorkflow.textContent = workflowAssignment.remote_text_workflow
+      ? workflowAssignment.remote_text_workflow.missing
+        ? `${workflowAssignment.remote_text_workflow.id} · ${deviceUi("workflow.missing", "Missing")}`
+        : workflowAssignment.remote_text_workflow.name ||
+          workflowAssignment.remote_text_workflow.id
+      : deviceUi("workflow.notAssigned", "Not assigned");
+    const remoteTextWorkflowAction = document.createElement("button");
+    remoteTextWorkflowAction.type = "button";
+    deviceUiText(
+      remoteTextWorkflowAction,
+      workflowAssignment.remote_text_workflow
+        ? "common.change"
+        : "workflow.assign",
+      workflowAssignment.remote_text_workflow ? "Change" : "Assign",
+    );
+    remoteTextWorkflowAction.disabled = managementBlocked;
+    remoteTextWorkflowAction.addEventListener("click", () =>
+      openWorkflowSettings(device, "remote_text"),
+    );
+
     workflowSummary.append(
       workflowHeading,
       workflowNames,
@@ -2075,6 +2104,9 @@ function renderDevices({ presentationOnly = false } = {}) {
       balanceWorkflowHeading,
       balanceWorkflow,
       balanceWorkflowAction,
+      remoteTextWorkflowHeading,
+      remoteTextWorkflow,
+      remoteTextWorkflowAction,
     );
 
     const withdrawApi = withdraw.withdraw_api || {};
@@ -3472,8 +3504,10 @@ function closeWorkflowSettings() {
   $("workflow-settings-dialog").hidden = true;
   $("workflow-settings-search").value = "";
   $("workflow-settings-balance-search").value = "";
+  $("workflow-settings-remote-text-search").value = "";
   $("workflow-settings-payment-section").hidden = false;
   $("workflow-settings-balance-section").hidden = false;
+  $("workflow-settings-remote-text-section").hidden = false;
   setWorkflowSettingsError();
 }
 
@@ -3877,15 +3911,100 @@ function renderBalanceWorkflowOptions() {
   $("workflow-settings-balance-list").replaceChildren(...options);
 }
 
+function renderRemoteTextWorkflowOptions() {
+  if (!workflowSettingsData) return;
+  const query = $("workflow-settings-remote-text-search")
+    .value.trim()
+    .toLocaleLowerCase();
+  const assignedId = workflowSettingsData.remote_text_workflow_id || "";
+  const assigned = workflowSettingsData.remote_text_workflow;
+  const available = workflowSettingsData.available_workflows
+    .filter((workflow) => workflow.remote_text_eligible === true)
+    .filter((workflow) =>
+      `${workflow.name} ${workflow.id}`.toLocaleLowerCase().includes(query),
+    );
+  const options = [];
+  const noneLabel = document.createElement("label");
+  noneLabel.className = "workflow-assignment-option";
+  noneLabel.dataset.workflowId = "";
+  const noneInput = document.createElement("input");
+  noneInput.type = "radio";
+  noneInput.name = "device-remote-text-workflow";
+  noneInput.checked = !assignedId;
+  const noneText = document.createElement("span");
+  const noneName = document.createElement("strong");
+  uiLiteralText(noneName, "No Remote Paste Workflow assigned");
+  const noneHint = document.createElement("small");
+  uiLiteralText(noneHint, "Disable captured-keyboard paste for this phone");
+  noneText.append(noneName, noneHint);
+  noneLabel.append(noneInput, noneText);
+  options.push(noneLabel);
+
+  for (const workflow of available) {
+    const label = document.createElement("label");
+    label.className = "workflow-assignment-option";
+    label.dataset.workflowId = workflow.id;
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "device-remote-text-workflow";
+    input.checked = workflow.id === assignedId;
+    const text = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = workflow.name;
+    const id = document.createElement("small");
+    id.textContent = workflow.id;
+    text.append(name, id);
+    label.append(input, text);
+    options.push(label);
+  }
+
+  if (
+    assignedId &&
+    assigned &&
+    (assigned.missing || assigned.remote_text_eligible === false) &&
+    !available.some((workflow) => workflow.id === assignedId)
+  ) {
+    const label = document.createElement("label");
+    label.className = "workflow-assignment-option missing";
+    label.dataset.workflowId = assignedId;
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "device-remote-text-workflow";
+    input.checked = true;
+    input.disabled = true;
+    const text = document.createElement("span");
+    const name = document.createElement("strong");
+    uiLiteralText(
+      name,
+      assigned.missing
+        ? "Missing Remote Paste Workflow"
+        : "Invalid Remote Paste Workflow",
+    );
+    const id = document.createElement("small");
+    id.textContent = assigned.name
+      ? `${assigned.name} · ${assigned.id}`
+      : assigned.id;
+    text.append(name, id);
+    label.append(input, text);
+    options.push(label);
+  }
+  $("workflow-settings-remote-text-list").replaceChildren(...options);
+}
+
 async function openWorkflowSettings(device, mode = "payment") {
   workflowSettingsDeviceId = device.id;
   workflowSettingsData = null;
-  workflowSettingsMode = mode === "balance" ? "balance" : "payment";
+  workflowSettingsMode = ["balance", "remote_text"].includes(mode)
+    ? mode
+    : "payment";
 
   const balanceMode = workflowSettingsMode === "balance";
-  const workflowType = balanceMode
-    ? deviceUi("workflow.balance", "Balance Check Workflow")
-    : deviceUi("workflow.payment", "Payment Workflow");
+  const remoteTextMode = workflowSettingsMode === "remote_text";
+  const workflowType = remoteTextMode
+    ? "Remote Paste Workflow"
+    : balanceMode
+      ? deviceUi("workflow.balance", "Balance Check Workflow")
+      : deviceUi("workflow.payment", "Payment Workflow");
   deviceUiText(
     $("workflow-settings-title"),
     "workflow.settingsNamed",
@@ -3893,11 +4012,17 @@ async function openWorkflowSettings(device, mode = "payment") {
     { type: workflowType, name: device.name || device.id },
   );
   uiLiteralText($("workflow-settings-help"), "Loading workflows…");
-  $("workflow-settings-payment-section").hidden = balanceMode;
+  $("workflow-settings-payment-section").hidden =
+    balanceMode || remoteTextMode;
   $("workflow-settings-balance-section").hidden = !balanceMode;
+  $("workflow-settings-remote-text-section").hidden = !remoteTextMode;
   uiLiteralText(
     $("workflow-settings-save"),
-    balanceMode ? "Save Balance Check Workflow" : "Save Payment Workflow",
+    remoteTextMode
+      ? "Save Remote Paste Workflow"
+      : balanceMode
+        ? "Save Balance Check Workflow"
+        : "Save Payment Workflow",
   );
   $("workflow-settings-list").replaceChildren();
   $("workflow-settings-dialog").hidden = false;
@@ -3907,13 +4032,17 @@ async function openWorkflowSettings(device, mode = "payment") {
     workflowSettingsData = await deviceService.workflows(device.id);
     uiLiteralText(
       $("workflow-settings-help"),
-      balanceMode
-        ? "Choose the Balance Check Workflow used to read this payer's balance."
-        : "Choose the Payment Workflow that may run on this phone.",
+      remoteTextMode
+        ? "Choose a one-step captured-keyboard workflow for RemoteViewer pasted values."
+        : balanceMode
+          ? "Choose the Balance Check Workflow used to read this payer's balance."
+          : "Choose the Payment Workflow that may run on this phone.",
     );
     renderWorkflowSettingsOptions();
     renderBalanceWorkflowOptions();
-    if (balanceMode) $("workflow-settings-balance-search").focus();
+    renderRemoteTextWorkflowOptions();
+    if (remoteTextMode) $("workflow-settings-remote-text-search").focus();
+    else if (balanceMode) $("workflow-settings-balance-search").focus();
     else $("workflow-settings-search").focus();
   } catch (error) {
     setWorkflowSettingsError(error.message);
@@ -3927,6 +4056,7 @@ async function saveWorkflowSettings(event) {
   const savingMode = workflowSettingsMode;
   let workflowIds;
   let balanceWorkflowId;
+  let remoteTextWorkflowId;
 
   if (savingMode === "balance") {
     // Preserve the Payment Workflow exactly as it was while editing only the
@@ -3940,6 +4070,19 @@ async function saveWorkflowSettings(event) {
       (option) => option.children[0]?.checked && !option.children[0]?.disabled,
     );
     balanceWorkflowId = selectedBalance?.dataset.workflowId || null;
+    remoteTextWorkflowId =
+      workflowSettingsData.remote_text_workflow_id || null;
+  } else if (savingMode === "remote_text") {
+    workflowIds = workflowSettingsData.unrestricted
+      ? []
+      : [...(workflowSettingsData.allowed_workflow_ids || [])];
+    balanceWorkflowId = workflowSettingsData.balance_workflow_id || null;
+    const selectedRemoteText = Array.from(
+      $("workflow-settings-remote-text-list").children,
+    ).find(
+      (option) => option.children[0]?.checked && !option.children[0]?.disabled,
+    );
+    remoteTextWorkflowId = selectedRemoteText?.dataset.workflowId || null;
   } else {
     const selected = Array.from($("workflow-settings-list").children).find(
       (option) => option.children[0]?.checked,
@@ -3947,6 +4090,8 @@ async function saveWorkflowSettings(event) {
     workflowIds = selected ? [selected.dataset.workflowId] : [];
     // Preserve the Balance Check Workflow while editing only Payment Workflow.
     balanceWorkflowId = workflowSettingsData.balance_workflow_id || null;
+    remoteTextWorkflowId =
+      workflowSettingsData.remote_text_workflow_id || null;
   }
 
   const button = $("workflow-settings-save");
@@ -3957,15 +4102,18 @@ async function saveWorkflowSettings(event) {
       workflowSettingsDeviceId,
       workflowIds,
       balanceWorkflowId,
+      remoteTextWorkflowId,
     );
     closeWorkflowSettings();
     deviceRenderSignature = null;
     await loadDevices();
     await window.phoneRecorder?.workflowAssignmentsChanged?.();
     notice(
-      savingMode === "balance"
-        ? "Balance Check Workflow saved."
-        : "Payment Workflow saved.",
+      savingMode === "remote_text"
+        ? "Remote Paste Workflow saved."
+        : savingMode === "balance"
+          ? "Balance Check Workflow saved."
+          : "Payment Workflow saved.",
     );
   } catch (error) {
     setWorkflowSettingsError(error.message);
@@ -6008,6 +6156,10 @@ $("workflow-settings-search").addEventListener(
 $("workflow-settings-balance-search").addEventListener(
   "input",
   renderBalanceWorkflowOptions,
+);
+$("workflow-settings-remote-text-search").addEventListener(
+  "input",
+  renderRemoteTextWorkflowOptions,
 );
 $("workflow-settings-cancel").addEventListener("click", closeWorkflowSettings);
 $("workflow-settings-close").addEventListener("click", closeWorkflowSettings);

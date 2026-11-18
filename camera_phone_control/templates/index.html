@@ -796,6 +796,26 @@ Select Refresh Logs to load recent activity.</pre
             ></div>
           </div>
 
+          <div id="workflow-settings-remote-text-section">
+            <h3>Remote Paste Workflow</h3>
+
+            <label>
+              Search workflows
+
+              <input
+                id="workflow-settings-remote-text-search"
+                type="search"
+                placeholder="Search by workflow name or ID"
+                autocomplete="off"
+              />
+            </label>
+
+            <div
+              id="workflow-settings-remote-text-list"
+              class="workflow-assignment-list"
+            ></div>
+          </div>
+
           <p
             id="workflow-settings-error"
             class="device-error"
@@ -1544,6 +1564,8 @@ Select Refresh Logs to load recent activity.</pre
               <option value="payment">Payment</option>
 
               <option value="balance_check">Balance Check</option>
+
+              <option value="remote_text">Remote Paste</option>
             </select>
           </label>
 

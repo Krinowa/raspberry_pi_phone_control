@@ -17,7 +17,7 @@ from automation.input.base import UnsupportedOperation
 from automation.workflows.runner import SCREEN_KEYBOARD_KEY_DELAY, WorkflowRunner
 from automation.workflows.service import WorkflowService
 from automation.workflows.storage import WorkflowStorage
-from automation.workflows.validation import validate_workflow
+from automation.workflows.validation import remote_text_input_workflow, validate_workflow
 from device_lock import DeviceLocks
 from hardware.pi_api_client import PiApiClient
 from hardware.raspberry_pi_input import RaspberryPiInputBridge
@@ -41,7 +41,7 @@ def keyboard():
 
 
 def screen_keyboard_flow(value=None, variable=False):
-    result = new_workflow("Numeric input")
+    result = new_workflow("Numeric input", "remote_text" if variable else "payment")
     result["id"] = "numeric_flow"
     result["keyboards"] = {"keyboard_numeric": keyboard()}
     step = {
@@ -102,6 +102,41 @@ class FakeContext:
 
 
 class ScreenKeyboardPlaybackTests(unittest.TestCase):
+    def test_remote_text_workflow_accepts_only_one_variable_screen_input(self):
+        workflow = screen_keyboard_flow(variable=True)
+        validated, step, definition = remote_text_input_workflow(workflow)
+        self.assertEqual(validated["id"], "numeric_flow")
+        self.assertEqual(step["variable"], "account_no")
+        self.assertEqual(definition["name"], "account_no")
+
+        for unsafe_step in (
+            {"id": "tap", "type": "tap", "x": 0.5, "y": 0.5},
+            {"id": "key", "type": "key", "key": "ENTER"},
+        ):
+            unsafe = deepcopy(workflow)
+            unsafe["steps"].append(unsafe_step)
+            with self.assertRaisesRegex(ValueError, "exactly one input step"):
+                remote_text_input_workflow(unsafe)
+            with self.assertRaisesRegex(ValueError, "exactly one input step"):
+                validate_workflow(unsafe)
+
+    def test_remote_text_workflow_rejects_hid_fixed_and_critical_inputs(self):
+        workflow = screen_keyboard_flow(variable=True)
+        for changes in (
+            {"input_method": "hid", "keyboard_id": None},
+            {"source": "fixed", "variable": None, "value": "1"},
+            {"critical": True},
+        ):
+            unsafe = deepcopy(workflow)
+            unsafe["steps"][0].update(changes)
+            unsafe["steps"][0] = {
+                key: value
+                for key, value in unsafe["steps"][0].items()
+                if value is not None
+            }
+            with self.assertRaises(ValueError):
+                remote_text_input_workflow(unsafe)
+
     def test_two_input_steps_use_their_exact_referenced_keyboard_maps(self):
         workflow = new_workflow("Two numeric keypads")
         workflow["id"] = "two_keypads"

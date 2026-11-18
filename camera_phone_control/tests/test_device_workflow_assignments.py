@@ -64,6 +64,7 @@ class DeviceWorkflowAssignmentTests(unittest.TestCase):
         self.maybank = self._workflow("Maybank")
         self.uob = self._workflow("UOB")
         self.balance = self._balance_workflow("Check Balance")
+        self.remote_text = self._remote_text_workflow("Remote Account Input")
 
     def _workflow(self, name):
         workflow = new_workflow(name)
@@ -89,6 +90,40 @@ class DeviceWorkflowAssignmentTests(unittest.TestCase):
                 "output_key": "receipt_path",
                 **({"critical": True} if critical else {}),
             },
+        ]
+        return self.workflows.save(workflow, create=True)
+
+    def _remote_text_workflow(self, name):
+        workflow = new_workflow(name, "remote_text")
+        workflow["variables"] = [
+            {
+                "name": "account_number",
+                "label": "Account Number",
+                "type": "text",
+                "required": True,
+                "default": None,
+            }
+        ]
+        workflow["keyboards"] = {
+            "account_keys": {
+                "id": "account_keys",
+                "name": "Account entry keypad",
+                "kind": "numeric",
+                "keys": {
+                    str(value): {"x": value / 10, "y": 0.7}
+                    for value in range(10)
+                },
+            }
+        }
+        workflow["steps"] = [
+            {
+                "id": "account_input",
+                "type": "input",
+                "source": "variable",
+                "variable": "account_number",
+                "input_method": "screen_keyboard",
+                "keyboard_id": "account_keys",
+            }
         ]
         return self.workflows.save(workflow, create=True)
 
@@ -186,7 +221,10 @@ class DeviceWorkflowAssignmentTests(unittest.TestCase):
 
     def test_main_and_balance_routes_persist_together_across_restart(self):
         self.assignments.set_routes(
-            "phone_A", [self.testing["id"]], self.uob["id"]
+            "phone_A",
+            [self.testing["id"]],
+            self.uob["id"],
+            self.remote_text["id"],
         )
         self.assignments.set_routes(
             "phone_B", [self.maybank["id"]], self.testing["id"]
@@ -205,6 +243,53 @@ class DeviceWorkflowAssignmentTests(unittest.TestCase):
             restarted.integration("phone_B")["balance_workflow_id"],
             self.testing["id"],
         )
+        self.assertEqual(
+            restarted.remote_text_workflow("phone_A"), self.remote_text["id"]
+        )
+
+    def test_api_assigns_only_a_single_captured_keyboard_input_for_remote_paste(self):
+        app = self._app()
+        client = app.test_client()
+        authenticate_admin(client)
+        headers = self._headers(app)
+
+        saved = client.put(
+            "/api/devices/phone_A/workflows",
+            json={
+                "workflow_ids": [self.testing["id"]],
+                "balance_workflow_id": self.balance["id"],
+                "remote_text_workflow_id": self.remote_text["id"],
+            },
+            headers=headers,
+        )
+        self.assertEqual(saved.status_code, 200, saved.json)
+        self.assertEqual(
+            saved.json["remote_text_workflow_id"], self.remote_text["id"]
+        )
+        self.assertTrue(saved.json["remote_text_workflow"]["remote_text_eligible"])
+
+        unsafe_edit = self.workflows.read(self.remote_text["id"])
+        unsafe_edit["steps"].append(
+            {"id": "unsafe_tap", "type": "tap", "x": 0.5, "y": 0.5}
+        )
+        edit_response = client.put(
+            f"/api/workflows/{self.remote_text['id']}",
+            json=unsafe_edit,
+            headers=headers,
+        )
+        self.assertEqual(edit_response.status_code, 400, edit_response.json)
+        self.assertIn("assigned as the Remote Paste Workflow", edit_response.json["error"])
+
+        rejected = client.put(
+            "/api/devices/phone_A/workflows",
+            json={
+                "workflow_ids": [self.testing["id"]],
+                "remote_text_workflow_id": self.testing["id"],
+            },
+            headers=headers,
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.json)
+        self.assertIn("Remote Paste purpose", rejected.json["error"])
 
     def test_legacy_json_without_device_entry_loads_safely(self):
         path = self.root / "device_workflows.json"

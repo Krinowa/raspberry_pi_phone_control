@@ -559,7 +559,7 @@ test("workflow polling is idle without a run and cleanup is idempotent", async (
   assert.equal(ui.timers.size, 0);
 });
 
-test("workflow create and edit UI persists one of the two displayed purposes", async () => {
+test("workflow create and edit UI persists one of the displayed purposes", async () => {
   const created = setup();
   await start(created);
   await created.fire("record-screenshot-here", "click");
@@ -604,7 +604,7 @@ test("workflow create and edit UI persists one of the two displayed purposes", a
   )[1];
   assert.deepEqual(
     [...purposeSelect.matchAll(/value="([^"]+)"/g)].map((match) => match[1]),
-    ["payment", "balance_check"],
+    ["payment", "balance_check", "remote_text"],
   );
 });
 

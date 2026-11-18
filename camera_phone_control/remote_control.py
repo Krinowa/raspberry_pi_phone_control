@@ -97,6 +97,7 @@ def validate_input(data):
         "tap": {"x", "y"},
         "swipe": {"x1", "y1", "x2", "y2", "duration_ms"},
         "text": {"text"},
+        "workflow_text": {"text"},
         "key": {"key"},
         "home": set(),
         "back": set(),
@@ -112,7 +113,9 @@ def validate_input(data):
         type(data["duration_ms"]) is not int or not 50 <= data["duration_ms"] <= 3000
     ):
         raise Refused(400, "invalid_input")
-    if kind == "text" and not _plain(data["text"], MAX_TEXT_LENGTH):
+    if kind in {"text", "workflow_text"} and not _plain(
+        data["text"], MAX_TEXT_LENGTH
+    ):
         raise Refused(400, "invalid_input")
     if kind == "key" and data["key"] not in KEYS:
         raise Refused(400, "invalid_input")
@@ -246,6 +249,7 @@ class RemoteControl:
         open_input,
         read_screen,
         save_screen,
+        workflow_text_input=None,
         lease_seconds=LEASE_SECONDS,
         input_wait_seconds=INPUT_WAIT_SECONDS,
     ):
@@ -258,6 +262,7 @@ class RemoteControl:
         self.open_input = open_input
         self.read_screen = read_screen
         self.save_screen = save_screen
+        self.workflow_text_input = workflow_text_input
         self.lease_seconds = lease_seconds
         self.input_wait_seconds = input_wait_seconds
         self.lock = threading.RLock()
@@ -504,7 +509,15 @@ class RemoteControl:
                     raise Refused(409, "device_unavailable")
                 session.sending = True
             try:
-                performed = perform_input(bridge, calibration, data)
+                if data["type"] == "workflow_text":
+                    if self.workflow_text_input is None:
+                        raise Refused(409, "workflow_text_unavailable")
+                    self.workflow_text_input(device_id, bridge, data["text"])
+                    performed = True
+                else:
+                    performed = perform_input(bridge, calibration, data)
+            except Refused:
+                raise
             except UnsupportedOperation:
                 raise Refused(422, "unsupported_input") from None
             except ValueError:

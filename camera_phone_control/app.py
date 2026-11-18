@@ -55,6 +55,11 @@ from automation.error_codes import exception_error_fields, error_fields
 from automation.screen.camera import CalibratedPreviewCache
 from automation.screen.stability import ScreenStabilityError
 from automation.workflows.api import register_workflows
+from automation.workflows.runner import format_input_value, type_with_screen_keyboard
+from automation.workflows.validation import (
+    remote_text_input_workflow,
+    resolve_variables,
+)
 from automation.jobs.api import register_jobs
 from automation.jobs.storage import DeviceWorkflowAssignmentStore
 from automation.integrations.withdraw_v2.balance import balance_check_workflow
@@ -928,6 +933,7 @@ def create_app(
         allowed = store.get(device_id)
         integration = store.integration(device_id)
         balance_workflow_id = integration.get("balance_workflow_id")
+        remote_text_workflow_id = store.remote_text_workflow(device_id)
         workflow_storage = app.extensions["workflow_storage"]
         workflows = workflow_storage.list()
         if include_available:
@@ -939,6 +945,13 @@ def create_app(
                 except ValueError as error:
                     item["balance_check_eligible"] = False
                     item["balance_check_error"] = str(error)
+                try:
+                    remote_text_input_workflow(workflow_storage.read(item["id"]))
+                    item["remote_text_eligible"] = True
+                    item["remote_text_error"] = None
+                except ValueError as error:
+                    item["remote_text_eligible"] = False
+                    item["remote_text_error"] = str(error)
         known = {item["id"]: item for item in workflows}
         assigned_ids = list(known) if allowed is None else list(allowed)
         assigned = [
@@ -971,6 +984,20 @@ def create_app(
                     ),
                 }
                 if balance_workflow_id
+                else None
+            ),
+            "remote_text_workflow_id": remote_text_workflow_id,
+            "remote_text_workflow": (
+                {
+                    "id": remote_text_workflow_id,
+                    "name": known.get(remote_text_workflow_id, {}).get("name"),
+                    "purpose": known.get(remote_text_workflow_id, {}).get("purpose"),
+                    "missing": remote_text_workflow_id not in known,
+                    "remote_text_eligible": known.get(
+                        remote_text_workflow_id, {}
+                    ).get("remote_text_eligible", False),
+                }
+                if remote_text_workflow_id
                 else None
             ),
         }
@@ -1200,10 +1227,18 @@ def create_app(
         if (
             not isinstance(data, dict)
             or "workflow_ids" not in data
-            or set(data) - {"workflow_ids", "balance_workflow_id"}
+            or set(data)
+            - {
+                "workflow_ids",
+                "balance_workflow_id",
+                "remote_text_workflow_id",
+            }
             or not isinstance(data["workflow_ids"], list)
         ):
-            raise ValueError("Expected workflow_ids and optional balance_workflow_id.")
+            raise ValueError(
+                "Expected workflow_ids and optional balance_workflow_id and "
+                "remote_text_workflow_id."
+            )
 
         if len(data["workflow_ids"]) > 1:
             raise ValueError("Only one workflow can be assigned to a phone.")
@@ -1216,9 +1251,21 @@ def create_app(
         )
         if balance_workflow_id is not None and not isinstance(balance_workflow_id, str):
             raise ValueError("balance_workflow_id must be a workflow ID or null.")
+        remote_text_workflow_id = data.get(
+            "remote_text_workflow_id",
+            assignment_store.remote_text_workflow(device_id),
+        )
+        if remote_text_workflow_id is not None and not isinstance(
+            remote_text_workflow_id, str
+        ):
+            raise ValueError("remote_text_workflow_id must be a workflow ID or null.")
 
         loaded_workflows = {}
-        for workflow_id in [*data["workflow_ids"], balance_workflow_id]:
+        for workflow_id in [
+            *data["workflow_ids"],
+            balance_workflow_id,
+            remote_text_workflow_id,
+        ]:
             if workflow_id is None:
                 continue
             try:
@@ -1237,6 +1284,8 @@ def create_app(
 
         if balance_workflow_id is not None:
             balance_check_workflow(loaded_workflows[balance_workflow_id])
+        if remote_text_workflow_id is not None:
+            remote_text_input_workflow(loaded_workflows[remote_text_workflow_id])
 
         withdraw_manager = app.extensions.get("withdraw_manager")
         if withdraw_manager is not None:
@@ -1244,7 +1293,10 @@ def create_app(
                 device_id, data["workflow_ids"]
             )
         assignment_store.set_routes(
-            device_id, data["workflow_ids"], balance_workflow_id
+            device_id,
+            data["workflow_ids"],
+            balance_workflow_id,
+            remote_text_workflow_id,
         )
         if withdraw_manager is not None:
             withdraw_manager.reload_after_workflow_assignment(device_id)
@@ -2153,6 +2205,26 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         )
         return context.input, calibration
 
+    def workflow_text_input(device_id, bridge, value):
+        """Type one RemoteViewer value through the phone's captured keyboard."""
+        assignment_store = app.extensions["device_workflow_assignment_store"]
+        workflow_id = assignment_store.remote_text_workflow(device_id)
+        if workflow_id is None:
+            raise remote_control.Refused(409, "workflow_text_unassigned")
+        try:
+            workflow, step, definition = remote_text_input_workflow(
+                app.extensions["workflow_storage"].read(workflow_id)
+            )
+            resolved = resolve_variables(workflow, {definition["name"]: value})
+            typed_value = format_input_value(step, resolved[definition["name"]])
+            keyboard = workflow["keyboards"][step["keyboard_id"]]
+            # This validates the complete value before the first screen tap.
+            type_with_screen_keyboard(bridge, time.sleep, keyboard, typed_value)
+        except FileNotFoundError:
+            raise remote_control.Refused(409, "workflow_text_invalid") from None
+        except ValueError:
+            raise remote_control.Refused(422, "unsupported_input") from None
+
     remote = remote_control.RemoteControl(
         workflow_service,
         state.device_locks,
@@ -2166,6 +2238,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         open_input=open_input,
         read_screen=read_screen,
         save_screen=save_screen,
+        workflow_text_input=workflow_text_input,
     )
     app.extensions["remote_control"] = remote
 

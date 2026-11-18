@@ -183,6 +183,7 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
             if not isinstance(value, dict) or set(value) - {
                 "allowed_workflow_ids",
                 "balance_workflow_id",
+                "remote_text_workflow_id",
                 "withdraw_api",
                 "ready_for_work",
             }:
@@ -228,8 +229,14 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
             self._save(assignments)
         return tuple(normalized)
 
-    def set_routes(self, device_id, workflow_ids, balance_workflow_id):
-        """Atomically persist the main and balance routes for one device."""
+    def set_routes(
+        self,
+        device_id,
+        workflow_ids,
+        balance_workflow_id,
+        remote_text_workflow_id=None,
+    ):
+        """Atomically persist payment, balance, and Remote Paste routes."""
         validate_device_id(device_id)
         if not isinstance(workflow_ids, list) or len(workflow_ids) > 1:
             raise ValueError("Only one workflow can be assigned to a phone.")
@@ -237,13 +244,26 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
         balance = (
             identifier(balance_workflow_id) if balance_workflow_id is not None else None
         )
+        remote_text = (
+            identifier(remote_text_workflow_id)
+            if remote_text_workflow_id is not None
+            else None
+        )
         with self.lock:
             records = self._read()
             record = records.setdefault(device_id, {})
             record["allowed_workflow_ids"] = normalized
             record["balance_workflow_id"] = balance
+            record["remote_text_workflow_id"] = remote_text
             self._write(records)
-        return tuple(normalized), balance
+        return tuple(normalized), balance, remote_text
+
+    def remote_text_workflow(self, device_id):
+        validate_device_id(device_id)
+        with self.lock:
+            value = self._read().get(device_id, {})
+            workflow_id = value.get("remote_text_workflow_id")
+            return identifier(workflow_id) if workflow_id is not None else None
 
     def ready_for_work(self, device_id):
         """Return the explicit operator gate, defaulting legacy records on."""

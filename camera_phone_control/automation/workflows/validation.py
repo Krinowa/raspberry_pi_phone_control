@@ -253,7 +253,9 @@ def validate_workflow(workflow, *, allow_empty=False):
     if type(workflow.get("financial", False)) is not bool:
         raise ValueError("financial must be a boolean.")
     if workflow.get("purpose") not in WORKFLOW_PURPOSES:
-        raise ValueError("Workflow purpose must be payment or balance_check.")
+        raise ValueError(
+            "Workflow purpose must be payment, balance_check, or remote_text."
+        )
 
     recovery_workflow_id = workflow.get("recovery_workflow_id")
     if recovery_workflow_id is not None:
@@ -687,6 +689,29 @@ def validate_workflow(workflow, *, allow_empty=False):
             "Transfer-method conditions are only valid in payment workflows."
         )
 
+    if not allow_empty and workflow.get("purpose") == "remote_text":
+        if len(steps) != 1:
+            raise ValueError(
+                "Remote Paste Workflow must contain exactly one input step."
+            )
+        remote_step = steps[0]
+        if (
+            remote_step.get("type") != "input"
+            or remote_step.get("source") != "variable"
+            or remote_step.get("input_method") != "screen_keyboard"
+            or remote_step.get("critical", False)
+        ):
+            raise ValueError(
+                "Remote Paste Workflow must be one non-critical variable input "
+                "using a captured screen keyboard."
+            )
+        if len(variables) != 1 or variables[0]["name"] != remote_step.get(
+            "variable"
+        ):
+            raise ValueError(
+                "Remote Paste Workflow must define only the variable used by its input."
+            )
+
     if not allow_empty and workflow.get("purpose", "payment") == "payment":
         method_definitions = {
             **LEGACY_TRANSFER_METHODS,
@@ -883,6 +908,44 @@ def resolve_variables(workflow, supplied=None, *, execution_context=None):
         except ValueError as exc:
             raise ValueError(f"Variable {name!r}: {exc}") from None
     return resolved
+
+
+def remote_text_input_workflow(workflow):
+    """Return the only input step for a safe Remote Paste workflow.
+
+    Remote Paste deliberately accepts an otherwise incomplete recording (for
+    example an ``account_number`` input without a transfer-method branch), but
+    it must never be able to execute anything except one captured-keyboard
+    variable input.
+    """
+    workflow = validate_workflow(workflow, allow_empty=True)
+    if workflow.get("purpose") != "remote_text":
+        raise ValueError("Remote Paste Workflow must use the Remote Paste purpose.")
+    if len(workflow["steps"]) != 1:
+        raise ValueError(
+            "Remote Paste Workflow must contain exactly one input step."
+        )
+    step = workflow["steps"][0]
+    if (
+        step.get("type") != "input"
+        or step.get("source") != "variable"
+        or step.get("input_method") != "screen_keyboard"
+        or step.get("critical", False)
+    ):
+        raise ValueError(
+            "Remote Paste Workflow must be one non-critical variable input "
+            "using a captured screen keyboard."
+        )
+    matching = [
+        definition
+        for definition in workflow["variables"]
+        if definition["name"] == step.get("variable")
+    ]
+    if len(workflow["variables"]) != 1 or len(matching) != 1:
+        raise ValueError(
+            "Remote Paste Workflow must define only the variable used by its input."
+        )
+    return workflow, step, matching[0]
 
 
 def validate_recovery_workflow(workflow):

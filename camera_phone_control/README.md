@@ -799,7 +799,7 @@ the agent's requests need no dashboard control token.
 | `POST /agent/v1/devices/<id>/takeover` | Take the phone. `200` with `interrupted_job` (or `null`); `409` with `local_operator`, `held_by_remote`, `critical_step` or `job_running`. |
 | `POST /agent/v1/devices/<id>/takeover/renew` | Keep the lease. `409` once the session no longer holds the phone. |
 | `DELETE /agent/v1/devices/<id>/takeover?session_id=…` | Release. Always `200`. |
-| `POST /agent/v1/devices/<id>/input` | One tap, swipe, text, key, `home`, `back` or `wake`. `403` unless the session holds the phone; `200` after the input was carried out. |
+| `POST /agent/v1/devices/<id>/input` | One tap, swipe, direct text, captured-keyboard `workflow_text`, key, `home`, `back` or `wake`. `403` unless the session holds the phone; `200` after the input was carried out. |
 
 **Lease.** Without a renew for 6 seconds the phone is released automatically.
 
@@ -819,6 +819,27 @@ the phone is ignored. Taps and swipes are refused (`409 not_calibrated`) until
 the phone is calibrated. Text is passed to the phone as data, never through a
 shell. The Pi accepts printable ASCII text only; other text, and the `escape`
 key, answer `422 unsupported_input` without sending anything.
+
+**Remote Paste.** To enter copied account numbers, amounts, or other sensitive
+values through the phone's visible keyboard, record a workflow with the
+*Remote Paste* purpose. It must have exactly one required variable input, use
+a captured screen keyboard, and contain no other step. Assign it to the phone
+under *Remote Paste Workflow*, then send:
+
+```json
+{
+  "session_id": "the-takeover-session",
+  "type": "workflow_text",
+  "text": "001234567890"
+}
+```
+
+The complete value is checked against the captured keys before the first tap.
+Alphabetic keyboards use their captured Shift and `?123`/`ABC` toggles when
+needed. `409 workflow_text_unassigned` means the phone has no assignment;
+invalid values answer `422 unsupported_input`. The value is not saved in the
+workflow, logs, or remote-control history. Existing `type: "text"` remains
+direct Pi/Appium text input.
 
 **Dashboard.** A phone under remote control shows who holds it, why and since
 when, with an *End Remote Control* button that takes it back (the agent's next

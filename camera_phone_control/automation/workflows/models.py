@@ -19,7 +19,7 @@ STEP_TYPES = {
     "manual_checkpoint",
 }
 VARIABLE_TYPES = {"text", "number"}
-WORKFLOW_PURPOSES = {"payment", "balance_check"}
+WORKFLOW_PURPOSES = {"payment", "balance_check", "remote_text"}
 
 
 def now():

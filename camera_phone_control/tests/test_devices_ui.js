@@ -967,6 +967,8 @@ test("workflow assignment UI displays names while API saves workflow IDs", async
     configured: true,
     allowed_workflow_ids: ["flow_testing"],
     balance_workflow_id: "flow_uob",
+    remote_text_workflow_id: null,
+    remote_text_workflow: null,
     balance_workflow: {
       id: "flow_uob",
       name: "UOB",
@@ -981,6 +983,7 @@ test("workflow assignment UI displays names while API saves workflow IDs", async
       { id: "flow_uob", name: "UOB", purpose: "balance_check", balance_check_eligible: true },
       { id: "flow_balance_2", name: "Balance 2", purpose: "balance_check", balance_check_eligible: true },
       { id: "flow_transfer", name: "Unsafe Balance", purpose: "balance_check", balance_check_eligible: false },
+      { id: "flow_paste", name: "Account Paste", purpose: "remote_text", remote_text_eligible: true },
     ],
   };
   context.api = async (url, data, method) => {
@@ -988,6 +991,7 @@ test("workflow assignment UI displays names while API saves workflow IDs", async
     if (method === "GET") return structuredClone(persisted);
     persisted.allowed_workflow_ids = [...data.workflow_ids];
     persisted.balance_workflow_id = data.balance_workflow_id;
+    persisted.remote_text_workflow_id = data.remote_text_workflow_id;
     persisted.balance_workflow = persisted.available_workflows.find(
       (workflow) => workflow.id === data.balance_workflow_id,
     );
@@ -1022,6 +1026,32 @@ test("workflow assignment UI displays names while API saves workflow IDs", async
     data: {
       workflow_ids: ["flow_maybank"],
       balance_workflow_id: "flow_uob",
+      remote_text_workflow_id: null,
+    },
+    method: "PUT",
+  });
+
+  await context.openWorkflowSettings(
+    { id: "phone_A", name: "Phone A" },
+    "remote_text",
+  );
+  assert.equal(nodes.get("workflow-settings-payment-section").hidden, true);
+  assert.equal(nodes.get("workflow-settings-balance-section").hidden, true);
+  assert.equal(nodes.get("workflow-settings-remote-text-section").hidden, false);
+  const remoteOptions = nodes.get("workflow-settings-remote-text-list").children;
+  assert.deepEqual(
+    remoteOptions.map((option) => option.dataset.workflowId),
+    ["", "flow_paste"],
+  );
+  remoteOptions[0].children[0].checked = false;
+  remoteOptions[1].children[0].checked = true;
+  await context.saveWorkflowSettings({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.at(-1))), {
+    url: "/api/devices/phone_A/workflows",
+    data: {
+      workflow_ids: ["flow_maybank"],
+      balance_workflow_id: "flow_uob",
+      remote_text_workflow_id: "flow_paste",
     },
     method: "PUT",
   });
@@ -1041,6 +1071,7 @@ test("workflow assignment UI displays names while API saves workflow IDs", async
     data: {
       workflow_ids: ["flow_maybank"],
       balance_workflow_id: "flow_balance_2",
+      remote_text_workflow_id: "flow_paste",
     },
     method: "PUT",
   });
@@ -1065,7 +1096,7 @@ test("workflow assignment UI displays names while API saves workflow IDs", async
   );
 });
 
-test("device card exposes independent Payment and Balance Check assignments", () => {
+test("device card exposes independent Payment, Balance Check, and Remote Paste assignments", () => {
   const { context, nodes } = setup();
   context.deviceCatalog = {
     selected_device: "phone_A",
@@ -1082,6 +1113,11 @@ test("device card exposes independent Payment and Balance Check assignments", ()
           balance_workflow: {
             id: "flow_balance",
             name: "Hong Leong Check Balance",
+            missing: false,
+          },
+          remote_text_workflow: {
+            id: "flow_paste",
+            name: "Account Number Paste",
             missing: false,
           },
         },
@@ -1103,6 +1139,8 @@ test("device card exposes independent Payment and Balance Check assignments", ()
   assert.equal(summary.children[1].textContent, "Hong Leong Transfer");
   assert.equal(summary.children[4].textContent, "Balance Check Workflow");
   assert.equal(summary.children[5].textContent, "Hong Leong Check Balance");
+  assert.equal(summary.children[7].textContent, "Remote Paste Workflow");
+  assert.equal(summary.children[8].textContent, "Account Number Paste");
   assert.equal(summary.children[6].textContent, "Change");
 
   context.deviceCatalog.devices[0].workflow_assignment.balance_workflow = null;

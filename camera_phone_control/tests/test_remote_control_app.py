@@ -217,6 +217,82 @@ def test_tap_reaches_the_pi_through_the_workflow_input_bridge(dashboard, monkeyp
     assert status["active"][0]["user_id"] == "tester"
 
 
+def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
+    from automation.workflows.models import new_workflow
+
+    workflow = new_workflow("Remote account paste", "remote_text")
+    workflow["variables"] = [
+        {
+            "name": "account_number",
+            "label": "Account Number",
+            "type": "text",
+            "required": True,
+            "default": None,
+        }
+    ]
+    workflow["keyboards"] = {
+        "account_keys": {
+            "id": "account_keys",
+            "name": "Account entry keypad",
+            "kind": "numeric",
+            "keys": {
+                "0": {"x": 0.5, "y": 0.9},
+                "1": {"x": 0.2, "y": 0.7},
+                "2": {"x": 0.5, "y": 0.7},
+            },
+        }
+    }
+    workflow["steps"] = [
+        {
+            "id": "account_input",
+            "type": "input",
+            "source": "variable",
+            "variable": "account_number",
+            "input_method": "screen_keyboard",
+            "keyboard_id": "account_keys",
+        }
+    ]
+    saved = dashboard.app.extensions["workflow_storage"].save(
+        workflow, create=True
+    )
+    dashboard.app.extensions["device_workflow_assignment_store"].set_routes(
+        "phone_A", [], None, saved["id"]
+    )
+    takeover = {
+        "session_id": "s1",
+        "user_id": "tester",
+        "reason": "paste account number",
+        "allow_during_job": False,
+    }
+    assert (
+        dashboard.client.post(BASE + "/takeover", json=takeover, headers=AUTH).status_code
+        == 200
+    )
+    response = dashboard.client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "workflow_text", "text": "120"},
+        headers=AUTH,
+    )
+    assert response.status_code == 200, response.get_json()
+    assert FakePi.sent == [
+        ("phone_A", "tap", 0.2, 0.7),
+        ("phone_A", "tap", 0.5, 0.7),
+        ("phone_A", "tap", 0.5, 0.9),
+    ]
+
+    before = list(FakePi.sent)
+    unsupported = dashboard.client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "workflow_text", "text": "123"},
+        headers=AUTH,
+    )
+    assert unsupported.status_code == 422
+    assert FakePi.sent == before
+    assert "120" not in dashboard.app.extensions[
+        "remote_control"
+    ].history.path.read_text(encoding="utf-8")
+
+
 def test_held_phone_is_not_eligible_for_new_jobs(dashboard):
     body = {
         "session_id": "s1",

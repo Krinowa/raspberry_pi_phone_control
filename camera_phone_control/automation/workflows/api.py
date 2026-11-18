@@ -37,6 +37,7 @@ from .runner import (
     screen_keyboard_points,
     type_with_screen_keyboard,
 )
+from .validation import remote_text_input_workflow
 from .service import WorkflowService
 from .storage import WorkflowStorage
 from hardware.raspberry_pi_input import PiControlTarget
@@ -390,13 +391,22 @@ def register_workflows(
 
     def ensure_purpose_change_is_unassigned(existing, candidate):
         """Reject an edit that would leave a device assigned to the wrong role."""
-        if existing.get("purpose") == candidate.get("purpose"):
-            return
         assignments = app.extensions.get("device_workflow_assignment_store")
         if assignments is None:
             return
         workflow_id = existing["id"]
         for device_id, integration in assignments.integrations().items():
+            if assignments.remote_text_workflow(device_id) == workflow_id:
+                try:
+                    remote_text_input_workflow(candidate)
+                except ValueError as exc:
+                    raise ValueError(
+                        "Workflow is assigned as the Remote Paste Workflow for "
+                        f"{device_id}; keep it as one captured-keyboard variable "
+                        "input or change that assignment first."
+                    ) from exc
+            if existing.get("purpose") == candidate.get("purpose"):
+                continue
             if (
                 integration.get("balance_workflow_id") == workflow_id
                 and candidate.get("purpose") != "balance_check"
