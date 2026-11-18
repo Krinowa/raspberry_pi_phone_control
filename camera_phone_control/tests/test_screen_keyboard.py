@@ -285,6 +285,19 @@ class ScreenKeyboardPlaybackTests(unittest.TestCase):
                     [call(keys[label]["x"], keys[label]["y"]) for label in value],
                 )
 
+    def test_alphabetic_mapping_with_symbols_types_each_coordinate_once(self):
+        value = '@#$+(;"'
+        keys = {
+            label: {"x": (index + 1) / 10, "y": 0.7}
+            for index, label in enumerate(value)
+        }
+        ctx = FakeContext()
+        WorkflowRunner(ctx).run(mapped_flow("alphabetic", keys, value))
+        self.assertEqual(
+            ctx.input.tap.call_args_list,
+            [call(keys[label]["x"], keys[label]["y"]) for label in value],
+        )
+
     def test_custom_labels_play_back_exact_case_and_punctuation(self):
         labels = "AB-12"
         keys = {
@@ -674,22 +687,24 @@ class ScreenKeyboardCaptureTests(unittest.TestCase):
         )
         self.assertEqual(self.client.get("/api/frame").status_code, 200)
 
-    def test_alphabetic_capture_saves_lowercase_digits_and_normalized_points(self):
+    def test_alphabetic_capture_saves_lowercase_digits_symbols_and_normalized_points(self):
         started = self.post(
             "/api/recorder/keyboard-capture/start",
             {
                 "name": "App keyboard",
                 "kind": "alphabetic",
-                "keys": ["a", "b", "1", " ", "BACKSPACE", "SHIFT"],
+                "keys": ["a", "b", "1", "@", '"', " ", "BACKSPACE", "SHIFT"],
             },
         )
         self.assertEqual(
             started["keyboard_capture"]["requested_keys"],
-            ["a", "b", "1", " ", "backspace", "shift"],
+            ["a", "b", "1", "@", '"', " ", "backspace", "shift"],
         )
         points = {
             "b": [0.2, 0.3],
             "1": [0.3, 0.3],
+            "@": [0.4, 0.3],
+            '"': [0.45, 0.3],
             " ": [0.5, 0.9],
             "backspace": [0.9, 0.8],
             "shift": [0.05, 0.8],

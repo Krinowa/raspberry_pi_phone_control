@@ -1894,13 +1894,14 @@ test("keyboard capture cancel keeps the active workflow unchanged", async () => 
   assert.equal(ui.$("record-live").hidden, false);
 });
 
-test("alphabetic capture UI requests optional space, backspace, and case toggle", async () => {
+test("alphabetic capture UI requests optional symbols, space, backspace, and case toggle", async () => {
   const ui = setup();
   await start(ui);
   await ui.fire("record-capture-keyboard", "click");
   ui.$("keyboard-capture-name").value = "App keyboard";
   ui.$("keyboard-capture-kind").value = "alphabetic";
   await ui.fire("keyboard-capture-kind", "change");
+  ui.$("keyboard-alphabetic-include-symbols").checked = true;
   ui.$("keyboard-include-space").checked = true;
   ui.$("keyboard-alphabetic-backspace").checked = true;
   ui.$("keyboard-alphabetic-shift").checked = true;
@@ -1910,18 +1911,23 @@ test("alphabetic capture UI requests optional space, backspace, and case toggle"
   );
   assert.equal(request.data.kind, "alphabetic");
   assert.deepEqual(request.data.keys.slice(0, 3), ["q", "w", "e"]);
+  assert.deepEqual(
+    request.data.keys.slice(26, 33),
+    ["@", "#", "$", "+", "(", ";", '"'],
+  );
   assert.deepEqual(request.data.keys.slice(-3), [" ", "backspace", "shift"]);
-  assert.equal(new Set(request.data.keys).size, 29);
+  assert.equal(new Set(request.data.keys).size, 36);
   assert.equal(ui.$("keyboard-alphabetic-options").hidden, false);
   assert.equal(ui.$("keyboard-numeric-options").hidden, true);
   assert.equal(ui.context.window.phoneRecorder.blocksInput(), true);
 });
 
-test("keyboard key generation preserves Numeric, Alphabetic digit option, and Custom", () => {
+test("keyboard key generation preserves Numeric, Alphabetic options, and Custom", () => {
   const fields = new Map([
     ["keyboard-include-decimal", { checked: false }],
     ["keyboard-numeric-backspace", { checked: false }],
     ["keyboard-alphabetic-include-digits", { checked: false }],
+    ["keyboard-alphabetic-include-symbols", { checked: false }],
     ["keyboard-include-space", { checked: false }],
     ["keyboard-alphabetic-backspace", { checked: false }],
     ["keyboard-alphabetic-shift", { checked: false }],
@@ -1956,9 +1962,21 @@ test("keyboard key generation preserves Numeric, Alphabetic digit option, and Cu
     Array.from(keyboardCaptureKeys("alphabetic").slice(-10)),
     Array.from("0123456789"),
   );
+  fields.get("keyboard-alphabetic-include-digits").checked = false;
+  fields.get("keyboard-alphabetic-include-symbols").checked = true;
+  assert.deepEqual(
+    Array.from(keyboardCaptureKeys("alphabetic").slice(-7)),
+    ["@", "#", "$", "+", "(", ";", '"'],
+  );
   assert.deepEqual(Array.from(keyboardCaptureKeys("custom")), ["A", "1", "-"]);
   assert.equal(
     /id="keyboard-alphabetic-include-digits"[\s\S]*?type="checkbox"/.test(
+      templateSource,
+    ),
+    true,
+  );
+  assert.equal(
+    /id="keyboard-alphabetic-include-symbols"[\s\S]*?type="checkbox"/.test(
       templateSource,
     ),
     true,

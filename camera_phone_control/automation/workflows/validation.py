@@ -25,7 +25,7 @@ PROTECTED_SCREEN_INPUT = re.compile(
 )
 KEYBOARD_KINDS = {"numeric", "alphabetic", "custom"}
 NUMERIC_KEY_LABELS = set("0123456789.") | {"BACKSPACE"}
-ALPHABETIC_KEY_LABELS = set("abcdefghijklmnopqrstuvwxyz0123456789 ") | {
+ALPHABETIC_KEY_LABELS = set('abcdefghijklmnopqrstuvwxyz0123456789 @#$+(;"') | {
     "backspace",
     "shift",
 }
@@ -169,8 +169,8 @@ def validate_keyboard_labels(kind, labels):
         label not in ALPHABETIC_KEY_LABELS for label in labels
     ):
         raise ValueError(
-            "Alphabetic keyboards support lowercase a-z, digits 0-9, space, "
-            "backspace, and shift."
+            "Alphabetic keyboards support lowercase a-z, digits 0-9, the "
+            "configured symbols, space, backspace, and shift."
         )
     if kind == "custom":
         for label in labels:

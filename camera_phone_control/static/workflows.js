@@ -370,6 +370,8 @@
 
       if ($("keyboard-alphabetic-include-digits").checked)
         keys.push(...Array.from("0123456789"));
+      if ($("keyboard-alphabetic-include-symbols").checked)
+        keys.push(...Array.from('@#$+(;"'));
       if ($("keyboard-include-space").checked) keys.push(" ");
       if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
       if ($("keyboard-alphabetic-shift").checked) keys.push("shift");
