@@ -171,6 +171,11 @@ def _build_paddle_engine(
         text_recognition_model_name=recognition_model,
         textline_orientation_model_name="PP-LCNet_x1_0_textline_ori",
     )
+    if sys.platform == "win32":
+        # Paddle 3.3.0's Windows oneDNN executor rejects a PP-OCRv5 PIR
+        # DoubleAttribute array during prediction (CI-20). Use the supported
+        # standard CPU executor; retain models, precision and verification.
+        options["enable_mkldnn"] = False
     if recognition_batch_size is not None:
         options["text_recognition_batch_size"] = recognition_batch_size
     packaged_models = os.environ.get("PHONE_CONTROLLER_OCR_MODELS_DIR", "").strip()
@@ -312,7 +317,8 @@ def _paddle_worker(connection, config):
                             "native_threads": native_threads,
                             "input_width": image.shape[1],
                             "input_height": image.shape[0],
-                            "console_streams_absent": sys.stdout is None and sys.stderr is None,
+                            "console_streams_absent": sys.stdout is None
+                            and sys.stderr is None,
                         },
                     )
                 )

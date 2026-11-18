@@ -248,6 +248,26 @@ class PaddleWorkerClientTests(unittest.TestCase):
         self.assertEqual(options["lang"], "chinese_cht")
         self.assertEqual(options["text_recognition_model_name"], "PP-OCRv5_mobile_rec")
 
+    def test_windows_uses_standard_cpu_executor_for_every_language(self):
+        for language, model in (
+            ("en", "en_PP-OCRv5_mobile_rec"),
+            ("zh-HK", "PP-OCRv5_mobile_rec"),
+            ("zh-TW", "PP-OCRv5_mobile_rec"),
+            ("ms", "latin_PP-OCRv5_mobile_rec"),
+        ):
+            with self.subTest(language=language), patch.object(sys, "platform", "win32"):
+                options = self.paddle_options(language)
+            self.assertIs(options["enable_mkldnn"], False)
+            self.assertEqual(options["device"], "cpu")
+            self.assertEqual(options["text_recognition_model_name"], model)
+            self.assertEqual(options["text_recognition_batch_size"], 1)
+
+    def test_non_windows_keeps_existing_cpu_backend_default(self):
+        for platform in ("darwin", "linux"):
+            with self.subTest(platform=platform), patch.object(sys, "platform", platform):
+                options = self.paddle_options("en")
+            self.assertNotIn("enable_mkldnn", options)
+
     def test_zh_tw_uses_same_traditional_chinese_profile(self):
         self.assertEqual(_ocr_language_profile("zh-TW"), _ocr_language_profile("zh-HK"))
 
