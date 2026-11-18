@@ -42,6 +42,22 @@ HEALTH_CLIENT = "launcher-health"
 PACKAGE_SMOKE_OCR_LANGUAGES = ("en", "zh-HK", "ms")
 
 
+def _normalized_ocr_text(value):
+    """Normalize OCR whitespace without weakening character matching."""
+    return "".join(str(value).split()).casefold()
+
+
+def _package_smoke_fixture_matches(recognized, expected):
+    """Require the complete public fixture text, tolerating extra OCR regions."""
+    expected_text = _normalized_ocr_text(expected)
+    if not expected_text:
+        return False
+    recognized_text = "".join(
+        _normalized_ocr_text(value) for value in recognized
+    )
+    return expected_text in recognized_text
+
+
 def _package_smoke_ocr_inference(provider, language, image, expected=None):
     """Run real inference; retain text only for explicitly supplied public fixtures."""
     from automation.screen.camera_ocr import _ocr_language_profile
@@ -82,9 +98,8 @@ def _package_smoke_ocr_inference(provider, language, image, expected=None):
         region_count += len(texts)
         recognized.extend(texts)
         confidences.extend(result.get("rec_scores", []))
-    if expected is not None and (
-        "".join(expected.split()).casefold()
-        != "".join("".join(recognized).split()).casefold()
+    if expected is not None and not _package_smoke_fixture_matches(
+        recognized, expected
     ):
         raise RuntimeError(
             f"Frozen {language} OCR did not recognize its public fixture: {recognized!r}."

@@ -14,6 +14,7 @@ import numpy as np
 
 from windows_launcher import (
     _PackageSmokeCamera,
+    _package_smoke_fixture_matches,
     _package_smoke_ocr_inference,
     _package_smoke_fixtures,
     _package_smoke_recovery,
@@ -25,6 +26,23 @@ from windows_runtime import RuntimePaths
 
 
 class FrozenLauncherSmokeTests(unittest.TestCase):
+    def test_fixture_match_requires_complete_text_but_allows_extra_regions(self):
+        self.assertTrue(
+            _package_smoke_fixture_matches(
+                ["status", "Pemindahan", " berjaya ", "footer"],
+                "Pemindahan berjaya",
+            )
+        )
+        self.assertTrue(
+            _package_smoke_fixture_matches(["確認", "取消"], "確認取消")
+        )
+        self.assertFalse(
+            _package_smoke_fixture_matches(
+                ["Pemindahan", "gagal"], "Pemindahan berjaya"
+            )
+        )
+        self.assertFalse(_package_smoke_fixture_matches(["anything"], ""))
+
     def test_absent_stream_smoke_hook_does_not_redirect_to_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "early.json"
