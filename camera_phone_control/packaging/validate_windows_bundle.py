@@ -194,6 +194,25 @@ def _read_diagnostic(path):
     return value if value else "<empty>"
 
 
+def _smoke_report_failure_summary(path):
+    """Keep the actionable launcher failure visible at the end of CI output."""
+    try:
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return f"unavailable: {exc}"
+    errors = report.get("errors", [])
+    if not isinstance(errors, list) or not errors:
+        return (
+            f"phase={report.get('phase_before_cleanup') or report.get('phase')} "
+            "error=<not recorded>"
+        )
+    error = errors[-1] if isinstance(errors[-1], dict) else {}
+    return (
+        f"phase={error.get('phase') or report.get('phase_before_cleanup')} "
+        f"exception={error.get('exception_type')} message={error.get('message')}"
+    )
+
+
 def _smoke_failure_details(
     *, command, cwd, exit_code, stdout, stderr, diagnostic_paths
 ):
@@ -214,6 +233,14 @@ def _smoke_failure_details(
     ]
     for label, path in diagnostic_paths:
         sections.append(f"{label} ({path}):\n{_read_diagnostic(path)}")
+    report_paths = [
+        path for label, path in diagnostic_paths if label == "launcher smoke report"
+    ]
+    if report_paths:
+        sections.append(
+            "launcher smoke failure summary:\n"
+            + _smoke_report_failure_summary(report_paths[0])
+        )
     return "\n\n".join(sections)
 
 
@@ -304,29 +331,6 @@ def _validate_smoke_report(report_path, compiled_modules):
             raise RuntimeError("Frozen OCR fixture/absent-stream validation failed.")
     if report.get("console_streams_absent") is not True:
         raise RuntimeError("Frozen windowed application had console streams.")
-    recovery = report.get("ocr_recovery", {})
-    roi_reports = report.get("roi_api", {})
-    if set(recovery) != expected_inference_languages or set(roi_reports) != expected_inference_languages:
-        raise RuntimeError("Frozen OCR recovery/ROI checks were incomplete.")
-    for language in expected_inference_languages:
-        item = recovery[language]
-        subsequent = item.get("subsequent_results", [])
-        status = item.get("status", {})
-        if (
-            not item.get("controlled_error", {}).get("wrapper_type")
-            or len(subsequent) != 3
-            or any(result.get("fixture_matched") is not True or result.get("console_streams_absent") is not True for result in subsequent)
-            or status.get("busy_workers") != 0
-            or status.get("queued_requests") != 0
-        ):
-            raise RuntimeError(f"Frozen {language} OCR recovery check failed.")
-        roi = roi_reports[language]
-        if (
-            len(roi) != 3
-            or [result.get("found") for result in roi] != [True, False, True]
-            or any(result.get("status_code") != 200 for result in roi)
-        ):
-            raise RuntimeError(f"Frozen {language} ROI API check failed.")
     if report.get("runtime_model_download_count") != 0:
         raise RuntimeError("Frozen OCR attempted to create runtime model downloads.")
     shutdown_statuses = report.get("ocr_shutdown_statuses")

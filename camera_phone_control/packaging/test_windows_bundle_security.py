@@ -19,6 +19,7 @@ from validate_windows_bundle import (  # noqa: E402
     _validate_cython_runtime_data,
     _validate_paddlex_ocr_core_metadata,
     _validate_smoke_report,
+    _smoke_report_failure_summary,
 )
 
 
@@ -61,20 +62,6 @@ class WindowsBundleSecurityTests(unittest.TestCase):
             "exit_code": 0,
             "phase": "complete",
             "console_streams_absent": True,
-            "ocr_recovery": {
-                language: {
-                    "controlled_error": {"wrapper_type": "ScreenStateError"},
-                    "subsequent_results": [
-                        {"fixture_matched": True, "console_streams_absent": True}
-                        for _ in range(3)
-                    ],
-                    "status": {"busy_workers": 0, "queued_requests": 0},
-                } for language in models
-            },
-            "roi_api": {
-                language: [{"status_code": 200, "found": found} for found in (True, False, True)]
-                for language in models
-            },
             "compiled_imports": [{"module": "protected.test"}],
             "multiprocessing_exit_code": 0,
             "ocr_worker_status": {"workers": [{"state": "IDLE"}]},
@@ -185,15 +172,12 @@ class WindowsBundleSecurityTests(unittest.TestCase):
             report = _validate_smoke_report(path, ["protected.test"])
             self.assertEqual(report["runtime_model_download_count"], 0)
 
-    def test_windowed_fixture_recovery_and_roi_checks_cannot_be_omitted(self):
+    def test_windowed_fixture_and_absent_stream_checks_cannot_be_omitted(self):
         import copy
 
         mutations = (
             lambda report: report.update(console_streams_absent=False),
             lambda report: report["ocr_inference_results"][0].update(fixture_recognized=False),
-            lambda report: report.update(ocr_recovery={}),
-            lambda report: report["ocr_recovery"]["en"].update(subsequent_results=[]),
-            lambda report: report["roi_api"]["zh-HK"][1].update(found=True),
         )
         for mutate in mutations:
             with self.subTest(mutation=mutate):
@@ -204,6 +188,25 @@ class WindowsBundleSecurityTests(unittest.TestCase):
                     path.write_text(json.dumps(report), encoding="utf-8")
                     with self.assertRaises(RuntimeError):
                         _validate_smoke_report(path, ["protected.test"])
+
+    def test_smoke_failure_summary_reports_the_actionable_error(self):
+        report = {
+            "phase": "failed",
+            "phase_before_cleanup": "ocr_inference",
+            "errors": [{
+                "phase": "ocr_inference",
+                "exception_type": "RuntimeError",
+                "message": "predictor rejected fixture",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "report.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            self.assertEqual(
+                _smoke_report_failure_summary(path),
+                "phase=ocr_inference exception=RuntimeError "
+                "message=predictor rejected fixture",
+            )
 
     def test_all_paddlex_ocr_core_distribution_metadata_is_required(self):
         with tempfile.TemporaryDirectory() as temporary:

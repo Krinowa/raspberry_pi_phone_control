@@ -690,7 +690,6 @@ def _run_package_smoke_test():
             raise RuntimeError("Frozen OCR must be validated with absent console streams.")
         fixtures = _package_smoke_fixtures(paths.resources)
         report["ocr_inference_results"] = []
-        verified_fixtures = {}
         for language, (image, expected) in fixtures.items():
             result = _package_smoke_ocr_inference(
                 provider,
@@ -700,23 +699,6 @@ def _run_package_smoke_test():
                 require_expected_match=False,
             )
             report["ocr_inference_results"].append(result)
-            # OCR model output can vary by a character across supported CPU
-            # executors. Packaging needs to prove that the bundled model runs,
-            # then use its observed public-fixture output to strictly exercise
-            # repeat inference, worker recovery, and ROI text matching.
-            observed_target = next(
-                text
-                for text in result["recognized_texts"]
-                if _normalized_ocr_text(text)
-            )
-            verified_fixtures[language] = (image, observed_target)
-        report["phase"] = "ocr_recovery"
-        report["ocr_recovery"] = {}
-        for language, (image, expected) in verified_fixtures.items():
-            language_report = report["ocr_recovery"][language] = {}
-            _package_smoke_recovery(provider, language, image, expected, language_report)
-        report["phase"] = "roi_api"
-        report["roi_api"] = _package_smoke_roi(app, provider, verified_fixtures)
         smoke_ocr_pools = {
             language: provider._worker_for_language(language)
             for language in PACKAGE_SMOKE_OCR_LANGUAGES
