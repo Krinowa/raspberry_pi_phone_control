@@ -27,7 +27,9 @@ KEYBOARD_KINDS = {"numeric", "alphabetic", "custom"}
 NUMERIC_KEY_LABELS = set("0123456789.") | {"BACKSPACE"}
 ALPHABETIC_KEY_LABELS = set('abcdefghijklmnopqrstuvwxyz0123456789 @#$+(;"') | {
     "backspace",
+    "letters",
     "shift",
+    "symbols",
 }
 MAX_CUSTOM_KEYS = 100
 MAX_CUSTOM_KEY_LABEL = 32
@@ -143,7 +145,11 @@ def normalize_capture_keyboard_labels(kind, labels):
             label = "BACKSPACE"
         elif kind == "alphabetic" and isinstance(label, str):
             folded = label.casefold()
-            label = folded if folded in {"backspace", "shift"} else label
+            label = (
+                folded
+                if folded in {"backspace", "letters", "shift", "symbols"}
+                else label
+            )
         normalized.append(label)
     validate_keyboard_labels(kind, normalized)
     return normalized
@@ -170,7 +176,11 @@ def validate_keyboard_labels(kind, labels):
     ):
         raise ValueError(
             "Alphabetic keyboards support lowercase a-z, digits 0-9, the "
-            "configured symbols, space, backspace, and shift."
+            "configured symbols, space, backspace, shift, and layout toggles."
+        )
+    if kind == "alphabetic" and len({"symbols", "letters"} & set(labels)) == 1:
+        raise ValueError(
+            "Alphabetic symbol layouts require both symbols and letters toggles."
         )
     if kind == "custom":
         for label in labels:

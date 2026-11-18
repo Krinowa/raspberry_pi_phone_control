@@ -298,6 +298,33 @@ class ScreenKeyboardPlaybackTests(unittest.TestCase):
             [call(keys[label]["x"], keys[label]["y"]) for label in value],
         )
 
+    def test_alphabetic_symbol_layout_switches_only_at_boundaries_and_restores_letters(self):
+        value = 'a@#$b+"'
+        labels = set(value) | {"symbols", "letters"}
+        keys = {
+            label: {"x": (index + 1) / 20, "y": 0.7}
+            for index, label in enumerate(sorted(labels))
+        }
+        expected = [
+            "a",
+            "symbols",
+            "@",
+            "#",
+            "$",
+            "letters",
+            "b",
+            "symbols",
+            "+",
+            '"',
+            "letters",
+        ]
+        ctx = FakeContext()
+        WorkflowRunner(ctx).run(mapped_flow("alphabetic", keys, value))
+        self.assertEqual(
+            ctx.input.tap.call_args_list,
+            [call(keys[label]["x"], keys[label]["y"]) for label in expected],
+        )
+
     def test_custom_labels_play_back_exact_case_and_punctuation(self):
         labels = "AB-12"
         keys = {
@@ -741,6 +768,69 @@ class ScreenKeyboardCaptureTests(unittest.TestCase):
             status=400,
         )
         self.assertIn("lowercase a-z", result["error"])
+
+    def test_alphabetic_capture_switches_symbol_layers_while_teaching(self):
+        self.post(
+            "/api/recorder/keyboard-capture/start",
+            {
+                "name": "Symbol keyboard",
+                "kind": "alphabetic",
+                "keys": ["a", "symbols", "@", "letters"],
+            },
+        )
+        self.post(
+            "/api/recorder/keyboard-capture/key",
+            {"key": "a", "point": [0.1, 0.2]},
+        )
+        self.post(
+            "/api/recorder/keyboard-capture/key",
+            {"key": "symbols", "camera_point": [0.18, 0.74], "frame_id": 123},
+        )
+        self.post(
+            "/api/recorder/keyboard-capture/key",
+            {"key": "@", "point": [0.2, 0.3]},
+        )
+        self.post(
+            "/api/recorder/keyboard-capture/key",
+            {"key": "letters", "camera_point": [0.18, 0.74], "frame_id": 123},
+        )
+        result = self.post("/api/recorder/keyboard-capture/save", {})
+        captured = next(iter(result["workflow"]["keyboards"].values()))
+        self.assertEqual(
+            set(captured["keys"]), {"a", "symbols", "@", "letters"}
+        )
+        self.assertEqual(
+            [call.args[1] for call in self.controller.send.call_args_list],
+            ["tap", "tap"],
+        )
+
+    def test_alphabetic_capture_requires_both_layout_toggles(self):
+        result = self.post(
+            "/api/recorder/keyboard-capture/start",
+            {
+                "name": "Incomplete symbol keyboard",
+                "kind": "alphabetic",
+                "keys": ["a", "symbols", "@"],
+            },
+            status=400,
+        )
+        self.assertIn("both symbols and letters toggles", result["error"])
+        self.controller.send.assert_not_called()
+
+    def test_custom_key_named_symbols_does_not_switch_phone_layout(self):
+        self.post(
+            "/api/recorder/keyboard-capture/start",
+            {"name": "Custom labels", "kind": "custom", "keys": ["symbols"]},
+        )
+        self.post(
+            "/api/recorder/keyboard-capture/key",
+            {
+                "key": "symbols",
+                "camera_point": [0.18, 0.74],
+                "frame_id": 123,
+            },
+        )
+        self.controller.send.assert_not_called()
 
     def test_custom_capture_saves_exact_labels(self):
         labels = ["A", "B", "-", "1", "2"]

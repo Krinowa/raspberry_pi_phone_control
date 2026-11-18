@@ -856,6 +856,7 @@ def register_workflows(
         if ("point" in data) == ("camera_point" in data):
             raise ValueError("Provide exactly one keyboard capture coordinate.")
         with lock:
+            label = data.get("key")
             point = data.get("point")
             if "camera_point" in data:
                 state.require_ready()
@@ -876,9 +877,36 @@ def register_workflows(
                     raise ValueError("Unsupported coordinate_space.")
             if not isinstance(point, (list, tuple)) or len(point) != 2:
                 raise ValueError("A keyboard key coordinate is required.")
+            point = [unit(point[0]), unit(point[1])]
+            capture = recorder.require_keyboard_capture_key(recorder_id(), label)
+            if (
+                capture["kind"] == "alphabetic"
+                and label in {"symbols", "letters"}
+                and "camera_point" in data
+            ):
+                if not state.action_lock.acquire(blocking=False):
+                    raise ValueError("Controller busy. Layout was not switched.")
+                try:
+                    with recording_sample_control(
+                        client_id(), data.get("frame_id")
+                    ) as device:
+                        if state.pi_bridge is not None:
+                            state.pi_bridge.tap(point[0], point[1])
+                        else:
+                            context = AutomationContext(
+                                device,
+                                state.android,
+                                threading.Event(),
+                                LOG,
+                                SimpleNamespace(),
+                                input_backend="appium",
+                            )
+                            context.input.tap(point[0], point[1])
+                finally:
+                    state.action_lock.release()
             return jsonify(
                 recorder.capture_keyboard_key(
-                    recorder_id(), data.get("key"), point[0], point[1]
+                    recorder_id(), label, point[0], point[1]
                 )
             )
 

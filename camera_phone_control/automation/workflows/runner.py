@@ -69,12 +69,26 @@ def screen_keyboard_points(keyboard, value):
                 "Shift/case-toggle key for "
                 f"uppercase: {labels}. No input sent."
             )
+        symbol_characters = set('@#$+(;"')
+        uses_symbol_layout = (
+            any(character in symbol_characters for character in value)
+            and {"symbols", "letters"} <= set(keyboard["keys"])
+        )
+        symbol_layout_active = False
         for character in value:
+            character_uses_symbols = character in symbol_characters
+            if uses_symbol_layout and character_uses_symbols != symbol_layout_active:
+                key_labels.append(
+                    "symbols" if character_uses_symbols else "letters"
+                )
+                symbol_layout_active = character_uses_symbols
             if "A" <= character <= "Z":
                 # Android Shift is a calibrated screen tap, not an HID modifier.
                 key_labels.extend(("shift", character.lower()))
             else:
                 key_labels.append(character)
+        if symbol_layout_active:
+            key_labels.append("letters")
     else:
         key_labels = list(value)
     missing = sorted(set(key_labels) - set(keyboard["keys"]))

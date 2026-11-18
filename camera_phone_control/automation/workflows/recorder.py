@@ -173,12 +173,16 @@ class Recorder:
         self.keyboard_capture = {**keyboard, "requested_keys": list(keys)}
         return self.snapshot()
 
-    def capture_keyboard_key(self, owner, label, x, y):
+    def require_keyboard_capture_key(self, owner, label):
         self.require_owner(owner)
         if self.keyboard_capture is None:
             raise ValueError("No keyboard capture is active.")
         if label not in self.keyboard_capture["requested_keys"]:
             raise ValueError("Choose a requested keyboard key.")
+        return self.keyboard_capture
+
+    def capture_keyboard_key(self, owner, label, x, y):
+        self.require_keyboard_capture_key(owner, label)
         self.keyboard_capture["keys"][label] = {"x": unit(x), "y": unit(y)}
         return self.snapshot()
 

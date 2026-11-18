@@ -1574,8 +1574,8 @@
       "已新增變數步驟，並輸入了一次預設值。",
     "Variable step added without sending input.":
       "已新增變數步驟，但沒有傳送輸入。",
-    "Teaching clicks are captured only; they are not sent to the phone.":
-      "教學點按只會被擷取，不會傳送至手機。",
+    "Teaching clicks are captured; ?123 and ABC prompts also switch the phone layout.":
+      "教學點按會被擷取；?123 及 ABC 提示亦會切換手機鍵盤配置。",
     Transfer: "轉帳",
     "Target preview before the tap": "點按前的目標預覽",
     "In Use": "使用中",

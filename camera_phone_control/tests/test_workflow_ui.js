@@ -1912,11 +1912,11 @@ test("alphabetic capture UI requests optional symbols, space, backspace, and cas
   assert.equal(request.data.kind, "alphabetic");
   assert.deepEqual(request.data.keys.slice(0, 3), ["q", "w", "e"]);
   assert.deepEqual(
-    request.data.keys.slice(26, 33),
-    ["@", "#", "$", "+", "(", ";", '"'],
+    request.data.keys.slice(26, 35),
+    ["symbols", "@", "#", "$", "+", "(", ";", '"', "letters"],
   );
   assert.deepEqual(request.data.keys.slice(-3), [" ", "backspace", "shift"]);
-  assert.equal(new Set(request.data.keys).size, 36);
+  assert.equal(new Set(request.data.keys).size, 38);
   assert.equal(ui.$("keyboard-alphabetic-options").hidden, false);
   assert.equal(ui.$("keyboard-numeric-options").hidden, true);
   assert.equal(ui.context.window.phoneRecorder.blocksInput(), true);
@@ -1965,8 +1965,8 @@ test("keyboard key generation preserves Numeric, Alphabetic options, and Custom"
   fields.get("keyboard-alphabetic-include-digits").checked = false;
   fields.get("keyboard-alphabetic-include-symbols").checked = true;
   assert.deepEqual(
-    Array.from(keyboardCaptureKeys("alphabetic").slice(-7)),
-    ["@", "#", "$", "+", "(", ";", '"'],
+    Array.from(keyboardCaptureKeys("alphabetic").slice(-9)),
+    ["symbols", "@", "#", "$", "+", "(", ";", '"', "letters"],
   );
   assert.deepEqual(Array.from(keyboardCaptureKeys("custom")), ["A", "1", "-"]);
   assert.equal(

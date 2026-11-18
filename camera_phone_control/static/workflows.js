@@ -347,6 +347,10 @@
     if (key === " ") return workflowLiteral("SPACE");
     if (key.toLowerCase() === "backspace") return workflowLiteral("BACKSPACE");
     if (key.toLowerCase() === "shift") return workflowLiteral("SHIFT");
+    if (key.toLowerCase() === "symbols")
+      return workflowLiteral("SYMBOLS (?123)");
+    if (key.toLowerCase() === "letters")
+      return workflowLiteral("LETTERS (ABC)");
     return key;
   }
 
@@ -370,8 +374,9 @@
 
       if ($("keyboard-alphabetic-include-digits").checked)
         keys.push(...Array.from("0123456789"));
-      if ($("keyboard-alphabetic-include-symbols").checked)
-        keys.push(...Array.from('@#$+(;"'));
+      if ($("keyboard-alphabetic-include-symbols").checked) {
+        keys.push("symbols", ...Array.from('@#$+(;"'), "letters");
+      }
       if ($("keyboard-include-space").checked) keys.push(" ");
       if ($("keyboard-alphabetic-backspace").checked) keys.push("backspace");
       if ($("keyboard-alphabetic-shift").checked) keys.push("shift");
@@ -2871,7 +2876,7 @@
       });
       keyboardSetupOpen = false;
       show(
-        "Teaching clicks are captured only; they are not sent to the phone.",
+        "Teaching clicks are captured; ?123 and ABC prompts also switch the phone layout.",
       );
       render();
     }),
