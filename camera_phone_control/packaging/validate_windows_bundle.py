@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from email.parser import Parser
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -585,19 +586,32 @@ def _validate_chardet_runtime_extensions(resources):
 def _validate_paddlex_ocr_core_metadata(resources):
     resources = Path(resources)
     discovered = {}
-    for dist in importlib.metadata.distributions(path=[os.fspath(resources)]):
-        name = dist.metadata.get("Name")
+    for dist_info in resources.glob("*.dist-info"):
+        metadata_path = dist_info / "METADATA"
+        if (
+            not dist_info.is_dir()
+            or dist_info.is_symlink()
+            or not metadata_path.is_file()
+            or metadata_path.is_symlink()
+            or metadata_path.stat().st_size == 0
+        ):
+            continue
+        try:
+            metadata = Parser().parsestr(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            continue
+        name = metadata.get("Name")
+        version = metadata.get("Version")
         if name:
-            discovered.setdefault(name.casefold(), []).append(dist)
+            normalized_name = re.sub(r"[-_.]+", "-", name).casefold()
+            discovered.setdefault(normalized_name, []).append(
+                (dist_info, version)
+            )
     invalid = []
     for distribution in PADDLEX_OCR_CORE_METADATA:
-        matches = discovered.get(distribution.casefold(), ())
-        if (
-            len(matches) != 1
-            or not matches[0].version
-            or not (Path(matches[0]._path) / "METADATA").is_file()
-            or (Path(matches[0]._path) / "METADATA").is_symlink()
-        ):
+        normalized_name = re.sub(r"[-_.]+", "-", distribution).casefold()
+        matches = discovered.get(normalized_name, ())
+        if len(matches) != 1 or not matches[0][1]:
             invalid.append(distribution)
     if invalid:
         raise RuntimeError(
