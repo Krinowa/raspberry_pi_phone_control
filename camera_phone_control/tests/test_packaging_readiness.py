@@ -456,6 +456,8 @@ class PackagingReadinessTests(unittest.TestCase):
         compiled = set(plan["compiled_modules"])
         bootstrap = set(plan["bootstrap_modules"])
 
+        self.assertEqual(len(plan["compiled_modules"]), 66)
+
         for module in (
             "app",
             "camera_manager",
@@ -578,6 +580,9 @@ class PackagingReadinessTests(unittest.TestCase):
         launcher = (APP_ROOT / "windows_launcher.py").read_text(encoding="utf-8")
         self.assertIn('report["ocr_worker_status"]', launcher)
         self.assertIn('report["ocr_language_statuses"]', launcher)
+        self.assertIn('report["ocr_inference_results"]', launcher)
+        self.assertIn('_package_smoke_ocr_inference', launcher)
+        self.assertIn('("en", "zh-HK", "ms")', launcher)
         self.assertIn('("en", "zh-HK", "zh-TW")', launcher)
         self.assertIn("start_worker()", launcher)
 

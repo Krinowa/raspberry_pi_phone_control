@@ -234,8 +234,8 @@ class StabilityTests(unittest.TestCase):
         ctx.input.tap.assert_called_once_with(.5, .5)
         provider.contains_text.assert_called_once_with("Transfer")
         messages = [call.args[0] for call in ctx.logger.info.call_args_list]
-        self.assertIn("Waiting for text: %s", messages)
-        self.assertIn("Text detected: %s", messages)
+        self.assertIn("Waiting for expected text.", messages)
+        self.assertIn("Expected text detected.", messages)
 
     def test_runner_reports_unavailable_text_provider(self):
         sim = Simulation()
@@ -427,8 +427,9 @@ class StabilityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ScreenStabilityError, 'stale'):
             session.capture_for_ocr()
-        self.publish(state, 0, 1)
-        state.camera.close()
+        state.camera.thread = None
+        state.camera.latest = None
+        state.camera.observation = Mock(return_value=None)
         with self.assertRaisesRegex(ScreenStabilityError, 'unavailable'):
             session.capture()
 

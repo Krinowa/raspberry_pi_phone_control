@@ -152,6 +152,44 @@ class PaddleWorkerPoolTests(unittest.TestCase):
         self.assertEqual(timing["worker_id"], 1)
         self.assertGreaterEqual(self.initializations.value, 2)
 
+    def test_repeated_inference_errors_release_slot_and_keep_ipc_correlated(self):
+        pool = self.pool(1)
+        pool.start()
+        pid = pool.slots[0]["client"].pid
+        for index in range(4):
+            with self.assertRaisesRegex(ScreenStateError, "RuntimeError: test failure") as caught:
+                pool.request(
+                    np.full((2, 2), 250, np.uint8),
+                    request_id=f"failed-{index}",
+                )
+            self.assertEqual(caught.exception.ocr_worker_id, pid)
+            status = pool.status()
+            self.assertEqual(status["busy_workers"], 0)
+            self.assertEqual(status["queued_requests"], 0)
+            self.assertEqual(status["workers"][0]["state"], "IDLE")
+        for command in (7, 8, 9):
+            result, timing = pool.request(
+                np.full((2, 2), command, np.uint8),
+                request_id=f"success-{command}",
+            )
+            self.assertEqual(result[0]["res"]["rec_texts"], [f"Value {command}"])
+            self.assertEqual(timing["request_id"], f"success-{command}")
+            self.assertEqual(timing["worker_pid"], pid)
+        self.assertEqual(self.initializations.value, 1)
+
+    def test_multiple_workers_remain_usable_after_inference_error(self):
+        pool = self.pool(2)
+        pool.start()
+        pids = [slot["client"].pid for slot in pool.slots]
+        with self.assertRaises(ScreenStateError):
+            pool.request(np.full((2, 2), 250, np.uint8))
+        for command, worker_id in ((7, 2), (8, 1)):
+            result, timing = pool.request(np.full((2, 2), command, np.uint8))
+            self.assertEqual(result[0]["res"]["rec_texts"], [f"Value {command}"])
+            self.assertEqual(timing["worker_id"], worker_id)
+            self.assertEqual(timing["worker_pid"], pids[worker_id - 1])
+        self.assertEqual(self.initializations.value, 2)
+
     def test_safe_restart_up_and_down_and_rejects_active_inference(self):
         pool = self.pool(1)
         pool.start()

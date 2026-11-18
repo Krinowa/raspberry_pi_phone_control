@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import importlib
 import importlib.machinery
 import json
 import logging
+import math
 import multiprocessing
 import os
 import sys
@@ -37,6 +39,163 @@ ERROR_ALREADY_EXISTS = 183
 EVENT_MODIFY_STATE = 0x0002
 WAIT_OBJECT_0 = 0
 HEALTH_CLIENT = "launcher-health"
+PACKAGE_SMOKE_OCR_LANGUAGES = ("en", "zh-HK", "ms")
+
+
+def _package_smoke_ocr_inference(provider, language, image, expected=None):
+    """Run real inference; retain text only for explicitly supplied public fixtures."""
+    from automation.screen.camera_ocr import _ocr_language_profile
+
+    worker_for_language = getattr(provider, "_worker_for_language", None)
+    if worker_for_language is None:
+        raise RuntimeError("Frozen application has no OCR language inference hook.")
+    results, timings = worker_for_language(language).request(image)
+    if not isinstance(results, list) or not isinstance(timings, dict):
+        raise RuntimeError(
+            f"Frozen {language} OCR inference returned an invalid response."
+        )
+    if expected is not None and timings.get("console_streams_absent") is not True:
+        raise RuntimeError("Frozen OCR child must retain absent console streams.")
+    inference = timings.get("inference")
+    if (
+        type(inference) not in (int, float)
+        or not math.isfinite(inference)
+        or inference < 0
+    ):
+        raise RuntimeError(
+            f"Frozen {language} OCR inference returned invalid timing data."
+        )
+    region_count = 0
+    recognized = []
+    confidences = []
+    for item in results:
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"Frozen {language} OCR inference returned an invalid result."
+            )
+        result = item.get("res", item)
+        texts = result.get("rec_texts", []) if isinstance(result, dict) else None
+        if not isinstance(texts, list):
+            raise RuntimeError(
+                f"Frozen {language} OCR inference returned invalid recognition data."
+            )
+        region_count += len(texts)
+        recognized.extend(texts)
+        confidences.extend(result.get("rec_scores", []))
+    if expected is not None and (
+        "".join(expected.split()).casefold()
+        != "".join("".join(recognized).split()).casefold()
+    ):
+        raise RuntimeError(
+            f"Frozen {language} OCR did not recognize its public fixture: {recognized!r}."
+        )
+    return {
+        "language": language,
+        "recognition_model": _ocr_language_profile(language)[2],
+        "result_batch_count": len(results),
+        "region_count": region_count,
+        "inference_ms": round(inference * 1000, 3),
+        "worker_id": timings.get("worker_id") or timings.get("worker_pid"),
+        **({
+            "fixture_matched": True,
+            "console_streams_absent": True,
+            "recognized_texts": recognized,
+            "confidence_scores": confidences,
+            "worker_pid": timings.get("worker_pid"),
+            "request_id": timings.get("request_id"),
+        } if expected is not None else {}),
+    }
+
+
+def _package_smoke_fixtures(resources):
+    import cv2
+    import numpy as np
+
+    data = json.loads((resources / "ocr_smoke_fixtures.json").read_text(encoding="utf-8"))
+    fixtures = {}
+    for item in data["fixtures"]:
+        image = cv2.imdecode(
+            np.frombuffer(base64.b64decode(item["png_base64"], validate=True), np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        if image is None or not item["expected"].strip():
+            raise RuntimeError("Invalid packaged OCR fixture.")
+        fixtures[item["language"]] = (image, item["expected"])
+    if set(fixtures) != set(PACKAGE_SMOKE_OCR_LANGUAGES):
+        raise RuntimeError("Packaged OCR language fixtures are incomplete.")
+    return fixtures
+
+
+def _package_smoke_recovery(provider, language, image, expected, report=None):
+    """Exercise real predictor error IPC, then require fresh valid inference."""
+    import numpy as np
+    from automation.screen.state import ScreenStateError
+
+    pool = provider._worker_for_language(language)
+    report = {} if report is None else report
+    report["status_before"] = pool.status()
+    try:
+        pool.request(np.zeros((0, 0, 3), dtype=np.uint8))
+    except ScreenStateError as exc:
+        diagnostics = dict(getattr(exc, "ocr_diagnostics", {}))
+        diagnostics.update(
+            wrapper_type=type(exc).__name__,
+            message=sanitize_text(str(exc)),
+            worker_pid=getattr(exc, "ocr_worker_id", None),
+        )
+    else:
+        raise RuntimeError(f"Frozen {language} OCR accepted an empty fixture image.")
+    report["controlled_error"] = diagnostics
+    report["status_after_error"] = pool.status()
+    report["subsequent_results"] = []
+    for _ in range(3):
+        report["subsequent_results"].append(
+            _package_smoke_ocr_inference(provider, language, image, expected)
+        )
+    status = pool.status()
+    report["status"] = status
+    if status["busy_workers"] or status["queued_requests"]:
+        raise RuntimeError("Frozen OCR retained a request after recovery.")
+    return report
+
+
+def _package_smoke_roi(app, provider, fixtures):
+    """Use fixture snapshots at the camera boundary; real API, crop and OCR."""
+    client = app.test_client()
+    client.environ_base["HTTP_X_CONTROL_TOKEN"] = app.config["CONTROL_TOKEN"]
+    with client.session_transaction() as session:
+        session["username"] = "package-smoke"
+        session["role"] = "admin"
+    original_capture = provider.capture_snapshot
+    reports = {}
+    try:
+        for language, (image, expected) in fixtures.items():
+            provider.capture_snapshot = lambda: image.copy()
+            # The ROI handler creates an isolated provider from this language.
+            original_language = provider.language
+            provider.language = language
+            try:
+                preview = client.post("/api/ocr/roi-preview", json={})
+                if preview.status_code != 200:
+                    raise RuntimeError(f"Frozen ROI preview failed: {preview.get_data(as_text=True)}")
+                token = preview.get_json()["token"]
+                responses = []
+                for target, expected_found in ((expected, True), ("ZZZUNMATCHEDZZZ", False), (expected, True)):
+                    response = client.post("/api/ocr/roi-test", json={
+                        "token": token,
+                        "roi": {"x": 0, "y": 0, "width": 1, "height": 1},
+                        "text": target,
+                    })
+                    body = response.get_json()
+                    if response.status_code != 200 or body.get("found") is not expected_found:
+                        raise RuntimeError(f"Frozen {language} ROI verification failed: {body!r}")
+                    responses.append({"status_code": response.status_code, "found": body["found"], "texts": body["texts"]})
+                reports[language] = responses
+            finally:
+                provider.language = original_language
+    finally:
+        provider.capture_snapshot = original_capture
+    return reports
 
 
 def _configure_logging(log_directory: Path):
@@ -378,6 +537,7 @@ def _run_package_smoke_test():
         "compiled_imports": [],
         "endpoints": [],
         "errors": [],
+        "console_streams_absent": sys.stdout is None and sys.stderr is None,
     }
 
     def save_report():
@@ -393,7 +553,8 @@ def _run_package_smoke_test():
 
     paths = None
     logging_runtime = None
-    app = camera_manager = None
+    app = camera_manager = provider = None
+    smoke_ocr_pools = {}
     exit_code = 1
     try:
         report["phase"] = "runtime_paths"
@@ -477,6 +638,40 @@ def _run_package_smoke_test():
                 raise RuntimeError(
                     f"Frozen {language} OCR workers did not initialize: {status!r}."
                 )
+        report["phase"] = "ocr_inference"
+        import cv2
+        import numpy as np
+
+        if not report["console_streams_absent"]:
+            raise RuntimeError("Frozen OCR must be validated with absent console streams.")
+        fixtures = _package_smoke_fixtures(paths.resources)
+        report["ocr_inference_results"] = [
+            _package_smoke_ocr_inference(provider, language, image, expected)
+            for language, (image, expected) in fixtures.items()
+        ]
+        report["phase"] = "ocr_recovery"
+        report["ocr_recovery"] = {}
+        for language, (image, expected) in fixtures.items():
+            language_report = report["ocr_recovery"][language] = {}
+            _package_smoke_recovery(provider, language, image, expected, language_report)
+        report["phase"] = "roi_api"
+        report["roi_api"] = _package_smoke_roi(app, provider, fixtures)
+        smoke_ocr_pools = {
+            language: provider._worker_for_language(language)
+            for language in PACKAGE_SMOKE_OCR_LANGUAGES
+        }
+        runtime_model_cache = paths.cache / "paddlex" / "official_models"
+        downloaded_model_files = (
+            list(runtime_model_cache.rglob("inference.pdiparams"))
+            if runtime_model_cache.is_dir()
+            else []
+        )
+        report["runtime_model_download_count"] = len(downloaded_model_files)
+        if downloaded_model_files:
+            raise RuntimeError(
+                "Frozen OCR created runtime model downloads instead of using the "
+                "bundled model directories."
+            )
         required_routes = {
             ("/agent/v1/devices/<device_id>/frames", "GET"),
             ("/agent/v1/devices/<device_id>/takeover", "POST"),
@@ -513,7 +708,9 @@ def _run_package_smoke_test():
             ),
             ("/static/app.js", {}, b"/api/remote-control"),
             ("/static/i18n.js", {}, b'"remote.heading"'),
+            ("/static/workflows.js", {}, b"switch_transfer_method"),
             ("/static/style.css", {}, b".remote-control-banner"),
+            ("/api/workflow-options/transfer-methods", {}, None),
         )
         report["phase"] = "flask_endpoints"
         for endpoint, request_options, required_marker in checks:
@@ -537,8 +734,56 @@ def _run_package_smoke_test():
                     raise RuntimeError(
                         f"Smoke endpoint {endpoint} is missing its RemoteViewer asset marker."
                     )
+                if endpoint == "/api/workflow-options/transfer-methods":
+                    methods = response.get_json().get("transfer_methods", [])
+                    values = {
+                        item.get("value") for item in methods if isinstance(item, dict)
+                    }
+                    expected_values = {
+                        "bank_account",
+                        "phone_no",
+                        "email",
+                        "fps_id",
+                    }
+                    if values != expected_values:
+                        raise RuntimeError(
+                            "Frozen transfer-method API returned unexpected values: "
+                            f"{sorted(values)!r}."
+                        )
+                    report["transfer_method_values"] = sorted(values)
             finally:
                 response.close()
+        report["phase"] = "http_health"
+        from werkzeug.serving import make_server
+
+        server = make_server("127.0.0.1", 0, app, threaded=True)
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            name="package-smoke-http",
+            daemon=True,
+        )
+        server_thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/status",
+                headers={"X-Control-Client": "package-smoke"},
+            )
+            with urllib.request.urlopen(request, timeout=10.0) as response:
+                report["http_health"] = {
+                    "status_code": response.status,
+                    "content_type": response.headers.get_content_type(),
+                }
+                response.read()
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(10.0)
+        report["http_health"]["thread_stopped"] = not server_thread.is_alive()
+        if (
+            report["http_health"]["status_code"] != 200
+            or not report["http_health"]["thread_stopped"]
+        ):
+            raise RuntimeError("Frozen local HTTP health check did not succeed.")
         report.pop("current_endpoint", None)
         report["phase"] = "checks_complete"
         exit_code = 0
@@ -549,6 +794,8 @@ def _run_package_smoke_test():
                 "exception_type": type(exc).__name__,
                 "message": str(exc),
                 "traceback": traceback.format_exc(),
+                "ocr_diagnostics": getattr(exc, "ocr_diagnostics", None),
+                "worker_pid": getattr(exc, "ocr_worker_id", None),
             }
         )
         if sys.stderr is not None:
@@ -559,6 +806,24 @@ def _run_package_smoke_test():
         try:
             if app is not None and camera_manager is not None:
                 _close_application(app, camera_manager)
+            if smoke_ocr_pools:
+                shutdown_statuses = {
+                    language: pool.status()
+                    for language, pool in smoke_ocr_pools.items()
+                }
+                report["ocr_shutdown_statuses"] = shutdown_statuses
+                for language, status in shutdown_statuses.items():
+                    workers = status.get("workers", [])
+                    if (
+                        status.get("accepting") is not False
+                        or status.get("busy_workers") != 0
+                        or status.get("queued_requests") != 0
+                        or not workers
+                        or any(worker.get("pid") is not None for worker in workers)
+                    ):
+                        raise RuntimeError(
+                            f"Frozen {language} OCR workers did not shut down cleanly."
+                        )
             if logging_runtime is not None:
                 logging_runtime.stop()
         except BaseException as exc:

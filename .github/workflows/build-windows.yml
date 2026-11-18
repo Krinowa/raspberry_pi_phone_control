@@ -22,6 +22,7 @@ jobs:
       APP_VERSION: ci-${{ github.run_number }}-${{ github.sha }}
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONUTF8: "1"
+      PHONE_CONTROLLER_PACKAGE_DIAGNOSTICS_DIR: ${{ github.workspace }}\camera_phone_control\artifacts\diagnostics
 
     steps:
       - name: Check out source
@@ -66,7 +67,12 @@ jobs:
       - name: Run focused frontend regressions
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path artifacts/diagnostics -Force | Out-Null
           node --test `
+            --test-reporter=spec `
+            --test-reporter-destination=stdout `
+            --test-reporter=junit `
+            --test-reporter-destination=artifacts/diagnostics/frontend-junit.xml `
             tests/test_dashboard_modes.js `
             tests/test_devices_ui.js `
             tests/test_i18n.js `
@@ -125,6 +131,10 @@ jobs:
           set "PYTHONPATH=%CD%;%CD%\tests"
           .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_packaging_readiness
           if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe packaging\test_windows_launcher_smoke.py
+          if errorlevel 1 exit /b 1
+          .venv-packaging-3.13.13\Scripts\python.exe packaging\test_windows_bundle_security.py
+          if errorlevel 1 exit /b 1
           .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_camera_identity
           if errorlevel 1 exit /b 1
           .venv-packaging-3.13.13\Scripts\python.exe -m unittest tests.test_screen_keyboard
@@ -162,6 +172,7 @@ jobs:
             python = "3.13.13-x64"
             app_version = $env:APP_VERSION
             protected_build_id = $attestation.build_id
+            protected_native_module_count = @($attestation.compiled_modules).Count
             ffmpeg_sha256 = $env:PHONE_CONTROLLER_FFMPEG_SOURCE_SHA256
           } | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding utf8NoBOM
 
@@ -183,4 +194,16 @@ jobs:
             ${{ steps.package.outputs.hash_path }}
           if-no-files-found: error
           compression-level: 0
+          retention-days: 14
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: PhoneController-windows-diagnostics-${{ github.sha }}
+          path: |
+            camera_phone_control/artifacts/diagnostics/**
+            camera_phone_control/build/PhoneController/warn-PhoneController.txt
+            camera_phone_control/build/PhoneController/xref-PhoneController.html
+          if-no-files-found: warn
           retention-days: 14

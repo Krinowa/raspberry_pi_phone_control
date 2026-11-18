@@ -110,6 +110,7 @@ binaries.append((str(ffmpeg), "tools"))
 # websocket-client is given certifi.where() explicitly for WSS verification.
 # Bundle certifi's cacert.pem so that path also exists in the installed onedir app.
 datas += collect_data_files("certifi")
+datas.append((str(APP_ROOT / "packaging" / "ocr_smoke_fixtures.json"), "."))
 
 # PaddleX imports Cython.Compiler while initializing OCR. Cython loads code
 # templates from this directory by path at runtime, so ModuleGraph cannot infer

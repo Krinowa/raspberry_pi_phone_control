@@ -17,6 +17,7 @@ from automation.screen.camera_ocr import (
     _ocr_language_profile,
 )
 from automation.screen.state import ScreenStateError
+from automation.workflows.runner import WorkflowRunner
 
 
 def protocol_worker(connection, config):
@@ -46,6 +47,12 @@ def protocol_worker(connection, config):
                             "RuntimeError",
                             "test failure",
                             os.getpid(),
+                            {
+                                "exception_type": "RuntimeError",
+                                "exception_detail": "test failure",
+                                "exception_chain": "RuntimeError",
+                                "traceback_summary": "model.py:42:predict",
+                            },
                         )
                     )
                 elif command == 251:
@@ -170,6 +177,19 @@ class PaddleWorkerClientTests(unittest.TestCase):
         result, _ = client.request(np.zeros((2, 2), np.uint8))
         self.assertEqual(result[0]["res"]["rec_texts"], ["Log In"])
         self.assertEqual(self.initializations.value, 1)
+
+    def test_worker_exception_diagnostics_survive_process_boundary(self):
+        client = self.client()
+        self.addCleanup(client.close)
+        with self.assertRaises(ScreenStateError) as caught:
+            client.request(np.full((2, 2), 250, np.uint8))
+        error = caught.exception
+        self.assertEqual(error.ocr_diagnostics["exception_type"], "RuntimeError")
+        self.assertEqual(error.ocr_diagnostics["exception_detail"], "test failure")
+        self.assertEqual(
+            error.ocr_diagnostics["traceback_summary"], "model.py:42:predict"
+        )
+        self.assertEqual(error.ocr_worker_id, client.pid)
 
     def test_request_timeout_stops_failed_worker(self):
         client = self.client(timeout=2)
@@ -379,6 +399,90 @@ class CameraOCRCacheTests(unittest.TestCase):
             provider.visible_texts_from_image(image)
         self.assertEqual(provider.visible_texts_from_image(image), ["Accounts"])
         self.assertEqual(worker.request.call_count, 2)
+
+    def test_repeated_failures_submit_fresh_requests_then_recover_and_cache(self):
+        worker = self.worker()
+        success = worker.request.return_value
+        worker.request.side_effect = [
+            ScreenStateError(f"failure-{index}") for index in range(4)
+        ] + [success]
+        provider = self.provider(worker)
+        image = np.zeros((300, 180), np.uint8)
+        for index in range(4):
+            with self.assertRaisesRegex(ScreenStateError, f"failure-{index}"):
+                provider.visible_texts_from_image(image)
+            self.assertEqual(provider._cache_by_scope, {})
+            self.assertEqual(worker.request.call_count, index + 1)
+        self.assertEqual(provider.visible_texts_from_image(image), ["Accounts"])
+        self.assertEqual(provider.visible_texts_from_image(image), ["Accounts"])
+        self.assertEqual(worker.request.call_count, 5)
+        ids = [call.kwargs["request_id"] for call in worker.request.call_args_list]
+        self.assertEqual(len(set(ids)), 5)
+
+    def test_inference_failure_log_contains_original_worker_exception(self):
+        worker = self.worker()
+        error = ScreenStateError(
+            "PaddleOCR worker 7654 failed: RuntimeError: predictor failed"
+        )
+        error.ocr_worker_id = 7654
+        error.ocr_diagnostics = {
+            "exception_type": "RuntimeError",
+            "exception_detail": "predictor failed",
+            "exception_chain": "RuntimeError",
+            "traceback_summary": "predictor.py:88:run",
+        }
+        worker.request.side_effect = error
+        provider = self.provider(worker)
+
+        with patch("automation.screen.camera_ocr.log_event") as logged:
+            with self.assertRaises(ScreenStateError) as caught:
+                provider.visible_texts_from_image(np.zeros((300, 180), np.uint8))
+
+        self.assertEqual(caught.exception.error_code, "ocr_inference_failed")
+
+        failure = next(
+            call
+            for call in logged.call_args_list
+            if len(call.args) > 3 and call.args[3] == "ocr_inference_failed"
+        )
+        self.assertEqual(failure.kwargs["exception_type"], "RuntimeError")
+        self.assertEqual(failure.kwargs["exception_detail"], "predictor failed")
+        self.assertEqual(failure.kwargs["exception_chain"], "RuntimeError")
+        self.assertEqual(
+            failure.kwargs["traceback_summary"], "predictor.py:88:run"
+        )
+        self.assertEqual(failure.kwargs["worker_id"], 7654)
+
+    def test_success_log_never_contains_recognized_text(self):
+        worker = self.worker()
+        provider = self.provider(worker)
+
+        with patch("automation.screen.camera_ocr.log_event") as logged:
+            self.assertEqual(
+                provider.visible_texts_from_image(np.zeros((300, 180), np.uint8)),
+                ["Accounts"],
+            )
+
+        result = next(
+            call
+            for call in logged.call_args_list
+            if len(call.args) > 3 and call.args[3] == "ocr_recognition_result"
+        )
+        self.assertEqual(result.kwargs["recognition_result_count"], 1)
+        self.assertNotIn("recognition_results", result.kwargs)
+        self.assertNotIn("Accounts", repr(result.kwargs))
+
+    def test_only_worker_boundary_failures_are_classified_as_inference(self):
+        preprocessing = ScreenStateError("Camera OCR received an empty image.")
+        self.assertEqual(
+            WorkflowRunner._diagnostic_error_code(preprocessing, "verify_text"),
+            "workflow_step_failed",
+        )
+        preprocessing.error_code = "ocr_inference_failed"
+        self.assertEqual(
+            WorkflowRunner._diagnostic_error_code(preprocessing, "verify_text"),
+            "ocr_inference_failed",
+        )
 
     def test_failure_invalidates_an_older_successful_cache_entry(self):
         worker = self.worker()

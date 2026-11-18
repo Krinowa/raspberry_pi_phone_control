@@ -131,8 +131,6 @@ class WorkflowRunner:
                 timed_out = False
             if timed_out:
                 return "ocr_timeout"
-            if isinstance(exc, ScreenStateError):
-                return "ocr_inference_failed"
         return "workflow_step_failed"
 
     def run(self, workflow, variables=None, *, start_step_index=0):

@@ -7,6 +7,7 @@ import logging
 import math
 import multiprocessing
 import os
+import sys
 from pathlib import Path
 import threading
 import time
@@ -303,18 +304,21 @@ def _paddle_worker(connection, config):
                             "native_threads": native_threads,
                             "input_width": image.shape[1],
                             "input_height": image.shape[0],
+                            "console_streams_absent": sys.stdout is None and sys.stderr is None,
                         },
                     )
                 )
             except BaseException as exc:
+                diagnostics = _exception_diagnostics(exc)
                 try:
                     connection.send(
                         (
                             "error",
                             request_id,
-                            type(exc).__name__,
-                            str(exc)[:500],
+                            diagnostics["exception_type"],
+                            diagnostics["exception_detail"],
                             worker_pid,
+                            diagnostics,
                         )
                     )
                 except (BrokenPipeError, EOFError, OSError):
@@ -473,10 +477,19 @@ class _PaddleWorkerClient:
                     "PaddleOCR worker returned a mismatched response."
                 )
             if message[0] == "error":
-                _, _, error_type, detail, pid = message
-                raise ScreenStateError(
+                _, _, error_type, detail, pid, *extra = message
+                diagnostics = extra[0] if extra and isinstance(extra[0], dict) else {}
+                error = ScreenStateError(
                     f"PaddleOCR worker {pid} failed: {error_type}: {detail}"
                 )
+                error.ocr_diagnostics = {
+                    "exception_type": diagnostics.get("exception_type", error_type),
+                    "exception_detail": diagnostics.get("exception_detail", detail),
+                    "exception_chain": diagnostics.get("exception_chain", error_type),
+                    "traceback_summary": diagnostics.get("traceback_summary", ""),
+                }
+                error.ocr_worker_id = pid
+                raise error
             if message[0] != "result":
                 self._stop(force=True)
                 raise ScreenStateError("PaddleOCR worker returned an invalid response.")
@@ -1487,16 +1500,38 @@ class CameraOCRScreenStateProvider:
                         timed_out = "timed out" in str(exc).casefold()
                     except Exception:
                         timed_out = False
+                    error_code = getattr(exc, "error_code", None)
+                    if not isinstance(error_code, str) or not error_code:
+                        error_code = (
+                            "ocr_timeout" if timed_out else "ocr_inference_failed"
+                        )
+                        try:
+                            exc.error_code = error_code
+                        except (AttributeError, TypeError):
+                            pass
+                    diagnostics = getattr(exc, "ocr_diagnostics", None)
+                    if not isinstance(diagnostics, dict):
+                        diagnostics = _exception_diagnostics(exc)
                     log_event(
                         LOG,
                         logging.WARNING if timed_out else logging.ERROR,
                         "ocr",
-                        "ocr_timeout" if timed_out else "ocr_inference_failed",
+                        error_code,
                         ocr_request_id=ocr_request_id,
-                        error_code=(
-                            "ocr_timeout" if timed_out else "ocr_inference_failed"
+                        error_code=error_code,
+                        exception_type=diagnostics.get(
+                            "exception_type", type(exc).__name__
                         ),
-                        exception_type=type(exc).__name__,
+                        exception_detail=sanitize_text(
+                            diagnostics.get("exception_detail", str(exc))
+                        )[:500],
+                        exception_chain=sanitize_text(
+                            diagnostics.get("exception_chain", type(exc).__name__)
+                        )[:500],
+                        traceback_summary=sanitize_text(
+                            diagnostics.get("traceback_summary", "")
+                        )[:500],
+                        worker_id=getattr(exc, "ocr_worker_id", None),
                         duration_ms=round(timings["total"] * 1000),
                     )
                     raise
@@ -1546,13 +1581,7 @@ class CameraOCRScreenStateProvider:
             paddle_language=paddle_language,
             recognition_model=recognition_model,
             ocr_scope="roi" if scope.startswith("roi:") else scope,
-            recognition_results=[
-                {
-                    "text": sanitize_text(item["text"])[:80],
-                    "confidence": round(item["confidence"], 2),
-                }
-                for item in candidates[:10]
-            ],
+            recognition_result_count=len(candidates),
             confidence_scores=[
                 round(item["confidence"], 2) for item in candidates[:10]
             ],

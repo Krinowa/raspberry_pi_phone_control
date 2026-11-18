@@ -2401,21 +2401,22 @@
   $("record-new").addEventListener("click", () => $("record-start").click());
 
   async function openSpecialCaseSetup(afterStepId = null, options = {}) {
-    if (alternateSetupOpen) {
-      show("Finish or cancel the current Special Case setup first.", true);
-      return;
-    }
-
     if (recording.alternate_screen) {
       show("Finish the current Special Case before adding another one.", true);
       return;
     }
 
+    const replacingDraft = alternateSetupOpen;
     const startedFromReview = !!afterStepId || !!options.conditionId;
 
-    enabledManualForReviewSpecialCase = false;
+    if (!replacingDraft) enabledManualForReviewSpecialCase = false;
 
-    if (startedFromReview && (piManual() || backend !== "mock") && !active()) {
+    if (
+      startedFromReview &&
+      !enabledManualForReviewSpecialCase &&
+      (piManual() || backend !== "mock") &&
+      !active()
+    ) {
       const enabled = await enableManualControl();
 
       if (!enabled) {
@@ -2441,7 +2442,11 @@
     $("condition-text-advanced").open = false;
 
     renderRecording();
-    $("condition-text-value").focus();
+    $(
+      $("condition-source").value === "withdrawal_api"
+        ? "condition-transfer-method"
+        : "condition-text-value",
+    ).focus();
 
     if (startedFromReview) {
       show(
@@ -2852,6 +2857,7 @@
         returnToVariableInput = false;
         alternateSetupOpen = false;
         specialCaseAfterStepId = null;
+        specialCaseConditionId = null;
 
         recording = await api("/api/recorder/start", {
           name: "New Recording",
@@ -2899,6 +2905,7 @@
         returnToVariableInput = false;
         alternateSetupOpen = false;
         specialCaseAfterStepId = null;
+        specialCaseConditionId = null;
         closeExpectedText();
         if (piManual() || backend !== "mock") await disable();
         show(
@@ -2938,6 +2945,7 @@
       returnToVariableInput = false;
       alternateSetupOpen = false;
       specialCaseAfterStepId = null;
+      specialCaseConditionId = null;
 
       closeExpectedText();
 
@@ -2977,6 +2985,7 @@
       liveWaitOpen = false;
       alternateSetupOpen = false;
       specialCaseAfterStepId = null;
+      specialCaseConditionId = null;
 
       show(editingExisting ? "Workflow updated" : "Workflow saved");
 

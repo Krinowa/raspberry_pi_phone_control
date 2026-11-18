@@ -6,7 +6,9 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -261,6 +263,91 @@ def _validate_smoke_report(report_path, compiled_modules):
             raise RuntimeError(
                 f"Frozen {language} PaddleOCR worker/model smoke check failed."
             )
+    inference_results = report.get("ocr_inference_results")
+    if not isinstance(inference_results, list) or not all(
+        isinstance(item, dict) for item in inference_results
+    ):
+        raise RuntimeError("Frozen OCR inference smoke checks were not reported.")
+    expected_inference_languages = {"en", "zh-HK", "ms"}
+    reported_inference_languages = {
+        item.get("language") for item in inference_results if isinstance(item, dict)
+    }
+    if reported_inference_languages != expected_inference_languages:
+        raise RuntimeError(
+            "Frozen OCR inference smoke checks were incomplete: "
+            f"{sorted(reported_inference_languages)!r}."
+        )
+    expected_models = {
+        "en": "en_PP-OCRv5_mobile_rec",
+        "zh-HK": "PP-OCRv5_mobile_rec",
+        "ms": "latin_PP-OCRv5_mobile_rec",
+    }
+    for item in inference_results:
+        if (
+            type(item.get("result_batch_count")) is not int
+            or item["result_batch_count"] < 1
+            or type(item.get("region_count")) is not int
+            or item["region_count"] < 1
+            or type(item.get("inference_ms")) not in (int, float)
+            or not math.isfinite(item["inference_ms"])
+            or item["inference_ms"] < 0
+            or not isinstance(item.get("worker_id"), int)
+        ):
+            raise RuntimeError(
+                "Frozen OCR inference smoke check returned invalid diagnostics."
+            )
+        if item.get("recognition_model") != expected_models[item["language"]]:
+            raise RuntimeError(
+                "Frozen OCR inference used an unexpected recognition model."
+            )
+        if item.get("fixture_matched") is not True or item.get("console_streams_absent") is not True:
+            raise RuntimeError("Frozen OCR fixture/absent-stream validation failed.")
+    if report.get("console_streams_absent") is not True:
+        raise RuntimeError("Frozen windowed application had console streams.")
+    recovery = report.get("ocr_recovery", {})
+    roi_reports = report.get("roi_api", {})
+    if set(recovery) != expected_inference_languages or set(roi_reports) != expected_inference_languages:
+        raise RuntimeError("Frozen OCR recovery/ROI checks were incomplete.")
+    for language in expected_inference_languages:
+        item = recovery[language]
+        subsequent = item.get("subsequent_results", [])
+        status = item.get("status", {})
+        if (
+            not item.get("controlled_error", {}).get("wrapper_type")
+            or len(subsequent) != 3
+            or any(result.get("fixture_matched") is not True or result.get("console_streams_absent") is not True for result in subsequent)
+            or status.get("busy_workers") != 0
+            or status.get("queued_requests") != 0
+        ):
+            raise RuntimeError(f"Frozen {language} OCR recovery check failed.")
+        roi = roi_reports[language]
+        if (
+            len(roi) != 3
+            or [result.get("found") for result in roi] != [True, False, True]
+            or any(result.get("status_code") != 200 for result in roi)
+        ):
+            raise RuntimeError(f"Frozen {language} ROI API check failed.")
+    if report.get("runtime_model_download_count") != 0:
+        raise RuntimeError("Frozen OCR attempted to create runtime model downloads.")
+    shutdown_statuses = report.get("ocr_shutdown_statuses")
+    if not isinstance(shutdown_statuses, dict) or set(shutdown_statuses) != {
+        "en",
+        "zh-HK",
+        "ms",
+    }:
+        raise RuntimeError("Frozen OCR shutdown checks were incomplete.")
+    for language, status in shutdown_statuses.items():
+        workers = status.get("workers", []) if isinstance(status, dict) else []
+        if (
+            status.get("accepting") is not False
+            or status.get("busy_workers") != 0
+            or status.get("queued_requests") != 0
+            or not workers
+            or any(worker.get("pid") is not None for worker in workers)
+        ):
+            raise RuntimeError(
+                f"Frozen {language} OCR shutdown check did not succeed."
+            )
     endpoint_statuses = {
         item.get("endpoint"): item.get("status_code")
         for item in report.get("endpoints", [])
@@ -271,12 +358,29 @@ def _validate_smoke_report(report_path, compiled_modules):
         "/api/status": 200,
         "/static/app.js": 200,
         "/static/i18n.js": 200,
+        "/static/workflows.js": 200,
         "/static/style.css": 200,
+        "/api/workflow-options/transfer-methods": 200,
     }
     if endpoint_statuses != expected_endpoints:
         raise RuntimeError(
             "Frozen Flask endpoint checks were incomplete or unsuccessful: "
             f"{endpoint_statuses!r}."
+        )
+    http_health = report.get("http_health")
+    if not isinstance(http_health, dict) or (
+        http_health.get("status_code") != 200
+        or http_health.get("thread_stopped") is not True
+    ):
+        raise RuntimeError("Frozen local HTTP listener health check did not succeed.")
+    if report.get("transfer_method_values") != [
+        "bank_account",
+        "email",
+        "fps_id",
+        "phone_no",
+    ]:
+        raise RuntimeError(
+            "Frozen transfer-method registry check was incomplete or unsuccessful."
         )
     expected_remoteviewer_routes = {
         ("/agent/v1/devices/<device_id>/frames", "GET"),
@@ -325,37 +429,59 @@ def _run_frozen_smoke_test(executable, compiled_modules):
         environment["PHONE_CONTROLLER_PACKAGE_SMOKE_EARLY_REPORT"] = os.fspath(
             early_report_path
         )
-        environment["PHONE_CONTROLLER_PACKAGE_SMOKE_STDOUT"] = os.fspath(stdout_path)
-        environment["PHONE_CONTROLLER_PACKAGE_SMOKE_STDERR"] = os.fspath(stderr_path)
+        # Keep the windowed bootloader's absent streams in parent AND children.
+        environment.pop("PHONE_CONTROLLER_PACKAGE_SMOKE_STDOUT", None)
+        environment.pop("PHONE_CONTROLLER_PACKAGE_SMOKE_STDERR", None)
         environment["CAMERA_OCR_LANGUAGE"] = "zh-HK"
         environment["CAMERA_OCR_WORKER_POOL_SIZE"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["HTTP_PROXY"] = "http://127.0.0.1:9"
+        environment["HTTPS_PROXY"] = "http://127.0.0.1:9"
+        environment["ALL_PROXY"] = "http://127.0.0.1:9"
+        environment["NO_PROXY"] = "127.0.0.1,localhost"
+        completed = None
         try:
-            completed = subprocess.run(
-                command,
-                cwd=executable.parent,
-                env=environment,
-                timeout=240,
-                check=False,
-                capture_output=True,
-                text=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                "Frozen application UI/API smoke test timed out.\n\n"
-                + _smoke_failure_details(
-                    command=command,
+            try:
+                completed = subprocess.run(
+                    command,
                     cwd=executable.parent,
-                    exit_code="<timed out after 240 seconds>",
-                    stdout=exc.stdout,
-                    stderr=exc.stderr,
-                    diagnostic_paths=diagnostic_paths,
+                    env=environment,
+                    timeout=240,
+                    check=False,
+                    capture_output=True,
+                    text=False,
                 )
-            ) from exc
-        try:
-            if completed.returncode != 0:
+            except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
-                    "Frozen application UI/API smoke test failed.\n\n"
+                    "Frozen application UI/API smoke test timed out.\n\n"
+                    + _smoke_failure_details(
+                        command=command,
+                        cwd=executable.parent,
+                        exit_code="<timed out after 240 seconds>",
+                        stdout=exc.stdout,
+                        stderr=exc.stderr,
+                        diagnostic_paths=diagnostic_paths,
+                    )
+                ) from exc
+            try:
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        "Frozen application UI/API smoke test failed.\n\n"
+                        + _smoke_failure_details(
+                            command=command,
+                            cwd=executable.parent,
+                            exit_code=completed.returncode,
+                            stdout=completed.stdout,
+                            stderr=completed.stderr,
+                            diagnostic_paths=diagnostic_paths,
+                        )
+                    )
+                report = _validate_smoke_report(report_path, compiled_modules)
+            except RuntimeError as exc:
+                if "Frozen application UI/API smoke test failed" in str(exc):
+                    raise
+                raise RuntimeError(
+                    f"{exc}\n\n"
                     + _smoke_failure_details(
                         command=command,
                         cwd=executable.parent,
@@ -364,27 +490,35 @@ def _run_frozen_smoke_test(executable, compiled_modules):
                         stderr=completed.stderr,
                         diagnostic_paths=diagnostic_paths,
                     )
+                ) from exc
+        finally:
+            diagnostics_value = os.environ.get(
+                "PHONE_CONTROLLER_PACKAGE_DIAGNOSTICS_DIR", ""
+            ).strip()
+            if diagnostics_value:
+                diagnostics_root = Path(diagnostics_value).resolve()
+                diagnostics_root.mkdir(parents=True, exist_ok=True)
+                for label, path in diagnostic_paths:
+                    if path.is_file():
+                        filename = label.replace(" ", "-") + path.suffix
+                        shutil.copy2(path, diagnostics_root / filename)
+                process_report = {
+                    "command": [os.fspath(item) for item in command],
+                    "return_code": (
+                        completed.returncode if completed is not None else None
+                    ),
+                }
+                (diagnostics_root / "frozen-smoke-process.json").write_text(
+                    json.dumps(process_report, indent=2, sort_keys=True),
+                    encoding="utf-8",
                 )
-            report = _validate_smoke_report(report_path, compiled_modules)
-        except RuntimeError as exc:
-            if "Frozen application UI/API smoke test failed" in str(exc):
-                raise
-            raise RuntimeError(
-                f"{exc}\n\n"
-                + _smoke_failure_details(
-                    command=command,
-                    cwd=executable.parent,
-                    exit_code=completed.returncode,
-                    stdout=completed.stdout,
-                    stderr=completed.stderr,
-                    diagnostic_paths=diagnostic_paths,
-                )
-            ) from exc
         print(
             "Frozen application smoke test verified: "
             f"native_modules={len(report['compiled_imports'])} "
             "multiprocessing_exit_code=0 "
-            "endpoints=/,/api/status,/static/app.js,/static/i18n.js,/static/style.css "
+            "endpoints=/,/api/status,/static/app.js,/static/i18n.js,"
+            "/static/workflows.js,/static/style.css,"
+            "/api/workflow-options/transfer-methods "
             "remoteviewer_routes=9"
         )
 

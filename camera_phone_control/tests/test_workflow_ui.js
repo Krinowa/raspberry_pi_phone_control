@@ -202,29 +202,52 @@ function setup(pi = false, options = {}) {
         draft.workflow.steps,
         draft.alternate_screen?.condition_id,
       );
-      (alternate?.then_steps || draft.workflow.steps).push(inputStep);
-      if (alternate) draft.alternate_screen.step_count = alternate.then_steps.length;
+      const destination =
+        alternate?.type === "switch_transfer_method"
+          ? alternate.branches[draft.alternate_screen.branch]
+          : alternate?.then_steps || draft.workflow.steps;
+      destination.push(inputStep);
+      if (alternate) draft.alternate_screen.step_count = destination.length;
       return structuredClone(draft);
     }
     if (url === "/api/recorder/alternate-screen/start") {
-      const condition = {
-        id: `alternate_${calls.length}`,
-        type: "if_text",
-        text: data.text,
-        timeout_seconds: data.timeout_seconds,
-        then_steps: [],
-        else_steps: [],
-        ...(data.roi ? { roi: structuredClone(data.roi) } : {}),
-      };
-      const afterIndex = data.after_step_id
-        ? draft.workflow.steps.findIndex((step) => step.id === data.after_step_id)
-        : draft.workflow.steps.length - 1;
-      draft.workflow.steps.splice(afterIndex + 1, 0, condition);
+      let condition;
+      if (data.source === "withdrawal_api") {
+        condition = data.condition_id
+          ? findStep(draft.workflow.steps, data.condition_id)
+          : null;
+        if (!condition) {
+          condition = {
+            id: `alternate_${calls.length}`,
+            type: "switch_transfer_method",
+            branches: {},
+          };
+          draft.workflow.steps.push(condition);
+        }
+        condition.branches[data.transfer_method] ||= [];
+      } else {
+        condition = {
+          id: `alternate_${calls.length}`,
+          type: "if_text",
+          text: data.text,
+          timeout_seconds: data.timeout_seconds,
+          then_steps: [],
+          else_steps: [],
+          ...(data.roi ? { roi: structuredClone(data.roi) } : {}),
+        };
+        const afterIndex = data.after_step_id
+          ? draft.workflow.steps.findIndex((step) => step.id === data.after_step_id)
+          : draft.workflow.steps.length - 1;
+        draft.workflow.steps.splice(afterIndex + 1, 0, condition);
+      }
       const returnMode = draft.active ? "recording" : "review";
       draft.active = true;
       draft.alternate_screen = {
         condition_id: condition.id,
-        text: condition.text,
+        source: data.source || "screen_text",
+        ...(data.source === "withdrawal_api"
+          ? { branch: data.transfer_method }
+          : { text: condition.text }),
         step_count: 0,
         return_mode: returnMode,
         after_step_id: data.after_step_id || null,
@@ -301,8 +324,12 @@ function setup(pi = false, options = {}) {
         draft.workflow.steps,
         draft.alternate_screen?.condition_id,
       );
-      (alternate?.then_steps || draft.workflow.steps).push(recordedStep);
-      if (alternate) draft.alternate_screen.step_count = alternate.then_steps.length;
+      const destination =
+        alternate?.type === "switch_transfer_method"
+          ? alternate.branches[draft.alternate_screen.branch]
+          : alternate?.then_steps || draft.workflow.steps;
+      destination.push(recordedStep);
+      if (alternate) draft.alternate_screen.step_count = destination.length;
     }
     if (url === "/api/recorder/stop") {
       draft.active = false;
@@ -482,6 +509,7 @@ function setup(pi = false, options = {}) {
   return {
     $,
     calls,
+    draft: () => structuredClone(draft),
     context,
     events,
     key,
@@ -2338,6 +2366,133 @@ test("Add Special Case during main recording routes actions and returns to main 
   assert.doesNotMatch(templateSource, /Add Another Screen|>Another Screen</);
   assert.doesNotMatch(templateSource, /id="insert-target"/);
   assert.doesNotMatch(templateSource, />\s*(?:IF|THEN|ELSE)\s*</);
+});
+
+test("open screen-text setup can be replaced by transfer-method branch drafts", async () => {
+  const existingBankStep = {
+    id: "bank_existing",
+    type: "tap",
+    x: 0.25,
+    y: 0.3,
+  };
+  const ui = setup(false, {
+    draft: {
+      active: false,
+      editing_existing: true,
+      workflow: {
+        id: "flow_transfer_branches",
+        name: "Transfer branches",
+        purpose: "payment",
+        variables: [],
+        keyboards: {},
+        steps: [
+          { id: "main_tap", type: "tap", x: 0.5, y: 0.5 },
+          {
+            id: "method_switch",
+            type: "switch_transfer_method",
+            branches: {
+              bank_account: [existingBankStep],
+              phone_no: [],
+              email: [],
+              fps_id: [],
+            },
+          },
+        ],
+      },
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const row = (id) =>
+    ui.$("record-steps").children.find((item) => item.dataset.stepId === id);
+  const branchButton = (methodIndex) => {
+    const branches = row("method_switch").children.find(
+      (item) => item.className === "condition-branches",
+    );
+    return branches.children[methodIndex].children.at(-1);
+  };
+  const clickButton = async (button) => {
+    await button.listeners.click();
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+
+  const mainActions = row("main_tap").children.at(-1);
+  await clickButton(
+    mainActions.children.find(
+      (button) => button.textContent === "+ Add Special Case",
+    ),
+  );
+  ui.$("condition-text-value").value = "Temporary screen-text draft";
+  const beforeReplacement = ui.draft().workflow.steps;
+
+  await clickButton(branchButton(0));
+  assert.equal(ui.$("condition-source").value, "withdrawal_api");
+  assert.equal(ui.$("condition-transfer-method").value, "bank_account");
+  assert.deepEqual(ui.draft().workflow.steps, beforeReplacement);
+  assert.doesNotMatch(
+    ui.$("workflow-notice").textContent,
+    /Finish or cancel the current Special Case setup first/,
+  );
+
+  await ui.fire("alternate-screen-start", "click");
+  let starts = ui.calls.filter(
+    (call) => call.url === "/api/recorder/alternate-screen/start",
+  );
+  assert.deepEqual(starts[0].data, {
+    source: "withdrawal_api",
+    transfer_method: "bank_account",
+    condition_id: "method_switch",
+  });
+  await ui.fire("workflow-preview", "pointerdown", {
+    clientX: 150,
+    clientY: 350,
+  });
+  await ui.fire("workflow-preview", "pointerup", {
+    clientX: 150,
+    clientY: 350,
+  });
+  await ui.fire("alternate-screen-finish", "click");
+
+  await clickButton(branchButton(1));
+  assert.equal(ui.$("condition-transfer-method").value, "phone_no");
+  await ui.fire("alternate-screen-start", "click");
+
+  const guardedEmailButton = branchButton(2);
+  await clickButton(guardedEmailButton);
+  assert.match(
+    ui.$("workflow-notice").textContent,
+    /Finish the current Special Case before adding another one/,
+  );
+  assert.equal(ui.$("condition-transfer-method").value, "phone_no");
+
+  await ui.fire("workflow-preview", "pointerdown", {
+    clientX: 250,
+    clientY: 350,
+  });
+  await ui.fire("workflow-preview", "pointerup", {
+    clientX: 250,
+    clientY: 350,
+  });
+  await ui.fire("alternate-screen-finish", "click");
+
+  starts = ui.calls.filter(
+    (call) => call.url === "/api/recorder/alternate-screen/start",
+  );
+  assert.deepEqual(
+    starts.map((call) => call.data.transfer_method),
+    ["bank_account", "phone_no"],
+  );
+  const methodSwitch = ui
+    .draft()
+    .workflow.steps.find((step) => step.id === "method_switch");
+  assert.deepEqual(
+    methodSwitch.branches.bank_account.map((step) => step.id),
+    ["bank_existing", "step_3"],
+  );
+  assert.deepEqual(
+    methodSwitch.branches.phone_no.map((step) => step.id),
+    ["step_3"],
+  );
 });
 
 test("review Special Case records only nested actions and returns safely to review", async () => {
