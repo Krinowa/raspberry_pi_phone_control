@@ -109,6 +109,19 @@ class FrozenLauncherSmokeTests(unittest.TestCase):
                 {"inference": .01, "worker_pid": 123, "console_streams_absent": True},
             )
             self.assertTrue(_package_smoke_ocr_inference(provider, language, image, expected)["fixture_matched"])
+            pool.request.return_value = (
+                [{"rec_texts": ["Pemindahan berjaye"]}],
+                {"inference": .01, "worker_pid": 123, "console_streams_absent": True},
+            )
+            variable_result = _package_smoke_ocr_inference(
+                provider,
+                language,
+                image,
+                expected,
+                require_expected_match=False,
+            )
+            self.assertTrue(variable_result["fixture_recognized"])
+            self.assertFalse(variable_result["fixture_matched"])
             pool.request.return_value[1]["console_streams_absent"] = False
             with self.assertRaisesRegex(RuntimeError, "absent console"):
                 _package_smoke_ocr_inference(provider, language, image, expected)

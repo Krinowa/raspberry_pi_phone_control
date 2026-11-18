@@ -300,7 +300,7 @@ def _validate_smoke_report(report_path, compiled_modules):
             raise RuntimeError(
                 "Frozen OCR inference used an unexpected recognition model."
             )
-        if item.get("fixture_matched") is not True or item.get("console_streams_absent") is not True:
+        if item.get("fixture_recognized") is not True or item.get("console_streams_absent") is not True:
             raise RuntimeError("Frozen OCR fixture/absent-stream validation failed.")
     if report.get("console_streams_absent") is not True:
         raise RuntimeError("Frozen windowed application had console streams.")

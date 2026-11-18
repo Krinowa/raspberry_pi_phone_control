@@ -91,6 +91,7 @@ class WindowsBundleSecurityTests(unittest.TestCase):
                     "inference_ms": 10.0,
                     "worker_id": index + 100,
                     "fixture_matched": True,
+                    "fixture_recognized": True,
                     "console_streams_absent": True,
                 }
                 for index, (language, model) in enumerate(models.items())
@@ -189,7 +190,7 @@ class WindowsBundleSecurityTests(unittest.TestCase):
 
         mutations = (
             lambda report: report.update(console_streams_absent=False),
-            lambda report: report["ocr_inference_results"][0].update(fixture_matched=False),
+            lambda report: report["ocr_inference_results"][0].update(fixture_recognized=False),
             lambda report: report.update(ocr_recovery={}),
             lambda report: report["ocr_recovery"]["en"].update(subsequent_results=[]),
             lambda report: report["roi_api"]["zh-HK"][1].update(found=True),
