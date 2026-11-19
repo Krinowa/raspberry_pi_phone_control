@@ -2205,8 +2205,12 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         )
         return context.input, calibration
 
-    def text_input(device_id, bridge, value):
-        """Type one RemoteViewer value through the phone's captured keyboard."""
+    def text_input(device_id, bridge, value, keyboard_type=None):
+        """Type one RemoteViewer value through the phone's captured keyboard.
+
+        keyboard_type "numeric"/"normal" picks the numeric/alphabetic captured
+        keyboard; None (older agents) keeps guessing from the text itself.
+        """
         assignment_store = app.extensions["device_workflow_assignment_store"]
         workflow_id = assignment_store.remote_text_workflow(device_id)
         if workflow_id is None:
@@ -2222,7 +2226,12 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
                 and all(character in "0123456789." for character in typed_value)
                 and typed_value.count(".") <= 1
             )
-            preferred_kind = "numeric" if numeric_text else "alphabetic"
+            if keyboard_type is None:
+                preferred_kind = "numeric" if numeric_text else "alphabetic"
+            else:
+                preferred_kind = (
+                    "numeric" if keyboard_type == "numeric" else "alphabetic"
+                )
             matching_ids = [
                 candidate_id
                 for candidate_id, candidate in workflow["keyboards"].items()

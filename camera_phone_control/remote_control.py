@@ -45,6 +45,9 @@ LOCK_POLL_SECONDS = 0.1
 MAX_ID_LENGTH = 64
 MAX_REASON_LENGTH = 200
 MAX_TEXT_LENGTH = 200
+# Optional "keyboard" on text input: which captured keyboard types the value.
+TEXT_KEYBOARDS = {"normal", "numeric"}
+NUMERIC_TEXT_CHARACTERS = frozenset("0123456789 +-.,*#")
 HISTORY_LIMIT = 200
 
 KEYS = {
@@ -102,6 +105,8 @@ def validate_input(data):
         "back": set(),
         "wake": set(),
     }.get(kind)
+    if kind == "text" and "keyboard" in data:
+        fields = fields | {"keyboard"}
     if fields is None or set(data) != fields | {"session_id", "type"}:
         raise Refused(400, "invalid_input")
     if kind in {"tap", "swipe"} and not all(
@@ -114,6 +119,11 @@ def validate_input(data):
         raise Refused(400, "invalid_input")
     if kind == "text" and not _plain(data["text"], MAX_TEXT_LENGTH):
         raise Refused(400, "invalid_input")
+    if kind == "text" and "keyboard" in data:
+        if data["keyboard"] not in TEXT_KEYBOARDS:
+            raise Refused(400, "invalid_input")
+        if data["keyboard"] == "numeric" and not set(data["text"]) <= NUMERIC_TEXT_CHARACTERS:
+            raise Refused(400, "invalid_input")
     if kind == "key" and data["key"] not in KEYS:
         raise Refused(400, "invalid_input")
 
@@ -506,7 +516,9 @@ class RemoteControl:
                 if data["type"] == "text":
                     if self.text_input is None:
                         raise Refused(409, "text_unavailable")
-                    self.text_input(device_id, bridge, data["text"])
+                    self.text_input(
+                        device_id, bridge, data["text"], data.get("keyboard")
+                    )
                     performed = True
                 else:
                     performed = perform_input(bridge, calibration, data)
@@ -534,8 +546,11 @@ class RemoteControl:
                         self._close_lock(session)
             session.inputs += 1
             LOG.info(
-                "Remote input %s on %s by %s (session %s)%s",
+                "Remote input %s%s on %s by %s (session %s)%s",
                 data["type"],
+                f" (keyboard {data.get('keyboard') or 'auto'})"
+                if data["type"] == "text"
+                else "",
                 device_id,
                 session.user_id,
                 session.session_id,
