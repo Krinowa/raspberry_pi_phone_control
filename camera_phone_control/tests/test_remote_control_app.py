@@ -215,6 +215,26 @@ def test_non_text_input_reaches_the_pi_through_the_workflow_input_bridge(dashboa
     assert status["active"][0]["user_id"] == "tester"
 
 
+def test_text_reports_when_remote_paste_workflow_is_unassigned(dashboard):
+    takeover = {
+        "session_id": "s1",
+        "user_id": "tester",
+        "reason": "paste account number",
+        "allow_during_job": False,
+    }
+    assert (
+        dashboard.client.post(BASE + "/takeover", json=takeover, headers=AUTH).status_code
+        == 200
+    )
+    response = dashboard.client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "text", "text": "120"},
+        headers=AUTH,
+    )
+    assert response.status_code == 409
+    assert response.get_json() == {"error": "text_unassigned"}
+
+
 def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
     from automation.workflows.models import new_workflow
 

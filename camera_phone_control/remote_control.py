@@ -505,7 +505,7 @@ class RemoteControl:
             try:
                 if data["type"] == "text":
                     if self.text_input is None:
-                        raise Refused(409, "workflow_text_unavailable")
+                        raise Refused(409, "text_unavailable")
                     self.text_input(device_id, bridge, data["text"])
                     performed = True
                 else:

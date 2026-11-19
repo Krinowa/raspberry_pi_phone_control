@@ -2210,7 +2210,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         assignment_store = app.extensions["device_workflow_assignment_store"]
         workflow_id = assignment_store.remote_text_workflow(device_id)
         if workflow_id is None:
-            raise remote_control.Refused(409, "workflow_text_unassigned")
+            raise remote_control.Refused(409, "text_unassigned")
         try:
             workflow, step, definition = remote_text_input_workflow(
                 app.extensions["workflow_storage"].read(workflow_id)
@@ -2221,7 +2221,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
             # This validates the complete value before the first screen tap.
             type_with_screen_keyboard(bridge, time.sleep, keyboard, typed_value)
         except FileNotFoundError:
-            raise remote_control.Refused(409, "workflow_text_invalid") from None
+            raise remote_control.Refused(409, "text_invalid") from None
         except ValueError:
             raise remote_control.Refused(422, "unsupported_input") from None
 

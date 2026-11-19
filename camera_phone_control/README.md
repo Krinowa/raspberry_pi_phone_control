@@ -836,7 +836,7 @@ under *Remote Paste Workflow*, then send:
 
 The complete value is checked against the captured keys before the first tap.
 Alphabetic keyboards use their captured Shift and `?123`/`ABC` toggles when
-needed. `409 workflow_text_unassigned` means the phone has no assignment;
+needed. `409 text_unassigned` means the phone has no assignment;
 invalid values answer `422 unsupported_input`. The value is not saved in the
 workflow, logs, or remote-control history.
 

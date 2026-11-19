@@ -439,6 +439,14 @@ def test_text_uses_the_assigned_keyboard_callback_without_direct_text(env):
     assert text not in Path(env.remote.history.path).read_text()
 
 
+def test_text_reports_unavailable_when_no_keyboard_handler_is_configured(env):
+    assert takeover(env.client).status_code == 200
+    env.remote.text_input = None
+    response = send(env.client, type="text", text="123")
+    assert response.status_code == 409
+    assert response.get_json() == {"error": "text_unavailable"}
+
+
 def test_keys_and_buttons(env):
     assert takeover(env.client).status_code == 200
     for key in (
