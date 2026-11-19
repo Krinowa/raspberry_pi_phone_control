@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ MAX_ID_LENGTH = 64
 MAX_REASON_LENGTH = 200
 MAX_TEXT_LENGTH = 200
 HISTORY_LIMIT = 200
+KEYBOARD_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,79}")
 
 KEYS = {
     "enter": "ENTER",
@@ -102,7 +104,9 @@ def validate_input(data):
         "back": set(),
         "wake": set(),
     }.get(kind)
-    if fields is None or set(data) != fields | {"session_id", "type"}:
+    required = fields | {"session_id", "type"} if fields is not None else set()
+    allowed = required | ({"keyboard_id"} if kind == "text" else set())
+    if fields is None or not required <= set(data) or not set(data) <= allowed:
         raise Refused(400, "invalid_input")
     if kind in {"tap", "swipe"} and not all(
         _fraction(data[name]) for name in fields - {"duration_ms"}
@@ -113,6 +117,11 @@ def validate_input(data):
     ):
         raise Refused(400, "invalid_input")
     if kind == "text" and not _plain(data["text"], MAX_TEXT_LENGTH):
+        raise Refused(400, "invalid_input")
+    if "keyboard_id" in data and (
+        not isinstance(data["keyboard_id"], str)
+        or KEYBOARD_ID.fullmatch(data["keyboard_id"]) is None
+    ):
         raise Refused(400, "invalid_input")
     if kind == "key" and data["key"] not in KEYS:
         raise Refused(400, "invalid_input")
@@ -506,7 +515,12 @@ class RemoteControl:
                 if data["type"] == "text":
                     if self.text_input is None:
                         raise Refused(409, "text_unavailable")
-                    self.text_input(device_id, bridge, data["text"])
+                    self.text_input(
+                        device_id,
+                        bridge,
+                        data["text"],
+                        data.get("keyboard_id"),
+                    )
                     performed = True
                 else:
                     performed = perform_input(bridge, calibration, data)

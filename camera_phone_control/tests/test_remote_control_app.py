@@ -258,7 +258,16 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
                 "1": {"x": 0.2, "y": 0.7},
                 "2": {"x": 0.5, "y": 0.7},
             },
-        }
+        },
+        "name_keys": {
+            "id": "name_keys",
+            "name": "Beneficiary name keyboard",
+            "kind": "alphabetic",
+            "keys": {
+                "a": {"x": 0.1, "y": 0.6},
+                "b": {"x": 0.4, "y": 0.6},
+            },
+        },
     }
     workflow["steps"] = [
         {
@@ -298,6 +307,22 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
         ("phone_A", "tap", 0.5, 0.9),
     ]
 
+    alternate = dashboard.client.post(
+        BASE + "/input",
+        json={
+            "session_id": "s1",
+            "type": "text",
+            "text": "ba",
+            "keyboard_id": "name_keys",
+        },
+        headers=AUTH,
+    )
+    assert alternate.status_code == 200, alternate.get_json()
+    assert FakePi.sent[-2:] == [
+        ("phone_A", "tap", 0.4, 0.6),
+        ("phone_A", "tap", 0.1, 0.6),
+    ]
+
     before = list(FakePi.sent)
     unsupported = dashboard.client.post(
         BASE + "/input",
@@ -305,6 +330,19 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
         headers=AUTH,
     )
     assert unsupported.status_code == 422
+    assert FakePi.sent == before
+    unknown_keyboard = dashboard.client.post(
+        BASE + "/input",
+        json={
+            "session_id": "s1",
+            "type": "text",
+            "text": "12",
+            "keyboard_id": "missing_keys",
+        },
+        headers=AUTH,
+    )
+    assert unknown_keyboard.status_code == 422
+    assert unknown_keyboard.get_json() == {"error": "unsupported_input"}
     assert FakePi.sent == before
     assert "120" not in dashboard.app.extensions[
         "remote_control"

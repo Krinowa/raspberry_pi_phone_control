@@ -94,8 +94,10 @@ def env(tmp_path, monkeypatch):
         open_input=lambda device_id: (bridge, flags.calibration),
         read_screen=lambda device_id: flags.calibration,
         save_screen=save_screen,
-        text_input=lambda device_id, input_bridge, value: (
-            flags.workflow_texts.append((device_id, input_bridge, value))
+        text_input=lambda device_id, input_bridge, value, keyboard_id: (
+            flags.workflow_texts.append(
+                (device_id, input_bridge, value, keyboard_id)
+            )
         ),
         lease_seconds=0.6,
         input_wait_seconds=3.0,
@@ -435,7 +437,7 @@ def test_text_uses_the_assigned_keyboard_callback_without_direct_text(env):
     text = "'; $(reboot) \" `id` & echo"
     assert send(env.client, type="text", text=text).status_code == 200
     assert env.bridge.calls == []
-    assert env.flags.workflow_texts == [("phone_A", env.bridge, text)]
+    assert env.flags.workflow_texts == [("phone_A", env.bridge, text, None)]
     assert text not in Path(env.remote.history.path).read_text()
 
 
@@ -445,6 +447,20 @@ def test_text_reports_unavailable_when_no_keyboard_handler_is_configured(env):
     response = send(env.client, type="text", text="123")
     assert response.status_code == 409
     assert response.get_json() == {"error": "text_unavailable"}
+
+
+def test_text_passes_an_optional_saved_keyboard_id(env):
+    assert takeover(env.client).status_code == 200
+    response = send(
+        env.client,
+        type="text",
+        text="123",
+        keyboard_id="account_numeric",
+    )
+    assert response.status_code == 200
+    assert env.flags.workflow_texts == [
+        ("phone_A", env.bridge, "123", "account_numeric")
+    ]
 
 
 def test_keys_and_buttons(env):
@@ -492,6 +508,8 @@ def test_keys_and_buttons(env):
         {"type": "text", "text": ""},
         {"type": "text", "text": "line\nbreak"},
         {"type": "text", "text": "x" * 201},
+        {"type": "text", "text": "123", "keyboard_id": "bad id"},
+        {"type": "text", "text": "123", "keyboard_id": "1numeric"},
         {"type": "workflow_text", "text": "valid but obsolete type"},
         {"type": "key", "key": "f1"},
         {"type": "home", "extra": 1},
@@ -513,7 +531,7 @@ def test_uncalibrated_phone_refuses_points_but_not_buttons(env):
     assert send(env.client, type="home").status_code == 200
     assert send(env.client, type="text", text="abc").status_code == 200
     assert env.bridge.calls == [("key", "HOME")]
-    assert env.flags.workflow_texts == [("phone_A", env.bridge, "abc")]
+    assert env.flags.workflow_texts == [("phone_A", env.bridge, "abc", None)]
 
 
 def test_input_waits_until_the_stopped_job_lets_go(env):

@@ -2205,7 +2205,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         )
         return context.input, calibration
 
-    def text_input(device_id, bridge, value):
+    def text_input(device_id, bridge, value, keyboard_id=None):
         """Type one RemoteViewer value through the phone's captured keyboard."""
         assignment_store = app.extensions["device_workflow_assignment_store"]
         workflow_id = assignment_store.remote_text_workflow(device_id)
@@ -2217,7 +2217,10 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
             )
             resolved = resolve_variables(workflow, {definition["name"]: value})
             typed_value = format_input_value(step, resolved[definition["name"]])
-            keyboard = workflow["keyboards"][step["keyboard_id"]]
+            selected_keyboard_id = keyboard_id or step["keyboard_id"]
+            keyboard = workflow["keyboards"].get(selected_keyboard_id)
+            if keyboard is None:
+                raise remote_control.Refused(422, "unsupported_input")
             # This validates the complete value before the first screen tap.
             type_with_screen_keyboard(bridge, time.sleep, keyboard, typed_value)
         except FileNotFoundError:

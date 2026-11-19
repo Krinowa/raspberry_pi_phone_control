@@ -830,9 +830,14 @@ under *Remote Paste Workflow*, then send:
 {
   "session_id": "the-takeover-session",
   "type": "text",
-  "text": "001234567890"
+  "text": "001234567890",
+  "keyboard_id": "account_numeric"
 }
 ```
+
+`keyboard_id` selects any saved keyboard map in the assigned Remote Paste
+workflow. Omit it to use the keyboard selected by that workflow's input step.
+Malformed or unknown keyboard IDs are rejected before any input is sent.
 
 The complete value is checked against the captured keys before the first tap.
 Alphabetic keyboards use their captured Shift and `?123`/`ABC` toggles when
