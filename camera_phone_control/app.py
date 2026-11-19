@@ -2205,7 +2205,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         )
         return context.input, calibration
 
-    def text_input(device_id, bridge, value, keyboard_id=None):
+    def text_input(device_id, bridge, value):
         """Type one RemoteViewer value through the phone's captured keyboard."""
         assignment_store = app.extensions["device_workflow_assignment_store"]
         workflow_id = assignment_store.remote_text_workflow(device_id)
@@ -2217,26 +2217,24 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
             )
             resolved = resolve_variables(workflow, {definition["name"]: value})
             typed_value = format_input_value(step, resolved[definition["name"]])
-            selected_keyboard_id = keyboard_id
-            if selected_keyboard_id is None:
-                numeric_text = (
-                    any(character.isdigit() for character in typed_value)
-                    and all(character in "0123456789." for character in typed_value)
-                    and typed_value.count(".") <= 1
-                )
-                preferred_kind = "numeric" if numeric_text else "alphabetic"
-                matching_ids = [
-                    candidate_id
-                    for candidate_id, candidate in workflow["keyboards"].items()
-                    if candidate["kind"] == preferred_kind
-                ]
-                default_keyboard_id = step["keyboard_id"]
-                if len(matching_ids) == 1:
-                    selected_keyboard_id = matching_ids[0]
-                elif default_keyboard_id in matching_ids or not matching_ids:
-                    selected_keyboard_id = default_keyboard_id
-                else:
-                    raise remote_control.Refused(422, "unsupported_input")
+            numeric_text = (
+                any(character.isdigit() for character in typed_value)
+                and all(character in "0123456789." for character in typed_value)
+                and typed_value.count(".") <= 1
+            )
+            preferred_kind = "numeric" if numeric_text else "alphabetic"
+            matching_ids = [
+                candidate_id
+                for candidate_id, candidate in workflow["keyboards"].items()
+                if candidate["kind"] == preferred_kind
+            ]
+            default_keyboard_id = step["keyboard_id"]
+            if len(matching_ids) == 1:
+                selected_keyboard_id = matching_ids[0]
+            elif default_keyboard_id in matching_ids:
+                selected_keyboard_id = default_keyboard_id
+            else:
+                raise remote_control.Refused(422, "unsupported_input")
             keyboard = workflow["keyboards"].get(selected_keyboard_id)
             if keyboard is None:
                 raise remote_control.Refused(422, "unsupported_input")
@@ -2246,32 +2244,6 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
             raise remote_control.Refused(409, "text_invalid") from None
         except ValueError:
             raise remote_control.Refused(422, "unsupported_input") from None
-
-    def text_keyboards(device_id):
-        """Return safe metadata for the phone's saved Remote Paste keyboards."""
-        assignment_store = app.extensions["device_workflow_assignment_store"]
-        workflow_id = assignment_store.remote_text_workflow(device_id)
-        if workflow_id is None:
-            raise remote_control.Refused(409, "text_unassigned")
-        try:
-            workflow, step, _ = remote_text_input_workflow(
-                app.extensions["workflow_storage"].read(workflow_id)
-            )
-        except (FileNotFoundError, ValueError):
-            raise remote_control.Refused(409, "text_invalid") from None
-        default_keyboard_id = step["keyboard_id"]
-        return {
-            "default_keyboard_id": default_keyboard_id,
-            "keyboards": [
-                {
-                    "keyboard_id": keyboard_id,
-                    "name": keyboard["name"],
-                    "kind": keyboard["kind"],
-                    "default": keyboard_id == default_keyboard_id,
-                }
-                for keyboard_id, keyboard in workflow["keyboards"].items()
-            ],
-        }
 
     remote = remote_control.RemoteControl(
         workflow_service,
@@ -2287,7 +2259,6 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         read_screen=read_screen,
         save_screen=save_screen,
         text_input=text_input,
-        text_keyboards=text_keyboards,
     )
     app.extensions["remote_control"] = remote
 

@@ -8,7 +8,6 @@ Implements the control addresses of RemoteViewer's docs/pi-interface.md
     POST   /agent/v1/devices/<id>/takeover/renew
     DELETE /agent/v1/devices/<id>/takeover?session_id=...
     POST   /agent/v1/devices/<id>/input
-    GET    /agent/v1/devices/<id>/keyboards
     GET    /agent/v1/devices/<id>/screen
     PUT    /agent/v1/devices/<id>/screen
 
@@ -24,7 +23,6 @@ import json
 import logging
 import math
 import os
-import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -48,7 +46,6 @@ MAX_ID_LENGTH = 64
 MAX_REASON_LENGTH = 200
 MAX_TEXT_LENGTH = 200
 HISTORY_LIMIT = 200
-KEYBOARD_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,79}")
 
 KEYS = {
     "enter": "ENTER",
@@ -105,9 +102,7 @@ def validate_input(data):
         "back": set(),
         "wake": set(),
     }.get(kind)
-    required = fields | {"session_id", "type"} if fields is not None else set()
-    allowed = required | ({"keyboard_id"} if kind == "text" else set())
-    if fields is None or not required <= set(data) or not set(data) <= allowed:
+    if fields is None or set(data) != fields | {"session_id", "type"}:
         raise Refused(400, "invalid_input")
     if kind in {"tap", "swipe"} and not all(
         _fraction(data[name]) for name in fields - {"duration_ms"}
@@ -118,11 +113,6 @@ def validate_input(data):
     ):
         raise Refused(400, "invalid_input")
     if kind == "text" and not _plain(data["text"], MAX_TEXT_LENGTH):
-        raise Refused(400, "invalid_input")
-    if "keyboard_id" in data and (
-        not isinstance(data["keyboard_id"], str)
-        or KEYBOARD_ID.fullmatch(data["keyboard_id"]) is None
-    ):
         raise Refused(400, "invalid_input")
     if kind == "key" and data["key"] not in KEYS:
         raise Refused(400, "invalid_input")
@@ -254,7 +244,6 @@ class RemoteControl:
         read_screen,
         save_screen,
         text_input=None,
-        text_keyboards=None,
         lease_seconds=LEASE_SECONDS,
         input_wait_seconds=INPUT_WAIT_SECONDS,
     ):
@@ -268,7 +257,6 @@ class RemoteControl:
         self.read_screen = read_screen
         self.save_screen = save_screen
         self.text_input = text_input
-        self.text_keyboards = text_keyboards
         self.lease_seconds = lease_seconds
         self.input_wait_seconds = input_wait_seconds
         self.lock = threading.RLock()
@@ -518,12 +506,7 @@ class RemoteControl:
                 if data["type"] == "text":
                     if self.text_input is None:
                         raise Refused(409, "text_unavailable")
-                    self.text_input(
-                        device_id,
-                        bridge,
-                        data["text"],
-                        data.get("keyboard_id"),
-                    )
+                    self.text_input(device_id, bridge, data["text"])
                     performed = True
                 else:
                     performed = perform_input(bridge, calibration, data)
@@ -560,11 +543,6 @@ class RemoteControl:
             )
 
     # -- screen position (calibration) ---------------------------------------
-
-    def keyboards(self, device_id):
-        if self.text_keyboards is None:
-            raise Refused(409, "text_unavailable")
-        return self.text_keyboards(device_id)
 
     def screen(self, device_id):
         """The device's calibration corners, or None when it is not calibrated."""
@@ -692,11 +670,6 @@ def register_routes(blueprint, remote, known_device, viewable_device=None):
         validate_input(data)
         remote.input(device_id, data)
         return jsonify(ok=True)
-
-    @blueprint.get("/devices/<device_id>/keyboards")
-    def keyboards(device_id):
-        require_device(device_id)
-        return jsonify(remote.keyboards(device_id))
 
     @blueprint.get("/devices/<device_id>/screen")
     def screen(device_id):

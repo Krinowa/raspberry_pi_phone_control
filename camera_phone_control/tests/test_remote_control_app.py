@@ -216,10 +216,6 @@ def test_non_text_input_reaches_the_pi_through_the_workflow_input_bridge(dashboa
 
 
 def test_text_reports_when_remote_paste_workflow_is_unassigned(dashboard):
-    keyboards = dashboard.client.get(BASE + "/keyboards", headers=AUTH)
-    assert keyboards.status_code == 409
-    assert keyboards.get_json() == {"error": "text_unassigned"}
-
     takeover = {
         "session_id": "s1",
         "user_id": "tester",
@@ -271,6 +267,8 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
             "keys": {
                 "a": {"x": 0.1, "y": 0.6},
                 "b": {"x": 0.4, "y": 0.6},
+                "+": {"x": 0.7, "y": 0.6},
+                "1": {"x": 0.9, "y": 0.6},
             },
         },
     }
@@ -290,25 +288,6 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
     dashboard.app.extensions["device_workflow_assignment_store"].set_routes(
         "phone_A", [], None, saved["id"]
     )
-    keyboards = dashboard.client.get(BASE + "/keyboards", headers=AUTH)
-    assert keyboards.status_code == 200
-    assert keyboards.get_json() == {
-        "default_keyboard_id": "account_keys",
-        "keyboards": [
-            {
-                "keyboard_id": "account_keys",
-                "name": "Account entry keypad",
-                "kind": "numeric",
-                "default": True,
-            },
-            {
-                "keyboard_id": "name_keys",
-                "name": "Beneficiary name keyboard",
-                "kind": "alphabetic",
-                "default": False,
-            },
-        ],
-    }
     takeover = {
         "session_id": "s1",
         "user_id": "tester",
@@ -355,20 +334,16 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
         ("phone_A", "tap", 0.1, 0.6),
     ]
 
-    alternate = dashboard.client.post(
+    symbols_use_alphabetic = dashboard.client.post(
         BASE + "/input",
-        json={
-            "session_id": "s1",
-            "type": "text",
-            "text": "ba",
-            "keyboard_id": "name_keys",
-        },
+        json={"session_id": "s1", "type": "text", "text": "a+1"},
         headers=AUTH,
     )
-    assert alternate.status_code == 200, alternate.get_json()
-    assert FakePi.sent[-2:] == [
-        ("phone_A", "tap", 0.4, 0.6),
+    assert symbols_use_alphabetic.status_code == 200
+    assert FakePi.sent[-3:] == [
         ("phone_A", "tap", 0.1, 0.6),
+        ("phone_A", "tap", 0.7, 0.6),
+        ("phone_A", "tap", 0.9, 0.6),
     ]
 
     before = list(FakePi.sent)
@@ -378,19 +353,6 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
         headers=AUTH,
     )
     assert unsupported.status_code == 422
-    assert FakePi.sent == before
-    unknown_keyboard = dashboard.client.post(
-        BASE + "/input",
-        json={
-            "session_id": "s1",
-            "type": "text",
-            "text": "12",
-            "keyboard_id": "missing_keys",
-        },
-        headers=AUTH,
-    )
-    assert unknown_keyboard.status_code == 422
-    assert unknown_keyboard.get_json() == {"error": "unsupported_input"}
     assert FakePi.sent == before
     assert "120" not in dashboard.app.extensions[
         "remote_control"

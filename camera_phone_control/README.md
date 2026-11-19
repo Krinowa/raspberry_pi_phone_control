@@ -800,7 +800,6 @@ the agent's requests need no dashboard control token.
 | `POST /agent/v1/devices/<id>/takeover/renew` | Keep the lease. `409` once the session no longer holds the phone. |
 | `DELETE /agent/v1/devices/<id>/takeover?session_id=…` | Release. Always `200`. |
 | `POST /agent/v1/devices/<id>/input` | One tap, swipe, captured-keyboard `text`, key, `home`, `back` or `wake`. `403` unless the session holds the phone; `200` after the input was carried out. |
-| `GET /agent/v1/devices/<id>/keyboards` | List the assigned Remote Paste workflow's saved keyboard IDs, names and kinds, including its default. Coordinates are never returned. |
 
 **Lease.** Without a renew for 6 seconds the phone is released automatically.
 
@@ -835,16 +834,11 @@ under *Remote Paste Workflow*, then send:
 }
 ```
 
-Without `keyboard_id`, digits and decimal amounts such as `12.50` select the
-saved numeric keyboard; text containing letters or other symbols selects the
-saved alphabetic keyboard. If more than one keyboard of the selected kind
+Digits and decimal amounts such as `12.50` select the saved numeric keyboard;
+text containing letters or other symbols selects the saved alphabetic
+keyboard. If more than one keyboard of the selected kind
 exists, the workflow default is used when it has that kind; otherwise the
 request is refused without input.
-An optional `keyboard_id` selects a specific saved keyboard map in the assigned
-Remote Paste workflow.
-Malformed or unknown keyboard IDs are rejected before any input is sent.
-The agent obtains valid IDs from `GET /agent/v1/devices/<id>/keyboards`.
-
 The complete value is checked against the captured keys before the first tap.
 Alphabetic keyboards use their captured Shift and `?123`/`ABC` toggles when
 needed. `409 text_unassigned` means the phone has no assignment;
