@@ -8,6 +8,7 @@ Implements the control addresses of RemoteViewer's docs/pi-interface.md
     POST   /agent/v1/devices/<id>/takeover/renew
     DELETE /agent/v1/devices/<id>/takeover?session_id=...
     POST   /agent/v1/devices/<id>/input
+    GET    /agent/v1/devices/<id>/keyboards
     GET    /agent/v1/devices/<id>/screen
     PUT    /agent/v1/devices/<id>/screen
 
@@ -253,6 +254,7 @@ class RemoteControl:
         read_screen,
         save_screen,
         text_input=None,
+        text_keyboards=None,
         lease_seconds=LEASE_SECONDS,
         input_wait_seconds=INPUT_WAIT_SECONDS,
     ):
@@ -266,6 +268,7 @@ class RemoteControl:
         self.read_screen = read_screen
         self.save_screen = save_screen
         self.text_input = text_input
+        self.text_keyboards = text_keyboards
         self.lease_seconds = lease_seconds
         self.input_wait_seconds = input_wait_seconds
         self.lock = threading.RLock()
@@ -558,6 +561,11 @@ class RemoteControl:
 
     # -- screen position (calibration) ---------------------------------------
 
+    def keyboards(self, device_id):
+        if self.text_keyboards is None:
+            raise Refused(409, "text_unavailable")
+        return self.text_keyboards(device_id)
+
     def screen(self, device_id):
         """The device's calibration corners, or None when it is not calibrated."""
         calibration = self.read_screen(device_id)
@@ -684,6 +692,11 @@ def register_routes(blueprint, remote, known_device, viewable_device=None):
         validate_input(data)
         remote.input(device_id, data)
         return jsonify(ok=True)
+
+    @blueprint.get("/devices/<device_id>/keyboards")
+    def keyboards(device_id):
+        require_device(device_id)
+        return jsonify(remote.keyboards(device_id))
 
     @blueprint.get("/devices/<device_id>/screen")
     def screen(device_id):

@@ -800,6 +800,7 @@ the agent's requests need no dashboard control token.
 | `POST /agent/v1/devices/<id>/takeover/renew` | Keep the lease. `409` once the session no longer holds the phone. |
 | `DELETE /agent/v1/devices/<id>/takeover?session_id=…` | Release. Always `200`. |
 | `POST /agent/v1/devices/<id>/input` | One tap, swipe, captured-keyboard `text`, key, `home`, `back` or `wake`. `403` unless the session holds the phone; `200` after the input was carried out. |
+| `GET /agent/v1/devices/<id>/keyboards` | List the assigned Remote Paste workflow's saved keyboard IDs, names and kinds, including its default. Coordinates are never returned. |
 
 **Lease.** Without a renew for 6 seconds the phone is released automatically.
 
@@ -838,6 +839,7 @@ under *Remote Paste Workflow*, then send:
 `keyboard_id` selects any saved keyboard map in the assigned Remote Paste
 workflow. Omit it to use the keyboard selected by that workflow's input step.
 Malformed or unknown keyboard IDs are rejected before any input is sent.
+The agent obtains valid IDs from `GET /agent/v1/devices/<id>/keyboards`.
 
 The complete value is checked against the captured keys before the first tap.
 Alphabetic keyboards use their captured Shift and `?123`/`ABC` toggles when

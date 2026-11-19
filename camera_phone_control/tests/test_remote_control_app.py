@@ -216,6 +216,10 @@ def test_non_text_input_reaches_the_pi_through_the_workflow_input_bridge(dashboa
 
 
 def test_text_reports_when_remote_paste_workflow_is_unassigned(dashboard):
+    keyboards = dashboard.client.get(BASE + "/keyboards", headers=AUTH)
+    assert keyboards.status_code == 409
+    assert keyboards.get_json() == {"error": "text_unassigned"}
+
     takeover = {
         "session_id": "s1",
         "user_id": "tester",
@@ -285,6 +289,25 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
     dashboard.app.extensions["device_workflow_assignment_store"].set_routes(
         "phone_A", [], None, saved["id"]
     )
+    keyboards = dashboard.client.get(BASE + "/keyboards", headers=AUTH)
+    assert keyboards.status_code == 200
+    assert keyboards.get_json() == {
+        "default_keyboard_id": "account_keys",
+        "keyboards": [
+            {
+                "keyboard_id": "account_keys",
+                "name": "Account entry keypad",
+                "kind": "numeric",
+                "default": True,
+            },
+            {
+                "keyboard_id": "name_keys",
+                "name": "Beneficiary name keyboard",
+                "kind": "alphabetic",
+                "default": False,
+            },
+        ],
+    }
     takeover = {
         "session_id": "s1",
         "user_id": "tester",

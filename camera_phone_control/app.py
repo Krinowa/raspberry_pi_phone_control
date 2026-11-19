@@ -2228,6 +2228,32 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         except ValueError:
             raise remote_control.Refused(422, "unsupported_input") from None
 
+    def text_keyboards(device_id):
+        """Return safe metadata for the phone's saved Remote Paste keyboards."""
+        assignment_store = app.extensions["device_workflow_assignment_store"]
+        workflow_id = assignment_store.remote_text_workflow(device_id)
+        if workflow_id is None:
+            raise remote_control.Refused(409, "text_unassigned")
+        try:
+            workflow, step, _ = remote_text_input_workflow(
+                app.extensions["workflow_storage"].read(workflow_id)
+            )
+        except (FileNotFoundError, ValueError):
+            raise remote_control.Refused(409, "text_invalid") from None
+        default_keyboard_id = step["keyboard_id"]
+        return {
+            "default_keyboard_id": default_keyboard_id,
+            "keyboards": [
+                {
+                    "keyboard_id": keyboard_id,
+                    "name": keyboard["name"],
+                    "kind": keyboard["kind"],
+                    "default": keyboard_id == default_keyboard_id,
+                }
+                for keyboard_id, keyboard in workflow["keyboards"].items()
+            ],
+        }
+
     remote = remote_control.RemoteControl(
         workflow_service,
         state.device_locks,
@@ -2242,6 +2268,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         read_screen=read_screen,
         save_screen=save_screen,
         text_input=text_input,
+        text_keyboards=text_keyboards,
     )
     app.extensions["remote_control"] = remote
 

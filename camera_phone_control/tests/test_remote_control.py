@@ -99,6 +99,17 @@ def env(tmp_path, monkeypatch):
                 (device_id, input_bridge, value, keyboard_id)
             )
         ),
+        text_keyboards=lambda device_id: {
+            "default_keyboard_id": "account_numeric",
+            "keyboards": [
+                {
+                    "keyboard_id": "account_numeric",
+                    "name": "Account keypad",
+                    "kind": "numeric",
+                    "default": True,
+                }
+            ],
+        },
         lease_seconds=0.6,
         input_wait_seconds=3.0,
     )
@@ -461,6 +472,23 @@ def test_text_passes_an_optional_saved_keyboard_id(env):
     assert env.flags.workflow_texts == [
         ("phone_A", env.bridge, "123", "account_numeric")
     ]
+
+
+def test_agent_can_discover_safe_saved_keyboard_metadata(env):
+    response = env.client.get(BASE + "/keyboards", headers=AUTH)
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "default_keyboard_id": "account_numeric",
+        "keyboards": [
+            {
+                "keyboard_id": "account_numeric",
+                "name": "Account keypad",
+                "kind": "numeric",
+                "default": True,
+            }
+        ],
+    }
+    assert "keys" not in response.get_json()["keyboards"][0]
 
 
 def test_keys_and_buttons(env):
