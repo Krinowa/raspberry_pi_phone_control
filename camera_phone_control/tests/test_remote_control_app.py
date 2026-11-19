@@ -261,6 +261,7 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
                 "0": {"x": 0.5, "y": 0.9},
                 "1": {"x": 0.2, "y": 0.7},
                 "2": {"x": 0.5, "y": 0.7},
+                ".": {"x": 0.8, "y": 0.9},
             },
         },
         "name_keys": {
@@ -328,6 +329,30 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
         ("phone_A", "tap", 0.2, 0.7),
         ("phone_A", "tap", 0.5, 0.7),
         ("phone_A", "tap", 0.5, 0.9),
+    ]
+
+    automatic_amount = dashboard.client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "text", "text": "12.0"},
+        headers=AUTH,
+    )
+    assert automatic_amount.status_code == 200
+    assert FakePi.sent[-4:] == [
+        ("phone_A", "tap", 0.2, 0.7),
+        ("phone_A", "tap", 0.5, 0.7),
+        ("phone_A", "tap", 0.8, 0.9),
+        ("phone_A", "tap", 0.5, 0.9),
+    ]
+
+    automatic_alphabetic = dashboard.client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "text", "text": "ba"},
+        headers=AUTH,
+    )
+    assert automatic_alphabetic.status_code == 200
+    assert FakePi.sent[-2:] == [
+        ("phone_A", "tap", 0.4, 0.6),
+        ("phone_A", "tap", 0.1, 0.6),
     ]
 
     alternate = dashboard.client.post(

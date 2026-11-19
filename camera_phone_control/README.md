@@ -831,13 +831,17 @@ under *Remote Paste Workflow*, then send:
 {
   "session_id": "the-takeover-session",
   "type": "text",
-  "text": "001234567890",
-  "keyboard_id": "account_numeric"
+  "text": "001234567890"
 }
 ```
 
-`keyboard_id` selects any saved keyboard map in the assigned Remote Paste
-workflow. Omit it to use the keyboard selected by that workflow's input step.
+Without `keyboard_id`, digits and decimal amounts such as `12.50` select the
+saved numeric keyboard; text containing letters or other symbols selects the
+saved alphabetic keyboard. If more than one keyboard of the selected kind
+exists, the workflow default is used when it has that kind; otherwise the
+request is refused without input.
+An optional `keyboard_id` selects a specific saved keyboard map in the assigned
+Remote Paste workflow.
 Malformed or unknown keyboard IDs are rejected before any input is sent.
 The agent obtains valid IDs from `GET /agent/v1/devices/<id>/keyboards`.
 

@@ -2217,7 +2217,26 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
             )
             resolved = resolve_variables(workflow, {definition["name"]: value})
             typed_value = format_input_value(step, resolved[definition["name"]])
-            selected_keyboard_id = keyboard_id or step["keyboard_id"]
+            selected_keyboard_id = keyboard_id
+            if selected_keyboard_id is None:
+                numeric_text = (
+                    any(character.isdigit() for character in typed_value)
+                    and all(character in "0123456789." for character in typed_value)
+                    and typed_value.count(".") <= 1
+                )
+                preferred_kind = "numeric" if numeric_text else "alphabetic"
+                matching_ids = [
+                    candidate_id
+                    for candidate_id, candidate in workflow["keyboards"].items()
+                    if candidate["kind"] == preferred_kind
+                ]
+                default_keyboard_id = step["keyboard_id"]
+                if len(matching_ids) == 1:
+                    selected_keyboard_id = matching_ids[0]
+                elif default_keyboard_id in matching_ids or not matching_ids:
+                    selected_keyboard_id = default_keyboard_id
+                else:
+                    raise remote_control.Refused(422, "unsupported_input")
             keyboard = workflow["keyboards"].get(selected_keyboard_id)
             if keyboard is None:
                 raise remote_control.Refused(422, "unsupported_input")
