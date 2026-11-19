@@ -2205,7 +2205,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         )
         return context.input, calibration
 
-    def workflow_text_input(device_id, bridge, value):
+    def text_input(device_id, bridge, value):
         """Type one RemoteViewer value through the phone's captured keyboard."""
         assignment_store = app.extensions["device_workflow_assignment_store"]
         workflow_id = assignment_store.remote_text_workflow(device_id)
@@ -2238,7 +2238,7 @@ def register_remote_agent(app, state, camera_manager, agent_secret, history):
         open_input=open_input,
         read_screen=read_screen,
         save_screen=save_screen,
-        workflow_text_input=workflow_text_input,
+        text_input=text_input,
     )
     app.extensions["remote_control"] = remote
 

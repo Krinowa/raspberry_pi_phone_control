@@ -94,7 +94,7 @@ def env(tmp_path, monkeypatch):
         open_input=lambda device_id: (bridge, flags.calibration),
         read_screen=lambda device_id: flags.calibration,
         save_screen=save_screen,
-        workflow_text_input=lambda device_id, input_bridge, value: (
+        text_input=lambda device_id, input_bridge, value: (
             flags.workflow_texts.append((device_id, input_bridge, value))
         ),
         lease_seconds=0.6,
@@ -430,20 +430,13 @@ def test_point_outside_the_phone_is_ignored_with_200(env):
     assert env.bridge.calls == []
 
 
-def test_text_is_passed_literally(env):
+def test_text_uses_the_assigned_keyboard_callback_without_direct_text(env):
     assert takeover(env.client).status_code == 200
     text = "'; $(reboot) \" `id` & echo"
     assert send(env.client, type="text", text=text).status_code == 200
-    assert env.bridge.calls == [("text", text)]
-
-
-def test_workflow_text_uses_the_assigned_keyboard_callback_without_direct_text(env):
-    assert takeover(env.client).status_code == 200
-    value = "00123.45"
-    assert send(env.client, type="workflow_text", text=value).status_code == 200
     assert env.bridge.calls == []
-    assert env.flags.workflow_texts == [("phone_A", env.bridge, value)]
-    assert value not in Path(env.remote.history.path).read_text()
+    assert env.flags.workflow_texts == [("phone_A", env.bridge, text)]
+    assert text not in Path(env.remote.history.path).read_text()
 
 
 def test_keys_and_buttons(env):
@@ -491,8 +484,7 @@ def test_keys_and_buttons(env):
         {"type": "text", "text": ""},
         {"type": "text", "text": "line\nbreak"},
         {"type": "text", "text": "x" * 201},
-        {"type": "workflow_text", "text": "line\nbreak"},
-        {"type": "workflow_text", "text": "x" * 201},
+        {"type": "workflow_text", "text": "valid but obsolete type"},
         {"type": "key", "key": "f1"},
         {"type": "home", "extra": 1},
         {"type": "launch"},
@@ -512,7 +504,8 @@ def test_uncalibrated_phone_refuses_points_but_not_buttons(env):
     assert response.get_json() == {"error": "not_calibrated"}
     assert send(env.client, type="home").status_code == 200
     assert send(env.client, type="text", text="abc").status_code == 200
-    assert env.bridge.calls == [("key", "HOME"), ("text", "abc")]
+    assert env.bridge.calls == [("key", "HOME")]
+    assert env.flags.workflow_texts == [("phone_A", env.bridge, "abc")]
 
 
 def test_input_waits_until_the_stopped_job_lets_go(env):

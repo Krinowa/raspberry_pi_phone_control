@@ -178,7 +178,7 @@ def test_agent_post_needs_no_control_token_but_needs_the_secret(dashboard):
     )
 
 
-def test_tap_reaches_the_pi_through_the_workflow_input_bridge(dashboard, monkeypatch):
+def test_non_text_input_reaches_the_pi_through_the_workflow_input_bridge(dashboard, monkeypatch):
     remote = dashboard.app.extensions["remote_control"]
     real_open = remote.open_input
 
@@ -199,7 +199,6 @@ def test_tap_reaches_the_pi_through_the_workflow_input_bridge(dashboard, monkeyp
     )
     for fields in (
         {"type": "tap", "x": 0.5, "y": 0.5},
-        {"type": "text", "text": "'; $(reboot) \""},
         {"type": "home"},
         {"type": "key", "key": "enter"},
     ):
@@ -209,7 +208,6 @@ def test_tap_reaches_the_pi_through_the_workflow_input_bridge(dashboard, monkeyp
         assert response.status_code == 200, response.get_json()
     assert FakePi.sent == [
         ("phone_A", "tap", 0.5, 0.5),
-        ("phone_A", "text", "'; $(reboot) \""),
         ("phone_A", "home"),
         ("phone_A", "key", "ENTER"),
     ]
@@ -270,7 +268,7 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
     )
     response = dashboard.client.post(
         BASE + "/input",
-        json={"session_id": "s1", "type": "workflow_text", "text": "120"},
+        json={"session_id": "s1", "type": "text", "text": "120"},
         headers=AUTH,
     )
     assert response.status_code == 200, response.get_json()
@@ -283,7 +281,7 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
     before = list(FakePi.sent)
     unsupported = dashboard.client.post(
         BASE + "/input",
-        json={"session_id": "s1", "type": "workflow_text", "text": "123"},
+        json={"session_id": "s1", "type": "text", "text": "123"},
         headers=AUTH,
     )
     assert unsupported.status_code == 422
