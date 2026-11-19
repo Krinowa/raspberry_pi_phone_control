@@ -77,7 +77,7 @@ def env(tmp_path, monkeypatch):
     # Phone occupies the middle half of the camera picture.
     calibration = Calibration([[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]])
     flags = SimpleNamespace(
-        local=False, job=None, calibration=calibration, saved=[], workflow_texts=[]
+        local=False, job=None, calibration=calibration, saved=[], workflow_texts=[], keyboards=[]
     )
 
     def save_screen(device_id, new, changed_by):
@@ -94,8 +94,9 @@ def env(tmp_path, monkeypatch):
         open_input=lambda device_id: (bridge, flags.calibration),
         read_screen=lambda device_id: flags.calibration,
         save_screen=save_screen,
-        text_input=lambda device_id, input_bridge, value: (
+        text_input=lambda device_id, input_bridge, value, keyboard=None: (
             flags.workflow_texts.append((device_id, input_bridge, value))
+            or flags.keyboards.append(keyboard)
         ),
         lease_seconds=0.6,
         input_wait_seconds=3.0,
@@ -437,6 +438,49 @@ def test_text_uses_the_assigned_keyboard_callback_without_direct_text(env):
     assert env.bridge.calls == []
     assert env.flags.workflow_texts == [("phone_A", env.bridge, text)]
     assert text not in Path(env.remote.history.path).read_text()
+
+
+def test_text_without_keyboard_passes_none_to_keep_automatic_choice(env):
+    assert takeover(env.client).status_code == 200
+    assert send(env.client, type="text", text="120").status_code == 200
+    assert env.flags.keyboards == [None]
+
+
+def test_text_passes_requested_keyboard_type(env):
+    assert takeover(env.client).status_code == 200
+    assert (
+        send(env.client, type="text", text="98223920", keyboard="numeric").status_code
+        == 200
+    )
+    assert (
+        send(env.client, type="text", text="98223920", keyboard="normal").status_code
+        == 200
+    )
+    assert send(env.client, type="text", text="+60 12-3,4.5*#", keyboard="numeric").status_code == 200
+    assert env.flags.keyboards == ["numeric", "normal", "numeric"]
+
+
+def test_text_rejects_unknown_keyboard_or_letters_in_numeric(env):
+    assert takeover(env.client).status_code == 200
+    for fields in (
+        {"text": "123", "keyboard": "emoji"},
+        {"text": "123", "keyboard": None},
+        {"text": "12a3", "keyboard": "numeric"},
+    ):
+        response = send(env.client, type="text", **fields)
+        assert response.status_code == 400
+        assert response.get_json() == {"error": "invalid_input"}
+    assert send(env.client, type="tap", x=0.1, y=0.1, keyboard="numeric").status_code == 400
+    assert env.flags.workflow_texts == []
+
+
+def test_text_with_keyboard_from_non_holder_is_refused(env):
+    assert takeover(env.client).status_code == 200
+    response = send(
+        env.client, session="other", type="text", text="123", keyboard="numeric"
+    )
+    assert response.status_code == 403
+    assert env.flags.workflow_texts == []
 
 
 def test_text_reports_unavailable_when_no_keyboard_handler_is_configured(env):

@@ -346,6 +346,28 @@ def test_remote_paste_uses_the_phone_assigned_captured_keyboard(dashboard):
         ("phone_A", "tap", 0.9, 0.6),
     ]
 
+    # Digit-only text the agent marks "normal" goes to the alphabetic keyboard.
+    normal_digit = dashboard.client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "text", "text": "1", "keyboard": "normal"},
+        headers=AUTH,
+    )
+    assert normal_digit.status_code == 200
+    assert FakePi.sent[-1] == ("phone_A", "tap", 0.9, 0.6)
+
+    numeric_amount = dashboard.client.post(
+        BASE + "/input",
+        json={"session_id": "s1", "type": "text", "text": "10.2", "keyboard": "numeric"},
+        headers=AUTH,
+    )
+    assert numeric_amount.status_code == 200
+    assert FakePi.sent[-4:] == [
+        ("phone_A", "tap", 0.2, 0.7),
+        ("phone_A", "tap", 0.5, 0.9),
+        ("phone_A", "tap", 0.8, 0.9),
+        ("phone_A", "tap", 0.5, 0.7),
+    ]
+
     before = list(FakePi.sent)
     unsupported = dashboard.client.post(
         BASE + "/input",
