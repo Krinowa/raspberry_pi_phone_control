@@ -186,10 +186,13 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
                 "remote_text_workflow_id",
                 "withdraw_api",
                 "ready_for_work",
+                "display_name",
             }:
                 raise ValueError("Stored device workflow assignment is invalid.")
             if "ready_for_work" in value and type(value["ready_for_work"]) is not bool:
                 raise ValueError("Stored device work readiness is invalid.")
+            if "display_name" in value:
+                self._validate_display_name(value["display_name"])
             # A readiness-only record must retain the legacy meaning of a
             # missing workflow allowlist: unrestricted, rather than empty.
             if "allowed_workflow_ids" not in value:
@@ -289,6 +292,44 @@ class DeviceWorkflowAssignmentStore(_JsonStore):
             record["ready_for_work"] = ready
             self._write(records)
         return ready
+
+    @staticmethod
+    def _validate_display_name(display_name):
+        if (
+            not isinstance(display_name, str)
+            or not display_name.strip()
+            or len(display_name) > 160
+            or any(ord(character) < 32 for character in display_name)
+        ):
+            raise ValueError(
+                "display_name must be non-empty text of at most 160 characters."
+            )
+        return display_name.strip()
+
+    def display_name(self, device_id):
+        validate_device_id(device_id)
+        with self.lock:
+            value = self._read().get(device_id, {})
+            if not isinstance(value, dict):
+                raise ValueError("Stored device workflow assignment is invalid.")
+            display_name = value.get("display_name")
+            return (
+                self._validate_display_name(display_name)
+                if display_name is not None
+                else None
+            )
+
+    def set_display_name(self, device_id, display_name):
+        validate_device_id(device_id)
+        normalized = self._validate_display_name(display_name)
+        with self.lock:
+            records = self._read()
+            record = records.setdefault(device_id, {})
+            if not isinstance(record, dict):
+                raise ValueError("Stored device workflow assignment is invalid.")
+            record["display_name"] = normalized
+            self._write(records)
+        return normalized
 
     def delete(self, device_id):
         validate_device_id(device_id)

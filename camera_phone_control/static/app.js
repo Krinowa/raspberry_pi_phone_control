@@ -445,8 +445,11 @@ async function api(path, data, method = "POST", options = {}) {
 const deviceService = {
   list: () => api("/api/devices", undefined, "GET", { monitor: false }),
   select: (deviceId) => api("/api/devices/select", { device_id: deviceId }),
-  startEnrollment: (deviceId) =>
-    api("/api/enrollment/start", { target_device_id: deviceId }),
+  startEnrollment: (deviceId, displayName) =>
+    api("/api/enrollment/start", {
+      target_device_id: deviceId,
+      display_name: displayName,
+    }),
   stopEnrollment: () => api("/api/enrollment/stop", {}),
   endRemoteControl: (deviceId) =>
     api(`/api/devices/${encodeURIComponent(deviceId)}/remote-control/end`, {}),
@@ -4136,6 +4139,7 @@ function reconcileAddPhonePanel(devices, enrollment) {
     addPhoneEnrollmentTarget = null;
     addPhoneInitialDeviceIds = new Set();
     $("device-enrollment-id").value = "";
+    $("device-enrollment-name").value = "";
     setDeviceError();
     return;
   }
@@ -6112,10 +6116,13 @@ $("device-add").addEventListener("click", () => {
     ? deviceCatalog.devices
     : [];
   addPhoneInitialDeviceIds = new Set(devices.map((device) => device.id));
-  $("device-enrollment-id").value = nextDeviceId(devices);
+  const deviceId = nextDeviceId(devices);
+  $("device-enrollment-id").value = deviceId;
+  $("device-enrollment-id-preview").textContent = deviceId;
+  $("device-enrollment-name").value = "";
   addPhonePanelOpen = true;
   renderDevices();
-  $("device-enrollment-id").focus();
+  $("device-enrollment-name").focus();
   setDeviceError();
 });
 
@@ -6130,7 +6137,8 @@ $("device-enrollment-form").addEventListener("submit", async (event) => {
   setDeviceError();
   try {
     const target = $("device-enrollment-id").value.trim();
-    await deviceService.startEnrollment(target);
+    const displayName = $("device-enrollment-name").value.trim();
+    await deviceService.startEnrollment(target, displayName);
     addPhoneEnrollmentTarget = target;
     addPhonePanelOpen = false;
     await loadDevices();

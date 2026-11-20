@@ -225,16 +225,22 @@
           hidden
         >
           <label>
-            Logical device ID
+            Phone name
 
             <input
-              id="device-enrollment-id"
-              maxlength="64"
-              pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
-              placeholder="phone_B"
+              id="device-enrollment-name"
+              maxlength="160"
+              placeholder="e.g. Reception phone #2"
               required
             />
           </label>
+
+          <input id="device-enrollment-id" type="hidden" />
+
+          <p class="small">
+            Internal device ID:
+            <code id="device-enrollment-id-preview">phone_B</code>
+          </p>
 
           <div class="flow-buttons">
             <button id="device-enrollment-start" class="primary" type="submit">

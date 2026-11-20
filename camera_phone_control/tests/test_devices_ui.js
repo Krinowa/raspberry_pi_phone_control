@@ -165,7 +165,7 @@ function phoneCardActionLabels(card) {
 
 test("device service keeps management calls in the shared API layer", async () => {
   const { context, calls } = setup();
-  await context.deviceService.startEnrollment("phone_C");
+  await context.deviceService.startEnrollment("phone_C", "Counter phone #3");
   await context.deviceService.remove("branch-phone/1");
   await context.deviceService.updateCamera("phone_B", {
     camera_source: 1,
@@ -175,7 +175,10 @@ test("device service keeps management calls in the shared API layer", async () =
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
     {
       url: "/api/enrollment/start",
-      data: { target_device_id: "phone_C" },
+      data: {
+        target_device_id: "phone_C",
+        display_name: "Counter phone #3",
+      },
     },
     {
       url: "/api/devices/branch-phone%2F1",
@@ -251,13 +254,16 @@ test("device card exposes normal operator work status and toggle", async () => {
   assert.equal(context.deviceCatalog.devices[0].ready_for_work, true);
 });
 
-test("Add Phone starts enrollment and never calls Replace", async () => {
+test("Add Phone starts enrollment with an unrestricted friendly name", async () => {
   const { context, calls } = setup();
-  await context.deviceService.startEnrollment("phone_B");
+  await context.deviceService.startEnrollment("phone_B", "受付 Phone #2 (KL)");
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
     {
       url: "/api/enrollment/start",
-      data: { target_device_id: "phone_B" },
+      data: {
+        target_device_id: "phone_B",
+        display_name: "受付 Phone #2 (KL)",
+      },
     },
   ]);
 });
@@ -2515,8 +2521,10 @@ test("Add Phone draft, validation, panel, and focus survive background polling",
   context.addPhoneInitialDeviceIds = new Set(["phone_A"]);
   context.addPhonePanelOpen = true;
   const input = nodes.get("device-enrollment-id") || context.$("device-enrollment-id");
+  const name = context.$("device-enrollment-name");
   input.value = "phone_B";
-  input.focus();
+  name.value = "Branch phone (North) #2";
+  name.focus();
   const validation = context.$("device-error");
   validation.textContent = "Choose an unused device ID.";
   validation.hidden = false;
@@ -2533,8 +2541,9 @@ test("Add Phone draft, validation, panel, and focus survive background polling",
   await context.loadDevices();
   await context.loadDevices();
   assert.equal(input.value, "phone_B");
+  assert.equal(name.value, "Branch phone (North) #2");
   assert.equal(context.$("device-enrollment-form").hidden, false);
-  assert.equal(input.focused, true);
+  assert.equal(name.focused, true);
   assert.equal(validation.textContent, "Choose an unused device ID.");
   assert.equal(validation.hidden, false);
 
@@ -2542,6 +2551,7 @@ test("Add Phone draft, validation, panel, and focus survive background polling",
   await context.loadDevices();
   assert.equal(context.$("device-enrollment-form").hidden, true);
   assert.equal(input.value, "");
+  assert.equal(name.value, "");
 });
 
 test("device polling does not overwrite open Camera Settings fields", async () => {

@@ -278,7 +278,8 @@ class PiDashboardTests(unittest.TestCase):
 
         self.pi.start_enrollment.return_value = {'ok': True, 'status': 'waiting'}
         started = self.post('/api/enrollment/start', {
-            'target_device_id': 'phone_B'
+            'target_device_id': 'phone_B',
+            'display_name': '接待處 Phone #2 (KL)',
         })
         self.assertTrue(started['ok'])
         self.pi.start_enrollment.assert_called_once_with('phone_B')
@@ -291,6 +292,11 @@ class PiDashboardTests(unittest.TestCase):
         catalog['devices'].append(
             {'id': 'phone_B', 'name': 'Phone B', 'connected': False,
              'bluetooth_address': None, 'default': False}
+        )
+        refreshed = self.client.get('/api/devices', headers=self.headers)
+        self.assertEqual(
+            refreshed.json['devices'][1]['name'],
+            '接待處 Phone #2 (KL)',
         )
         existing = self.client.post(
             '/api/enrollment/start',

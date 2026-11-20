@@ -219,6 +219,18 @@ class DeviceWorkflowAssignmentTests(unittest.TestCase):
         self.assertFalse(restarted.ready_for_work("phone_B"))
         self.assertIsNone(restarted.get("phone_B"))
 
+    def test_friendly_phone_name_accepts_unicode_and_survives_route_updates(self):
+        self.assignments.set_display_name("phone_B", "接待處 Phone #2 (KL)")
+        self.assignments.set_routes("phone_B", [], None)
+
+        restarted = DeviceWorkflowAssignmentStore(
+            self.root / "device_workflows.json"
+        )
+        self.assertEqual(
+            restarted.display_name("phone_B"),
+            "接待處 Phone #2 (KL)",
+        )
+
     def test_main_and_balance_routes_persist_together_across_restart(self):
         self.assignments.set_routes(
             "phone_A",

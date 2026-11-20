@@ -1142,6 +1142,13 @@ def create_app(
             devices = [
                 dict(item) if isinstance(item, dict) else item for item in devices
             ]
+            assignment_store = app.extensions["device_workflow_assignment_store"]
+            for item in devices:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    continue
+                display_name = assignment_store.display_name(item["id"])
+                if display_name is not None:
+                    item["name"] = display_name
             result["devices"] = devices
         with state.lock:
             state.pi_catalog_initialized = True
@@ -1341,12 +1348,20 @@ def create_app(
     @local_dashboard_access
     def start_pi_enrollment():
         data = payload()
-        if set(data) != {"target_device_id"}:
-            raise ValueError("Expected target_device_id only.")
+        if set(data) not in (
+            {"target_device_id"},
+            {"target_device_id", "display_name"},
+        ):
+            raise ValueError("Expected target_device_id and optional display_name.")
         bridge, _, registered = registered_pi_devices()
         if data["target_device_id"] in registered:
             raise ValueError(
                 "This device ID is already registered. Use Replace on its device card."
+            )
+        if "display_name" in data:
+            app.extensions["device_workflow_assignment_store"].set_display_name(
+                data["target_device_id"],
+                data["display_name"],
             )
         result = bridge.start_enrollment(data["target_device_id"])
         app.extensions["device_workflow_assignment_store"].set_ready_for_work(
